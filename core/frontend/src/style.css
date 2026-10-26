@@ -96,6 +96,13 @@ body {
   gap: 1rem;
 }
 
+@media (max-width: 639px) {
+  .nx-listing-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.75rem;
+  }
+}
+
 /* safe area for the mobile tab bar / sticky CTA */
 .nx-safe-b {
   padding-bottom: env(safe-area-inset-bottom, 0px);

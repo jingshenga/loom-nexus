@@ -37,19 +37,50 @@ function onToggleFav({ id, favorited, error }) {
 async function load(reset) {
   loading.value = true;
   if (reset) offset.value = 0;
+  try {
+    const data = await api(`/api/listings?${listingParams(24, offset.value)}`);
+    items.value = reset ? data.items : [...items.value, ...data.items];
+    total.value = data.total;
+    syncFavs(items.value);
+  } finally {
+    loading.value = false;
+    firstLoading.value = false;
+  }
+}
+
+function listingParams(limit, pageOffset) {
   const params = new URLSearchParams();
   if (q.value) params.set("q", q.value);
   if (district.value) params.set("district", district.value);
   if (minPrice.value != null && minPrice.value !== "") params.set("min_price", minPrice.value);
   if (maxPrice.value != null && maxPrice.value !== "") params.set("max_price", maxPrice.value);
   if (onlineOnly.value) params.set("online", "true");
-  params.set("limit", 24);
-  params.set("offset", offset.value);
+  params.set("limit", limit);
+  params.set("offset", pageOffset);
+  return params;
+}
+
+async function refreshSaved(snapshot) {
+  q.value = snapshot.q;
+  district.value = snapshot.district;
+  minPrice.value = snapshot.minPrice;
+  maxPrice.value = snapshot.maxPrice;
+  onlineOnly.value = snapshot.onlineOnly;
+  const pageOffsets = Array.from(
+    { length: Math.ceil(snapshot.items.length / 24) },
+    (_, page) => page * 24,
+  );
+  if (!pageOffsets.length) return load(true);
+  loading.value = true;
   try {
-    const data = await api(`/api/listings?${params}`);
-    items.value = reset ? data.items : [...items.value, ...data.items];
-    total.value = data.total;
+    const pages = await Promise.all(pageOffsets.map((pageOffset) =>
+      api(`/api/listings?${listingParams(24, pageOffset)}`),
+    ));
+    items.value = pages.flatMap((page) => page.items);
+    total.value = pages[0].total;
+    offset.value = pageOffsets[pageOffsets.length - 1];
     syncFavs(items.value);
+    requestAnimationFrame(() => window.scrollTo(0, snapshot.y));
   } finally {
     loading.value = false;
     firstLoading.value = false;
@@ -75,6 +106,11 @@ function persistScroll() {
     offset: offset.value,
     items: items.value,
     total: total.value,
+    q: q.value,
+    district: district.value,
+    minPrice: minPrice.value,
+    maxPrice: maxPrice.value,
+    onlineOnly: onlineOnly.value,
   };
 }
 
@@ -91,7 +127,8 @@ function restoreIfBack() {
 onMounted(async () => {
   window.addEventListener("popstate", onPopState);
   restoreIfBack();
-  if (!saved) load(true);
+  if (saved) refreshSaved(saved);
+  else load(true);
   try {
     districts.value = (await api("/api/meta/districts")).districts;
   } catch { /* non-fatal */ }
@@ -150,8 +187,8 @@ onUnmounted(() => {
 
     <!-- 首屏骨架 -->
     <div v-if="firstLoading" class="nx-listing-grid">
-      <div v-for="i in 8" :key="i" class="flex overflow-hidden rounded-2xl border border-slate-800 bg-slate-900 sm:block">
-        <div class="nx-skel aspect-[4/5] w-[40%] shrink-0 sm:w-auto" style="border-radius:0;"></div>
+      <div v-for="i in 8" :key="i" class="overflow-hidden rounded-2xl border border-slate-800 bg-slate-900">
+        <div class="nx-skel aspect-[4/5]" style="border-radius:0;"></div>
         <div class="space-y-2 p-3">
           <div class="nx-skel h-3.5 w-2/5"></div>
           <div class="nx-skel h-3 w-1/4"></div>

@@ -26,7 +26,10 @@ const focusStyle = () => {
 
 const tierText = () =>
   props.item.online_tier === "online" ? "在线"
-    : props.item.online_tier === "recent" ? "近期活跃" : null;
+    : props.item.online_tier === "recent" ? "近期活跃" : "状态未知";
+const tierClass = () =>
+  props.item.online_tier === "online" ? "bg-emerald-400"
+    : props.item.online_tier === "recent" ? "bg-amber-400" : "bg-slate-400";
 
 async function toggleFavorite() {
   // optimistic: the caller owns the state and updates instantly; on
@@ -43,9 +46,9 @@ async function toggleFavorite() {
 <template>
   <RouterLink
     :to="`/explore/${item.id}`"
-    class="group flex overflow-hidden rounded-2xl border border-slate-800 bg-slate-900 transition hover:border-sky-400/60 hover:shadow-lg hover:shadow-sky-400/5 sm:block"
+    class="group block overflow-hidden rounded-2xl border border-slate-800 bg-slate-900 transition hover:border-sky-400/60 hover:shadow-lg hover:shadow-sky-400/5"
   >
-    <div class="relative aspect-[4/5] w-[40%] shrink-0 bg-slate-800 sm:w-auto">
+    <div class="relative aspect-[4/5] bg-slate-800">
       <!-- cover crop keeps the detected face in frame via object-position -->
       <img
         v-if="cover()"
@@ -78,32 +81,15 @@ async function toggleFavorite() {
         <Star class="size-5" :class="favorited ? 'fill-amber-400' : ''" />
       </button>
     </div>
-    <div class="flex min-w-0 flex-1 flex-col justify-between gap-2 p-3 sm:block sm:space-y-2">
-      <div class="min-w-0">
-        <div class="flex min-w-0 items-center gap-2">
-        <span
-          v-if="item.online_tier === 'online' || item.online_tier === 'recent'"
-          class="inline-block size-2 shrink-0 rounded-full"
-          :class="item.online_tier === 'online'
-            ? 'bg-emerald-400 shadow-[0_0_0_3px_rgba(52,211,153,0.15)]'
-            : 'bg-amber-400 shadow-[0_0_0_3px_rgba(251,191,36,0.15)]'"
-          :title="tierText()"
-        ></span>
+    <div class="min-w-0 space-y-1.5 p-2.5 sm:p-3">
+      <div class="flex min-w-0 items-center gap-2">
+        <span class="size-2 shrink-0 rounded-full ring-2 ring-slate-950/20"
+          :class="tierClass()" :title="tierText()" :aria-label="tierText()"></span>
         <span class="min-w-0 truncate font-semibold text-slate-100">{{ item.nickname || "未命名" }}</span>
-        </div>
-        <div class="mt-1 flex items-center gap-2 text-[10px] text-slate-500">
-        <span v-if="tierText()">{{ tierText() }}</span>
-        <span :class="tierText() ? 'ml-auto' : ''">
-          {{ item.published_at ? new Date(item.published_at).toLocaleDateString("zh-CN") : "" }}
-        </span>
-        </div>
       </div>
-      <div class="flex flex-wrap items-center gap-1.5">
-        <span v-if="item.district"
-          class="flex items-center gap-1 rounded-lg bg-slate-800 px-2 py-0.5 text-[10px] text-slate-400">
-          <MapPin class="size-3" />{{ item.district }}
-        </span>
-        <span class="text-[10px] text-slate-500">立即聊天 ›</span>
+      <div class="flex min-w-0 items-center gap-1 text-xs text-slate-500">
+        <MapPin class="size-3 shrink-0" />
+        <span class="truncate">{{ item.district || "位置未标注" }}</span>
       </div>
     </div>
   </RouterLink>
