@@ -149,9 +149,9 @@ onUnmounted(() => {
     </div>
 
     <!-- 首屏骨架 -->
-    <div v-if="firstLoading" class="grid grid-cols-2 gap-3 sm:gap-4 md:grid-cols-3 xl:grid-cols-4">
-      <div v-for="i in 8" :key="i" class="overflow-hidden rounded-2xl border border-slate-800 bg-slate-900">
-        <div class="nx-skel aspect-[4/5]" style="border-radius:0;"></div>
+    <div v-if="firstLoading" class="nx-listing-grid">
+      <div v-for="i in 8" :key="i" class="flex overflow-hidden rounded-2xl border border-slate-800 bg-slate-900 sm:block">
+        <div class="nx-skel aspect-[4/5] w-[40%] shrink-0 sm:w-auto" style="border-radius:0;"></div>
         <div class="space-y-2 p-3">
           <div class="nx-skel h-3.5 w-2/5"></div>
           <div class="nx-skel h-3 w-1/4"></div>
@@ -159,9 +159,9 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- 卡片流：手机单列大卡，桌面多列 -->
+    <!-- 卡片流：按可用宽度自动换列 -->
     <div v-else-if="items.length"
-      class="grid grid-cols-2 gap-3 sm:gap-4 md:grid-cols-3 xl:grid-cols-4">
+      class="nx-listing-grid">
       <ListingCard v-for="item in items" :key="item.id" :item="item" favoritable
         :favorited="favSet.has(item.id)" @toggle-favorite="onToggleFav"
         @click="persistScroll" />

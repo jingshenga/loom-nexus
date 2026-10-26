@@ -1,12 +1,17 @@
 <script setup>
 import { nextTick, onMounted, onUnmounted, ref } from "vue";
-import { useRoute } from "vue-router";
-import { Clock, Check, XCircle, Send, TriangleAlert, ExternalLink, PhoneOff, Bell, ImagePlus } from "lucide-vue-next";
+import { useRoute, useRouter } from "vue-router";
+import { ArrowLeft, Clock, Check, XCircle, Send, TriangleAlert, ExternalLink, PhoneOff, Bell, ImagePlus, MoreHorizontal } from "lucide-vue-next";
 import { api, mediaUrl } from "../api/client";
 import { useSession } from "../stores/session";
 
 const session = useSession();
 const route = useRoute();
+const router = useRouter();
+const desktopQuery = window.matchMedia("(min-width: 1024px)");
+const mobile = ref(!desktopQuery.matches);
+const chatOpen = ref(false);
+const menuOpen = ref(false);
 const sessions = ref([]);
 const current = ref(null);
 const messages = ref([]);
@@ -24,8 +29,10 @@ async function loadSessions() {
   if (current.value) {
     current.value =
       sessions.value.find((s) => s.session_id === current.value.session_id) || null;
+    if (!current.value) chatOpen.value = false;
     return;
   }
+  if (mobile.value && !wanted) return;
   const target =
     sessions.value.find((s) => s.session_id === wanted) ||
     (wanted ? null : sessions.value.find((s) => s.status === "open") || sessions.value[0]);
@@ -40,16 +47,21 @@ async function closeCurrent() {
   if (!current.value) return;
   await api(`/api/chat/sessions/${current.value.session_id}/close`, { method: "POST" });
   current.value = null;
+  chatOpen.value = false;
+  menuOpen.value = false;
   messages.value = [];
   if (ws) { ws.close(); ws = null; }
-  await loadSessions();
-  if (sessions.value.length && sessions.value[0].status === "open") {
-    select(sessions.value[0]);
+  if (route.query.session) {
+    const query = { ...route.query };
+    delete query.session;
+    await router.replace({ query });
   }
+  await loadSessions();
 }
 
 async function select(item) {
   current.value = item;
+  chatOpen.value = true;
   conflict.value = false;
   messages.value = (await api(`/api/chat/sessions/${item.session_id}/messages`)).items;
   scrollBottom();
@@ -225,22 +237,32 @@ function scrollBottom() {
 }
 
 onMounted(() => {
+  desktopQuery.addEventListener("change", onViewportChange);
   loadSessions();
   listTimer = setInterval(loadSessions, 10000);
 });
 onUnmounted(() => {
+  desktopQuery.removeEventListener("change", onViewportChange);
   ws && ws.close();
   clearInterval(listTimer);
 });
+
+function onViewportChange(event) {
+  mobile.value = !event.matches;
+  if (event.matches && !current.value) loadSessions();
+}
 </script>
 
 <template>
-  <div class="grid h-[calc(100dvh-140px)] grid-cols-1 gap-4 lg:grid-cols-12">
-    <aside class="max-h-40 space-y-2 overflow-y-auto lg:col-span-3 lg:max-h-none">
+  <div class="grid h-[calc(100dvh-170px)] min-h-[320px] grid-cols-1 gap-4 lg:h-[calc(100dvh-140px)] lg:grid-cols-12">
+    <aside v-show="!mobile || !chatOpen" class="min-h-0 space-y-2 overflow-y-auto lg:col-span-3">
       <button @click="startChat"
         class="w-full rounded-lg bg-sky-600 py-2 text-sm font-medium hover:bg-sky-500">
         + 新建咨询
       </button>
+      <div v-if="conflict && mobile" class="rounded-lg border border-amber-600/40 bg-amber-600/15 p-3 text-sm text-amber-300">
+        该联系人当前没有空闲的独立网关账号，请稍后再试。
+      </div>
       <button v-for="s in sessions" :key="s.session_id" @click="select(s)"
         class="w-full rounded-lg border p-3 text-left text-sm"
         :class="current && current.session_id === s.session_id
@@ -262,21 +284,39 @@ onUnmounted(() => {
       </button>
     </aside>
 
-    <section class="flex h-[calc(100dvh-230px)] min-h-[45dvh] flex-col overflow-hidden rounded-xl border border-slate-800 lg:col-span-9">
-      <div v-if="current" class="flex items-center gap-3 border-b border-slate-800 px-4 py-2 text-xs text-slate-500">
-        <span>{{ current.contact_username ? "@" + current.contact_username : "联系人 " + current.contact_peer_id }} · 网关账号#{{ current.account_id }} 代理</span>
+    <section v-show="!mobile || chatOpen" class="flex min-h-0 flex-col overflow-hidden rounded-xl border border-slate-800 lg:col-span-9">
+      <div v-if="current" class="flex items-center gap-2 border-b border-slate-800 px-3 py-2 text-xs text-slate-500 sm:px-4">
+        <button v-if="mobile" @click="chatOpen = false; menuOpen = false" aria-label="返回会话列表"
+          class="flex size-9 shrink-0 items-center justify-center rounded-lg hover:bg-slate-800">
+          <ArrowLeft class="size-5" />
+        </button>
+        <span class="min-w-0 flex-1 truncate">{{ current.contact_username ? "@" + current.contact_username : "联系人 " + current.contact_peer_id }} · 网关账号#{{ current.account_id }} 代理</span>
+        <div v-if="mobile" class="relative shrink-0">
+          <button @click="menuOpen = !menuOpen" aria-label="会话操作" :aria-expanded="menuOpen"
+            class="flex size-9 items-center justify-center rounded-lg hover:bg-slate-800">
+            <MoreHorizontal class="size-5" />
+          </button>
+          <div v-if="menuOpen" class="absolute right-0 top-10 z-20 w-44 rounded-xl border border-slate-700 bg-slate-900 p-1 shadow-xl">
+            <button @click="toggleNotify(); menuOpen = false" class="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left hover:bg-slate-800">
+              <Bell class="size-4" />{{ notifyOn ? "关闭通知" : "开启通知" }}
+            </button>
+            <button v-if="current.status === 'open'" @click="closeCurrent" class="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left hover:bg-slate-800">
+              <PhoneOff class="size-4" />结束会话
+            </button>
+          </div>
+        </div>
         <button @click="toggleNotify" :title="notifyOn ? '桌面通知：开' : '桌面通知：关'"
-          class="ml-auto flex items-center gap-1 rounded-lg border px-2.5 py-1"
+          class="hidden items-center gap-1 rounded-lg border px-2.5 py-1 lg:flex"
           :class="notifyOn ? 'border-sky-600/60 text-sky-300' : 'border-slate-700 text-slate-500 hover:text-slate-300'">
           <Bell class="size-3.5" />{{ notifyOn ? "通知开" : "通知关" }}
         </button>
         <button v-if="current.status === 'open'" @click="closeCurrent"
-          class="flex items-center gap-1 rounded-lg border border-slate-700 px-2.5 py-1 hover:bg-slate-800 hover:text-slate-300">
+          class="hidden items-center gap-1 rounded-lg border border-slate-700 px-2.5 py-1 hover:bg-slate-800 hover:text-slate-300 lg:flex">
           <PhoneOff class="size-3.5" />结束会话（释放账号）
         </button>
-        <span v-else class="ml-auto rounded bg-slate-800 px-2 py-0.5">会话已结束</span>
+        <span v-else class="hidden rounded bg-slate-800 px-2 py-0.5 lg:inline">会话已结束</span>
       </div>
-      <div v-if="conflict" class="flex items-center gap-3 border-b border-amber-600/40 bg-amber-600/15 px-4 py-3 text-sm text-amber-300">
+      <div v-if="conflict" class="flex flex-wrap items-center gap-3 border-b border-amber-600/40 bg-amber-600/15 px-4 py-3 text-sm text-amber-300">
         <TriangleAlert class="size-5 shrink-0" />
         <span class="flex-1">该联系人当前没有空闲的独立网关账号（已被其他会话占用），为保证不串线，已禁用输入。</span>
         <a :href="externalUrl" target="_blank"
@@ -288,7 +328,7 @@ onUnmounted(() => {
       <div class="flex-1 space-y-3 overflow-y-auto p-4">
         <div v-for="m in messages" :key="m.id"
           class="flex" :class="m.direction === 'out' ? 'justify-end' : 'justify-start'">
-          <div class="max-w-[70%] rounded-2xl px-4 py-2 text-sm leading-relaxed"
+          <div class="max-w-[85%] rounded-2xl px-4 py-2 text-sm leading-relaxed sm:max-w-[70%]"
             :class="m.direction === 'out'
               ? 'rounded-br-sm nx-grad text-white shadow-lg shadow-sky-400/10'
               : 'rounded-bl-sm bg-slate-800 text-slate-100'">
@@ -320,12 +360,16 @@ onUnmounted(() => {
           <ImagePlus class="size-5" />
         </button>
         <input v-model="draft" :disabled="conflict || !current" placeholder="输入消息…"
-          class="flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-sky-500 disabled:opacity-50" />
+          class="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-sky-500 disabled:opacity-50" />
         <button :disabled="conflict || !current"
-          class="nx-grad flex items-center gap-1.5 rounded-xl px-4 py-2 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50">
-          <Send class="size-4" />发送
+          aria-label="发送消息"
+          class="nx-grad flex size-11 shrink-0 items-center justify-center gap-1.5 rounded-xl text-sm font-semibold text-white hover:opacity-90 disabled:opacity-50 sm:w-auto sm:px-4">
+          <Send class="size-4" /><span class="hidden sm:inline">发送</span>
         </button>
       </form>
     </section>
+    <div v-if="flash" role="status" class="fixed bottom-24 left-1/2 z-50 max-w-[90vw] -translate-x-1/2 rounded-xl bg-slate-800 px-4 py-2 text-sm text-slate-100 shadow-lg">
+      {{ flash }}
+    </div>
   </div>
 </template>

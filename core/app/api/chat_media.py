@@ -8,9 +8,11 @@ base64. The bridge sender streams the bytes straight to Telegram
 bridge (which may write under the media dir) via its DM router.
 """
 import base64
+import io
 import re
 
 from fastapi import APIRouter, Depends, Header, HTTPException
+from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel
 
 from app import db, sqlres
@@ -56,6 +58,13 @@ def _check_image(body: ImageOpenBody) -> None:
         raise HTTPException(status_code=400, detail="图片解码失败")
     if len(raw) > MAX_DECODED:
         raise HTTPException(status_code=413, detail="图片过大")
+    try:
+        with Image.open(io.BytesIO(raw)) as image:
+            if image.format not in ("JPEG", "PNG", "WEBP"):
+                raise ValueError("unsupported image format")
+            image.load()
+    except (ValueError, OSError, UnidentifiedImageError, Image.DecompressionBombError):
+        raise HTTPException(status_code=400, detail="图片文件损坏或格式无效")
 
 
 @router.post("/sessions-with-image")

@@ -43,9 +43,9 @@ async function toggleFavorite() {
 <template>
   <RouterLink
     :to="`/explore/${item.id}`"
-    class="group block overflow-hidden rounded-2xl border border-slate-800 bg-slate-900 transition hover:border-sky-400/60 hover:shadow-lg hover:shadow-sky-400/5"
+    class="group flex overflow-hidden rounded-2xl border border-slate-800 bg-slate-900 transition hover:border-sky-400/60 hover:shadow-lg hover:shadow-sky-400/5 sm:block"
   >
-    <div class="relative aspect-[4/5] bg-slate-800">
+    <div class="relative aspect-[4/5] w-[40%] shrink-0 bg-slate-800 sm:w-auto">
       <!-- cover crop keeps the detected face in frame via object-position -->
       <img
         v-if="cover()"
@@ -64,7 +64,7 @@ async function toggleFavorite() {
       </span>
       <!-- 悬浮价格徽章 -->
       <span v-if="item.price_amount != null"
-        class="nx-price-chip absolute bottom-2.5 left-2.5 rounded-xl px-2.5 py-0.5 text-[15px]">
+        class="nx-price-chip absolute left-2.5 top-2.5 rounded-xl px-2.5 py-0.5 text-[15px] sm:bottom-2.5 sm:top-auto">
         {{ item.price_amount }}<small class="ml-0.5 text-[10px] font-normal opacity-85">{{ item.price_currency }}</small>
       </span>
       <span v-if="mediaCount() > 1"
@@ -78,8 +78,9 @@ async function toggleFavorite() {
         <Star class="size-5" :class="favorited ? 'fill-amber-400' : ''" />
       </button>
     </div>
-    <div class="space-y-2 p-3">
-      <div class="flex items-center gap-2">
+    <div class="flex min-w-0 flex-1 flex-col justify-between gap-2 p-3 sm:block sm:space-y-2">
+      <div class="min-w-0">
+        <div class="flex min-w-0 items-center gap-2">
         <span
           v-if="item.online_tier === 'online' || item.online_tier === 'recent'"
           class="inline-block size-2 shrink-0 rounded-full"
@@ -88,13 +89,16 @@ async function toggleFavorite() {
             : 'bg-amber-400 shadow-[0_0_0_3px_rgba(251,191,36,0.15)]'"
           :title="tierText()"
         ></span>
-        <span class="truncate font-semibold text-slate-100">{{ item.nickname || "未命名" }}</span>
-        <span v-if="tierText()" class="text-[10px] text-slate-500">{{ tierText() }}</span>
-        <span class="ml-auto text-[10px] text-slate-600">
+        <span class="min-w-0 truncate font-semibold text-slate-100">{{ item.nickname || "未命名" }}</span>
+        </div>
+        <div class="mt-1 flex items-center gap-2 text-[10px] text-slate-500">
+        <span v-if="tierText()">{{ tierText() }}</span>
+        <span :class="tierText() ? 'ml-auto' : ''">
           {{ item.published_at ? new Date(item.published_at).toLocaleDateString("zh-CN") : "" }}
         </span>
+        </div>
       </div>
-      <div class="flex items-center gap-1.5">
+      <div class="flex flex-wrap items-center gap-1.5">
         <span v-if="item.district"
           class="flex items-center gap-1 rounded-lg bg-slate-800 px-2 py-0.5 text-[10px] text-slate-400">
           <MapPin class="size-3" />{{ item.district }}

@@ -19,12 +19,14 @@ through Telethon clients kept alive for each logged-in account, with:
   before the normal retry/failed path takes over.
 """
 import asyncio
+import io
 import logging
 import os
 import random
 import re
 
 import asyncpg
+from PIL import Image
 
 from runner import sqlres
 
@@ -74,11 +76,12 @@ async def _send_dm(client, target, content):
     )
 
 
-async def _send_any(client, target, kind, payload):
-    """Text or raw photo bytes, both with the send timeout."""
+async def _send_any(client, target, kind, payload, caption=""):
+    """Text or a named photo stream, both with the send timeout."""
     if kind == "photo":
         return await asyncio.wait_for(
-            client.send_file(target, payload), timeout=SEND_TIMEOUT_S,
+            client.send_file(target, payload, caption=caption, force_document=False),
+            timeout=SEND_TIMEOUT_S,
         )
     return await _send_dm(client, target, payload)
 
@@ -130,7 +133,7 @@ async def _send_sim(pool, account_id, job) -> None:
 
 
 def _payload(job):
-    """Photo messages stream the stored bytes straight to Telegram."""
+    """Decode and validate a stored photo before handing it to Telegram."""
     import base64
 
     b64 = job.get("media_b64")
@@ -138,8 +141,18 @@ def _payload(job):
         if "," in b64 and b64.startswith("data:"):
             b64 = b64.split(",", 1)[1]  # strip the data-url header
         b64 += "=" * (-len(b64) % 4)    # tolerate missing padding
-        raw = base64.b64decode(b64)
-        return ("photo", raw)
+        try:
+            raw = base64.b64decode(b64, validate=True)
+            with Image.open(io.BytesIO(raw)) as image:
+                image.load()
+                extension = {"JPEG": "jpg", "PNG": "png", "WEBP": "webp"}.get(image.format)
+            if not extension:
+                raise ValueError("unsupported image format")
+        except (ValueError, OSError, Image.DecompressionBombError) as exc:
+            raise ValueError("invalid photo data") from exc
+        photo = io.BytesIO(raw)
+        photo.name = f"photo.{extension}"
+        return ("photo", photo)
     return ("text", _prefixed_text(job))
 
 
@@ -173,7 +186,11 @@ async def _send_real(pool, account_id, job) -> None:
         await _finish(pool, job["job_id"], False, "account unauthorized", None)
         return
 
-    kind, payload = _payload(job)
+    try:
+        kind, payload = _payload(job)
+    except ValueError:
+        await _finish(pool, job["job_id"], False, "图片数据损坏，请重新拍摄发送", None)
+        return
     # channel decision: pinned bot channel wins; otherwise a brand-new
     # session on an account with today's stranger-limit flag goes
     # bot-first, while any session the contact ever replied to (or one
@@ -203,18 +220,23 @@ async def _send_real(pool, account_id, job) -> None:
         )
         return
 
+    msg = None
     try:
-        msg = await _send_any(client, target, kind, payload)
+        msg = await _send_any(client, target, kind, payload,
+                              caption=_prefixed_text(job) if kind == "photo" else "")
     except Exception as exc:
-        kind, friendly = classify_error(exc)
-        if kind in ("flood", "timeout"):
+        error_kind, friendly = classify_error(exc)
+        if error_kind in ("flood", "timeout"):
             # today this account messages strangers through bots only
             await pool.fetch(SQL_LIMIT_SET, account_id, "bot_first")
-        if not use_bot and kind in ("blocked", "privacy", "flood", "gone", "timeout"):
+        if not use_bot and error_kind in ("blocked", "privacy", "flood", "gone", "timeout"):
             bot = await _resolve_bot(pool, job["session_id"])
             if bot:
                 try:
-                    msg = await _send_any(client, bot, kind, payload)
+                    if kind == "photo":
+                        payload.seek(0)
+                    msg = await _send_any(client, bot, kind, payload,
+                                          caption=_prefixed_text(job) if kind == "photo" else "")
                     use_bot = True
                     logger.warning(
                         "direct delivery failed (%s), fell back to bot %s",
@@ -222,7 +244,7 @@ async def _send_real(pool, account_id, job) -> None:
                     )
                 except Exception as exc2:
                     _, friendly = classify_error(exc2)
-        if not use_bot:
+        if msg is None:
             await _finish(pool, job["job_id"], False, friendly, None)
             return
 

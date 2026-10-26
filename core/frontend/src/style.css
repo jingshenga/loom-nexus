@@ -90,6 +90,12 @@ body {
   box-shadow: 0 4px 14px var(--nx-glow);
 }
 
+.nx-listing-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr));
+  gap: 1rem;
+}
+
 /* safe area for the mobile tab bar / sticky CTA */
 .nx-safe-b {
   padding-bottom: env(safe-area-inset-bottom, 0px);

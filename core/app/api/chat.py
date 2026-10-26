@@ -21,6 +21,7 @@ from app.api.auth import (
     require_user,
     verify_token,
 )
+from app.api.chat_media import _check_image
 
 router = APIRouter(
     prefix="/api/chat", tags=["chat"],
@@ -188,6 +189,8 @@ async def send(session_id: int, body: SendBody, authorization: str = Header(defa
     user_id = _user_id(authorization)
     if not (body.content or "").strip() and not body.data_url:
         raise HTTPException(status_code=400, detail="empty message")
+    if body.data_url:
+        _check_image(body)
     rows = await pool.fetch(
         SQL_ENQUEUE, session_id, user_id, body.client_msg_id,
         (body.content or "").strip(),
