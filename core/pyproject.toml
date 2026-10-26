@@ -1,0 +1,13 @@
+[project]
+name = "nexus-core-app"
+version = "0.1.0"
+description = "nexus-core: FastAPI service and static host for nexus-edge"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.30,<1",
+    "asyncpg>=0.29,<0.31",
+    "pydantic-settings>=2.4,<3",
+    "rapidocr>=3.4,<4",
+    "onnxruntime>=1.17,<2",
+]

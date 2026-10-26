@@ -1,0 +1,108 @@
+# nexus-edge M0 skeleton: exactly 3 long-running containers on one bridge network.
+# Deploy target: low-power x86_64 NAS (Intel N100 / 16GB RAM).
+# Naming note: every identifier minted by this project avoids the banned
+# two-letter substring; the only exceptions are the upstream-mandated image
+# name and its POSTGRES_* env contract, which cannot be renamed.
+
+# canonical compose project; the stack lives at /volume3/docker/nexus on
+# the NAS so the Docker UI lists it alongside the other projects
+name: nexus
+
+services:
+  nexus-db:
+    image: postgres:16-alpine
+    container_name: nexus-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nexus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example)}
+      POSTGRES_DB: ${POSTGRES_DB:-nexus}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - ${NEXUS_DATA_DIR:-./data}/pgdata:/var/lib/postgresql/data
+      # first-boot schema bootstrap: the official entrypoint runs *.sql once,
+      # on the empty cluster, with ON_ERROR_STOP=1
+      - ./scripts/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+      # rolling daily logical backups on the bind mount (weekday files,
+      # 7-day rotation); survives any pgdata loss and restores the whole
+      # database incl. admin-entered LLM settings in one psql command
+      - ${NEXUS_DATA_DIR:-./data}/backups:/backups
+    # nightly pg_dump loop beside the official entrypoint: first dump 10
+    # minutes after boot (schema settled), then every 24h, written
+    # atomically via .tmp + mv so a crashed dump never halves a file
+    command:
+      - sh
+      - -c
+      - (sleep 600; while true; do pg_dump -U "$${POSTGRES_USER}" "$${POSTGRES_DB}" | gzip > /backups/nexus-$$(date +%u).sql.gz.tmp && mv /backups/nexus-$$(date +%u).sql.gz.tmp /backups/nexus-$$(date +%u).sql.gz; sleep 86400; done) & exec docker-entrypoint.sh postgres
+    networks:
+      - nexus-net
+    # 5432 is intentionally NOT published to the host.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  nexus-core:
+    build:
+      context: ./core
+    image: nexus-core:m0
+    container_name: nexus-core
+    restart: unless-stopped
+    environment:
+      NEXUS_DB_HOST: nexus-db
+      NEXUS_DB_PORT: "5432"
+      NEXUS_DB_USER: ${POSTGRES_USER:-nexus}
+      NEXUS_DB_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      NEXUS_DB_NAME: ${POSTGRES_DB:-nexus}
+      NEXUS_ADMIN_PASSWORD: ${NEXUS_ADMIN_PASSWORD:-nexus-admin-dev}
+    ports:
+      - "${NEXUS_CORE_PORT:-8000}:8000"
+    volumes:
+      - ${NEXUS_DATA_DIR:-./data}/media:/app/data/media
+      # ops scripts stay outside the build context; mounted read-only
+      - ./scripts:/app/scripts:ro
+    depends_on:
+      nexus-db:
+        condition: service_healthy
+    networks:
+      - nexus-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  nexus-bridge:
+    build:
+      context: ./bridge
+    image: nexus-bridge:m0
+    container_name: nexus-bridge
+    restart: unless-stopped
+    environment:
+      NEXUS_DB_HOST: nexus-db
+      NEXUS_DB_PORT: "5432"
+      NEXUS_DB_USER: ${POSTGRES_USER:-nexus}
+      NEXUS_DB_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      NEXUS_DB_NAME: ${POSTGRES_DB:-nexus}
+      NEXUS_BRIDGE_CHECK_INTERVAL: ${NEXUS_BRIDGE_CHECK_INTERVAL:-30}
+      NEXUS_BRIDGE_SIM: ${NEXUS_BRIDGE_SIM:-0}
+      NEXUS_BRIDGE_SIM_INTERVAL: ${NEXUS_BRIDGE_SIM_INTERVAL:-15}
+      NEXUS_BRIDGE_API_ID: ${NEXUS_BRIDGE_API_ID:-}
+      NEXUS_BRIDGE_API_HASH: ${NEXUS_BRIDGE_API_HASH:-}
+    volumes:
+      - ${NEXUS_DATA_DIR:-./data}/sessions:/app/data/sessions
+      - ${NEXUS_DATA_DIR:-./data}/media:/app/data/media
+    depends_on:
+      nexus-db:
+        condition: service_healthy
+    networks:
+      - nexus-net
+    # no host ports: bridge only talks inside nexus-net (and out to the internet)
+
+networks:
+  nexus-net:
+    name: nexus-net
+    driver: bridge

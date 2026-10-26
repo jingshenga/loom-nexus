@@ -1,0 +1,132 @@
+@import "tailwindcss";
+
+/* class-based dark mode: html.dark is set by the theme composable
+   (auto follows the system, manual toggle wins) */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ============================================================
+   nexus theme tokens — rose brand, light+dark surfaces.
+   Slate/Sky utilities are REMAPPED to these variables so the
+   whole existing UI themes automatically; new code can use the
+   same names or brand-* helpers.
+   ============================================================ */
+@theme inline {
+  --color-slate-950: var(--nx-bg);
+  --color-slate-900: var(--nx-card);
+  --color-slate-800: var(--nx-line);
+  --color-slate-700: var(--nx-line);
+  --color-slate-600: var(--nx-dim);
+  --color-slate-500: var(--nx-dim);
+  --color-slate-400: var(--nx-sub);
+  --color-slate-300: var(--nx-ink2);
+  --color-slate-200: var(--nx-ink2);
+  --color-slate-100: var(--nx-ink);
+  --color-sky-300: var(--nx-brand2);
+  --color-sky-400: var(--nx-brand);
+  --color-sky-500: var(--nx-brand);
+  --color-sky-600: var(--nx-brand);
+  --color-brand: var(--nx-brand);
+  --color-brand2: var(--nx-brand2);
+}
+
+/* light (default) */
+:root {
+  color-scheme: light;
+  --nx-bg: #f5f6fa;
+  --nx-card: #ffffff;
+  --nx-line: #e4e8f0;
+  --nx-chip: #edf0f7;
+  --nx-ink: #101828;
+  --nx-ink2: #475467;
+  --nx-sub: #667085;
+  --nx-dim: #98a2b3;
+  --nx-top: rgba(255, 255, 255, 0.82);
+  --nx-brand: #f43f5e;
+  --nx-brand2: #fb7185;
+  --nx-grad: linear-gradient(135deg, #f43f5e, #fb7185);
+  --nx-glow: rgba(244, 63, 94, 0.35);
+}
+
+/* dark */
+html.dark {
+  color-scheme: dark;
+  --nx-bg: #0b0f1a;
+  --nx-card: #111a2e;
+  --nx-line: #1c2740;
+  --nx-chip: #16203a;
+  --nx-ink: #e2e8f0;
+  --nx-ink2: #cbd5e1;
+  --nx-sub: #94a3b8;
+  --nx-dim: #64748b;
+  --nx-top: rgba(15, 21, 36, 0.82);
+  --nx-brand: #f43f5e;
+  --nx-brand2: #fb7185;
+  --nx-glow: rgba(244, 63, 94, 0.3);
+}
+
+body {
+  @apply bg-slate-950 text-slate-100 antialiased;
+}
+
+/* brand helpers */
+.nx-grad {
+  background-image: var(--nx-grad);
+}
+.nx-brand-text {
+  background-image: var(--nx-grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.nx-glass {
+  background: var(--nx-top);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+.nx-price-chip {
+  background-image: var(--nx-grad);
+  color: #fff;
+  font-weight: 700;
+  box-shadow: 0 4px 14px var(--nx-glow);
+}
+
+/* safe area for the mobile tab bar / sticky CTA */
+.nx-safe-b {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* skeleton shimmer */
+.nx-skel {
+  border-radius: 8px;
+  background: linear-gradient(
+    90deg,
+    var(--nx-chip) 25%,
+    var(--nx-line) 45%,
+    var(--nx-chip) 65%
+  );
+  background-size: 200% 100%;
+  animation: nx-shine 1.4s infinite linear;
+}
+@keyframes nx-shine {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+/* hide scrollbars on horizontal chip rows */
+.nx-noscroll::-webkit-scrollbar {
+  display: none;
+}
+.nx-noscroll {
+  scrollbar-width: none;
+}
+
+/* H5 keyboard/zoom fixes: iOS Safari zooms into inputs < 16px */
+input, textarea, select {
+  font-size: 16px;
+}
+@media (min-width: 640px) {
+  input, textarea, select {
+    font-size: inherit;
+  }
+}

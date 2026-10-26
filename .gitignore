@@ -1,0 +1,22 @@
+# secrets & environment
+.env
+.env.*
+!.env.example
+
+# build artifacts
+core/frontend/dist/
+node_modules/
+**/__pycache__/
+*.pyc
+
+# runtime data (sessions / media / backups / caches)
+data/
+*.session
+*.session-journal
+
+# local junk
+.DS_Store
+*.log
+.mimosa/
+.video_agent/
+.zcode/

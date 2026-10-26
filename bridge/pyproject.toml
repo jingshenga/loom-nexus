@@ -1,0 +1,12 @@
+[project]
+name = "nexus-bridge-app"
+version = "0.1.0"
+description = "nexus-bridge: asyncio gateway connection manager for nexus-edge"
+requires-python = ">=3.12"
+dependencies = [
+    "asyncpg>=0.29,<0.31",
+    "telethon>=1.36,<2",
+    "pillow>=10.1,<12",
+    "opencv-python-headless>=4.10,<5",
+    "numpy>=1.26,<3",
+]
