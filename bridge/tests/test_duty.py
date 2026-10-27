@@ -10,6 +10,7 @@ from runner.duty import (
     message_matches,
     profile_usernames,
 )
+from runner.duty_collection import _flood_wait_seconds, _is_flood_wait
 
 
 class FakeMessage:
@@ -66,6 +67,13 @@ class DutyRuleTests(unittest.TestCase):
             1,
         )
         self.assertEqual(listing_contact_username(message), "waneannb7025")
+
+    def test_flood_wait_is_deferred_for_telegram_retry(self):
+        flood_wait = type("FloodWaitError", (Exception,), {"seconds": 4120})()
+        other_error = RuntimeError("invalid username")
+        self.assertTrue(_is_flood_wait(flood_wait))
+        self.assertEqual(_flood_wait_seconds(flood_wait), 4120)
+        self.assertFalse(_is_flood_wait(other_error))
 
 
 if __name__ == "__main__":

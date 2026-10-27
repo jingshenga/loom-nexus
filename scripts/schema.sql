@@ -116,11 +116,20 @@ CREATE INDEX IF NOT EXISTS idx_duty_collection_jobs_pending
 ALTER TABLE duty_collection_jobs
     ADD COLUMN IF NOT EXISTS contact_peer_id BIGINT,
     ADD COLUMN IF NOT EXISTS profile_url TEXT,
+    ADD COLUMN IF NOT EXISTS profile_name TEXT,
+    ADD COLUMN IF NOT EXISTS profile_about TEXT,
+    ADD COLUMN IF NOT EXISTS personal_channel_id BIGINT,
     ADD COLUMN IF NOT EXISTS channel_url TEXT,
-    ADD COLUMN IF NOT EXISTS bot_url TEXT;
+    ADD COLUMN IF NOT EXISTS bot_url TEXT,
+    ADD COLUMN IF NOT EXISTS pinned_msg_id BIGINT,
+    ADD COLUMN IF NOT EXISTS pinned_text TEXT,
+    ADD COLUMN IF NOT EXISTS profile_checked_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS retry_count INT NOT NULL DEFAULT 0;
+ALTER TABLE bridge_accounts ADD COLUMN IF NOT EXISTS duty_profile_lookup_after TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_duty_collection_recovery
     ON duty_collection_jobs(status, updated_at DESC)
-    WHERE status IN ('not_found', 'failed');
+    WHERE status IN ('not_found', 'failed', 'deferred');
 CREATE TABLE IF NOT EXISTS duty_recovery_scans (
     id BIGSERIAL PRIMARY KEY,
     duty_job_id BIGINT NOT NULL UNIQUE REFERENCES duty_collection_jobs(id) ON DELETE CASCADE,
@@ -152,6 +161,11 @@ CREATE TABLE IF NOT EXISTS listings (
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS duty_collection_job_id BIGINT
+    REFERENCES duty_collection_jobs(id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_listings_duty_collection_job
+    ON listings(duty_collection_job_id)
+    WHERE duty_collection_job_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_listings_search
     ON listings(status, district, published_at DESC);
 

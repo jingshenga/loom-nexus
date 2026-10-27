@@ -290,18 +290,25 @@ onUnmounted(() => {
     <section v-if="activeWorkbench === 'duty'" class="grid gap-4 lg:grid-cols-12">
       <aside class="max-h-56 space-y-2 overflow-y-auto lg:col-span-4 lg:max-h-[calc(100dvh-210px)]">
         <button v-for="item in dutyRecovery" :key="item.id" @click="selectRecovery(item)" class="w-full rounded-lg border p-3 text-left" :class="selectedRecovery?.id === item.id ? 'border-sky-500 bg-sky-600/10' : 'border-slate-800 bg-slate-900'">
-          <div class="font-medium">@{{ item.contact_username }}</div>
-          <div class="mt-1 text-xs text-slate-400">{{ item.source_title || '来源群组' }} · {{ item.duty_date }} · {{ item.status }}</div>
+          <div class="font-medium">{{ item.profile_name || `@${item.contact_username}` }}</div>
+          <div v-if="item.profile_name" class="text-xs text-slate-400">@{{ item.contact_username }}</div>
+          <div class="mt-1 text-xs text-slate-400">{{ item.source_title || '来源群组' }} · {{ item.duty_date }} · {{ item.status === 'deferred' ? 'Telegram 冷却，自动重试' : item.status }}</div>
           <div v-if="item.error" class="mt-1 line-clamp-2 text-xs text-amber-300">{{ item.error }}</div>
         </button>
         <div v-if="!dutyRecovery.length" class="py-10 text-center text-sm text-slate-500">暂无未找到或失败的在岗账号</div>
       </aside>
       <div v-if="selectedRecovery" class="space-y-4 rounded-xl border border-slate-800 bg-slate-900/50 p-4 lg:col-span-8">
         <div>
-          <h3 class="font-semibold">@{{ selectedRecovery.contact_username }} 的人工补采</h3>
+          <h3 class="font-semibold">{{ selectedRecovery.profile_name || `@${selectedRecovery.contact_username}` }} · 自动采集结果 / 管理员补查</h3>
           <div class="mt-1 text-xs text-slate-400">原来源：{{ selectedRecovery.source_title || '未知' }}；TG 数字 ID 仅在可确认时填写。不会按昵称匹配或读取头像。</div>
+          <p v-if="selectedRecovery.profile_about" class="mt-2 whitespace-pre-wrap rounded bg-slate-950 p-2 text-sm text-slate-300">公开简介：{{ selectedRecovery.profile_about }}</p>
+          <div v-if="selectedRecovery.profile_checked_at" class="mt-1 text-xs text-slate-500">资料检查时间：{{ new Date(selectedRecovery.profile_checked_at).toLocaleString('zh-CN') }}</div>
           <a v-if="selectedRecovery.target_msg_id && selectedRecovery.source_username" class="mt-1 inline-block text-xs text-sky-300" :href="`https://t.me/${selectedRecovery.source_username}/${selectedRecovery.target_msg_id}`" target="_blank" rel="noreferrer">打开原在岗消息</a>
         </div>
+        <div v-if="selectedRecovery.status === 'deferred'" class="rounded-lg border border-amber-800 bg-amber-950/40 p-3 text-sm text-amber-200">
+          Telegram 暂时限制了资料查询，系统会在 {{ selectedRecovery.next_attempt_at ? new Date(selectedRecovery.next_attempt_at).toLocaleString('zh-CN') : '冷却结束后' }} 自动重试。此任务仍在自动采集中，暂不需要人工补录。
+        </div>
+        <template v-else>
         <div class="grid gap-2 sm:grid-cols-2">
           <label class="text-xs text-slate-400">Telegram 数字 ID<input v-model="recoveryForm.contact_peer_id" inputmode="numeric" class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm" /></label>
           <label class="text-xs text-slate-400">公开简介链接<input v-model="recoveryForm.profile_url" class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm" /></label>
@@ -337,6 +344,7 @@ onUnmounted(() => {
           </div>
           <button @click="createManualDutyCard" class="mt-3 rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium hover:bg-sky-500">创建待审核卡片</button>
         </div>
+        </template>
       </div>
       <div v-else class="flex items-center justify-center rounded-xl border border-slate-800 text-sm text-slate-500 lg:col-span-8">选择一个未找到账号</div>
     </section>
