@@ -12,6 +12,8 @@ except ModuleNotFoundError:
     asyncpg_stub.Pool = object
     sys.modules["asyncpg"] = asyncpg_stub
 
+from runner.backfill import order_media as backfill_order_media
+from runner.listener import order_media as listener_order_media
 from runner.protocol import _make_album_handler
 
 
@@ -43,7 +45,11 @@ class AlbumIngestTests(unittest.IsolatedAsyncioTestCase):
                 self.calls.append(kwargs)
 
         async def save_media(message, source_id):
-            return [{"kind": message.kind, "path": f"{message.id}.{message.kind}"}]
+            score = {5257: 0.3, 5258: 0.6, 5259: 0.9}.get(message.id)
+            media = {"kind": message.kind, "path": f"{message.id}.{message.kind}"}
+            if score is not None:
+                media["score"] = score
+            return [media]
 
         pipeline = Pipeline()
         handler = _make_album_handler(pipeline, 2, client=None)
@@ -58,6 +64,22 @@ class AlbumIngestTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([media["kind"] for media in stored["media"]], [
             "photo", "photo", "photo", "video",
         ])
+        self.assertEqual([media["score"] for media in stored["media"][:3]], [
+            0.9, 0.6, 0.3,
+        ])
+
+    def test_photo_order_uses_face_score_before_video(self):
+        media = [
+            {"kind": "photo", "path": "low.jpg", "score": 0.3},
+            {"kind": "video", "path": "clip.mp4", "poster": "clip.jpg"},
+            {"kind": "photo", "path": "high.jpg", "score": 0.9},
+            {"kind": "photo", "path": "middle.jpg", "score": 0.6},
+        ]
+        for order in (listener_order_media, backfill_order_media):
+            self.assertEqual(
+                [item["path"] for item in order(media)],
+                ["high.jpg", "middle.jpg", "low.jpg", "clip.mp4"],
+            )
 
 
 if __name__ == "__main__":

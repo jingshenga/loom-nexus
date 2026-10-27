@@ -68,8 +68,14 @@ MEDIA_ORDER = {"photo": 0, "video": 1, "file": 2}
 
 
 def order_media(media: list) -> list:
-    """Photos first, then videos, then other files."""
-    return sorted(media or [], key=lambda m: MEDIA_ORDER.get(m.get("kind"), 3))
+    """Best-scored photos first, then videos, then other files."""
+    return sorted(
+        media or [],
+        key=lambda m: (
+            MEDIA_ORDER.get(m.get("kind"), 3),
+            -float(m.get("score") or 0) if m.get("kind") == "photo" else 0,
+        ),
+    )
 
 
 async def _fetch_history(client, peer_id: int, limit: int, source_id: int):

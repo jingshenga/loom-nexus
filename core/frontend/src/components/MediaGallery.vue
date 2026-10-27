@@ -6,11 +6,14 @@ import { ImageIcon, Clapperboard, ChevronLeft, ChevronRight } from "lucide-vue-n
 const props = defineProps({ media: { type: Array, default: () => [] } });
 const active = ref(0);
 
-// photos first, videos last (defensive: also enforced at ingestion)
+// Highest-scored photos first, followed by videos.
 const sorted = computed(() =>
-  [...(props.media || [])].sort((a, b) =>
-    (a.kind === "photo" ? 0 : 1) - (b.kind === "photo" ? 0 : 1),
-  ),
+  [...(props.media || [])].sort((a, b) => {
+    const kindOrder = (a.kind === "photo" ? 0 : 1) - (b.kind === "photo" ? 0 : 1);
+    return kindOrder || (a.kind === "photo"
+      ? Number(b.score || 0) - Number(a.score || 0)
+      : 0);
+  }),
 );
 const counts = computed(() => {
   const photos = sorted.value.filter((m) => m.kind === "photo").length;

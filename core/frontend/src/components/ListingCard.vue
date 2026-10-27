@@ -9,12 +9,15 @@ const props = defineProps({
   favorited: { type: Boolean, default: false },
 });
 const emit = defineEmits(["toggle-favorite"]);
-// cover = best photo (already score-ordered server-side) or a video
-// with a poster frame; focus drives the face-aware cover crop
-const cover = () =>
-  (props.item.media || []).find((m) => m.kind === "photo") ||
-  (props.item.media || []).find((m) => m.kind === "video" && m.poster) ||
-  null;
+// Prefer the photo with the strongest face score, then a video poster.
+const cover = () => {
+  const media = props.item.media || [];
+  return media
+    .filter((m) => m.kind === "photo")
+    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))[0] ||
+    media.find((m) => m.kind === "video" && m.poster) ||
+    null;
+};
 const isPosterCover = () => cover() && cover().kind === "video";
 const mediaCount = () => (props.item.media || []).length;
 const focusStyle = () => {
