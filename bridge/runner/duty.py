@@ -18,6 +18,9 @@ SQL_LISTING_LOOKUP = sqlres.load("duty_listing_lookup.sql")
 
 TG_URL_RE = re.compile(r"https?://t\.me/([A-Za-z0-9_]+)(?:/(\d+))?[^\s]*", re.I)
 MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])@([A-Za-z][A-Za-z0-9_]{3,31})\b")
+CONTACT_RE = re.compile(
+    r"(?:电报|[Tt][Gg])[:：]\s*@?([A-Za-z][A-Za-z0-9_]{3,31})\b",
+)
 
 
 def decode_config(value) -> dict:
@@ -88,6 +91,11 @@ def linked_posts(message, target_channel: str) -> list[tuple[str, int, str]]:
     return list(dict.fromkeys(found))
 
 
+def listing_contact_username(message) -> str | None:
+    match = CONTACT_RE.search(message.raw_text or "")
+    return match.group(1).lower() if match else None
+
+
 async def _resolve_link(pool, client, channel: str, msg_id: int):
     from telethon import utils
 
@@ -97,12 +105,14 @@ async def _resolve_link(pool, client, channel: str, msg_id: int):
     if rows:
         return rows[0]["contact_username"]
 
-    rows = await pool.fetch(SQL_LISTING_LOOKUP, channel, msg_id)
+    rows = await pool.fetch(SQL_LISTING_LOOKUP, target_peer_id, msg_id)
     username = rows[0]["contact_username"] if rows else None
     if not username:
         target = await client.get_messages(entity, ids=msg_id)
-        usernames = profile_usernames(target) if target else []
-        username = usernames[0] if len(usernames) == 1 else None
+        username = listing_contact_username(target) if target else None
+        if not username and target:
+            usernames = profile_usernames(target)
+            username = usernames[0] if len(usernames) == 1 else None
     if username:
         username = username.lower().lstrip("@")
         await pool.fetch(SQL_LINK_UPSERT, target_peer_id, msg_id, username)

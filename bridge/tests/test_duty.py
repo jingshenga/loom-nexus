@@ -3,7 +3,13 @@ from datetime import datetime
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-from runner.duty import business_window, linked_posts, message_matches, profile_usernames
+from runner.duty import (
+    business_window,
+    linked_posts,
+    listing_contact_username,
+    message_matches,
+    profile_usernames,
+)
 
 
 class FakeMessage:
@@ -53,6 +59,13 @@ class DutyRuleTests(unittest.TestCase):
         posts = linked_posts(message, "NBXMWBGJ")
         self.assertEqual(posts[0][0:2], ("NBXMWBGJ", 5153))
         self.assertEqual(len(posts), 1)
+
+    def test_xiaomuwu_uses_contact_field_not_channel_link(self):
+        message = FakeMessage(
+            "💌 电报：@waneannb7025\n📮 频道：https://t.me/shiwanwanyanb",
+            1,
+        )
+        self.assertEqual(listing_contact_username(message), "waneannb7025")
 
 
 if __name__ == "__main__":
