@@ -51,5 +51,5 @@ SELECT id, source_id, nickname, district, price_amount, price_currency,
        presence_tier, duty_label, favorited
 FROM filtered
 ORDER BY (on_duty_today AND newly_collected) DESC,
-         newly_collected DESC, created_at DESC, id DESC
+         on_duty_today DESC, newly_collected DESC, created_at DESC, id DESC
 LIMIT GREATEST(1, $5::int) OFFSET GREATEST(0, $6::int);
