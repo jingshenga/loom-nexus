@@ -1,9 +1,15 @@
 """Admin review workbench APIs (token-protected)."""
-from fastapi import APIRouter, Depends, Header, HTTPException
+import json
+import uuid
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException
+from PIL import Image
 from pydantic import BaseModel
 
 from app import db, sqlres
 from app.api.auth import require_admin
+from app.config import get_settings
 
 router = APIRouter(
     prefix="/api/admin/review", tags=["admin-review"],
@@ -71,6 +77,11 @@ class BatchDeleteBody(BaseModel):
     ids: list
 
 
+class RotatePhotoBody(BaseModel):
+    path: str
+    clockwise: bool
+
+
 @router.post("/batch-delete")
 async def batch_delete(body: BatchDeleteBody) -> dict:
     """Delete listing cards in bulk; raw messages are kept."""
@@ -95,6 +106,56 @@ async def edit_fields(listing_id: int, edits: FieldEdits) -> dict:
     if not rows[0]["ok"]:
         raise HTTPException(status_code=404, detail="listing not found")
     return {"ok": True}
+
+
+@router.post("/{listing_id}/rotate-photo")
+async def rotate_photo(listing_id: int, body: RotatePhotoBody) -> dict:
+    """Create a rotated photo copy and update only its listing media entry."""
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    media_root = Path(get_settings().media_dir).resolve()
+    source = (media_root / body.path).resolve()
+    if not source.is_relative_to(media_root) or not source.is_file():
+        raise HTTPException(status_code=404, detail="photo not found")
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT l.source_msg_id, rm.media_json "
+                "FROM listings l JOIN raw_messages rm ON rm.id = l.source_msg_id "
+                "WHERE l.id = $1 FOR UPDATE OF rm",
+                listing_id,
+            )
+            if row is None:
+                raise HTTPException(status_code=404, detail="listing not found")
+            media = _decode(row["media_json"], [])
+            item = next(
+                (entry for entry in media if entry.get("kind") == "photo" and entry.get("path") == body.path),
+                None,
+            )
+            if item is None:
+                raise HTTPException(status_code=404, detail="photo is not part of this listing")
+
+            target = source.with_name(f"{source.stem}_manual_{uuid.uuid4().hex[:8]}.jpg")
+            try:
+                with Image.open(source) as image:
+                    image.rotate(-90 if body.clockwise else 90, expand=True).convert("RGB").save(
+                        target, "JPEG", quality=95,
+                    )
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail="photo could not be rotated") from exc
+
+            item["path"] = str(target.relative_to(media_root))
+            item["orientation"] = "manual"
+            item["orientation_checked"] = True
+            for key in ("focus_x", "focus_y", "score"):
+                item.pop(key, None)
+            await conn.execute(
+                "UPDATE raw_messages SET media_json = $2::jsonb WHERE id = $1",
+                row["source_msg_id"], json.dumps(media, ensure_ascii=False),
+            )
+    return {"media": media}
 
 
 @router.post("/{listing_id}/publish")

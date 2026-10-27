@@ -1,9 +1,13 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from "vue";
-import { mediaUrl } from "../api/client";
-import { ImageIcon, Clapperboard, ChevronLeft, ChevronRight } from "lucide-vue-next";
+import { api, mediaUrl } from "../api/client";
+import { ImageIcon, Clapperboard, ChevronLeft, ChevronRight, RotateCcw, RotateCw } from "lucide-vue-next";
 
-const props = defineProps({ media: { type: Array, default: () => [] } });
+const props = defineProps({
+  media: { type: Array, default: () => [] },
+  adminListingId: { type: Number, default: null },
+});
+const emit = defineEmits(["rotated"]);
 const active = ref(0);
 
 // Highest-scored photos first, followed by videos.
@@ -29,6 +33,16 @@ const multi = computed(() => sorted.value.length > 1);
 function step(delta) {
   if (!multi.value) return;
   active.value = (active.value + delta + sorted.value.length) % sorted.value.length;
+}
+
+async function rotatePhoto(clockwise) {
+  if (!props.adminListingId || current.value?.kind !== "photo") return;
+  const result = await api(`/api/admin/review/${props.adminListingId}/rotate-photo`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: current.value.path, clockwise }),
+  });
+  emit("rotated", result.media);
 }
 
 // touch swipe (H5): horizontal drag over 40px flips the page
@@ -82,6 +96,16 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
         class="absolute right-2 top-1/2 hidden -translate-y-1/2 rounded-full bg-slate-950/70 p-2.5 text-slate-200 backdrop-blur transition hover:bg-slate-900 sm:block">
         <ChevronRight class="size-5" />
       </button>
+      <div v-if="adminListingId && current?.kind === 'photo'" class="absolute bottom-2 right-2 flex gap-1.5">
+        <button @click="rotatePhoto(false)" aria-label="逆时针旋转 90 度" title="逆时针旋转 90°"
+          class="rounded-lg bg-slate-950/80 p-2 text-white backdrop-blur hover:bg-slate-800">
+          <RotateCcw class="size-4" />
+        </button>
+        <button @click="rotatePhoto(true)" aria-label="顺时针旋转 90 度" title="顺时针旋转 90°"
+          class="rounded-lg bg-slate-950/80 p-2 text-white backdrop-blur hover:bg-slate-800">
+          <RotateCw class="size-4" />
+        </button>
+      </div>
       <!-- 页点指示器（手机主用） -->
       <div v-if="multi" class="absolute bottom-2.5 left-1/2 flex -translate-x-1/2 gap-1.5">
         <span v-for="(m, i) in sorted" :key="i"
