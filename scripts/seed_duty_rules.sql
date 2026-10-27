@@ -19,7 +19,7 @@ BEGIN
     ) INTO v_source_id;
     PERFORM ingest_assign_source(v_source_id, v_account_id);
     SELECT rule_id INTO v_rule_id FROM rule_upsert(
-        '天一今日在岗', 'on_duty',
+        '天一今日在岗'::varchar, 'on_duty'::varchar,
         $json${
           "sender_username": "tyssbd_bot",
           "sender_peer_id": 8393755837,
@@ -39,7 +39,7 @@ BEGIN
     ) INTO v_source_id;
     PERFORM ingest_assign_source(v_source_id, v_account_id);
     SELECT rule_id INTO v_rule_id FROM rule_upsert(
-        '小木屋今日在岗', 'on_duty',
+        '小木屋今日在岗'::varchar, 'on_duty'::varchar,
         $json${
           "sender_username": "XMWGJR_BOT",
           "sender_peer_id": 8758449377,
