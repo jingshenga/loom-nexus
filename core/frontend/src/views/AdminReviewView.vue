@@ -11,7 +11,14 @@ const form = ref({ nickname: "", district: "", price_amount: null, price_currenc
 const flash = ref("");
 const statusTab = ref("pending");
 const selectedIds = ref([]);
+const nicknameFilter = ref("");
+const appliedNickname = ref("");
+const recollectStatus = ref("");
 let timer = null;
+let recollectTimer = null;
+let recollectJobIds = [];
+let pollingRecollect = false;
+const RECOLLECT_STORAGE_KEY = "nexus-admin-recollect-jobs";
 
 function isSelected(id) {
   return selectedIds.value.includes(id);
@@ -32,14 +39,25 @@ function toggleSelectAll() {
 
 async function batchRemove() {
   if (!selectedIds.value.length) return;
+  await removeCards(selectedIds.value);
+}
+
+async function removeCards(ids) {
   const r = await api("/api/admin/review/batch-delete", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ids: selectedIds.value }),
+    body: JSON.stringify({ ids }),
   });
   notify(`已删除 ${r.deleted} 条卡片（原始消息保留）`);
   selectedIds.value = [];
   await loadQueue();
+}
+
+async function deleteCurrent() {
+  if (!current.value) return;
+  const label = current.value.nickname || `#${current.value.id}`;
+  if (!window.confirm(`删除「${label}」？原始 Telegram 消息会保留。`)) return;
+  await removeCards([current.value.id]);
 }
 
 function select(item) {
@@ -59,11 +77,65 @@ function onMediaRotated(media) {
 }
 
 async function loadQueue() {
-  const data = await api(`/api/admin/review/queue?status=${statusTab.value}`);
+  const params = new URLSearchParams({ status: statusTab.value });
+  if (appliedNickname.value) params.set("nickname", appliedNickname.value);
+  const data = await api(`/api/admin/review/queue?${params}`);
   queue.value = data.items;
   if (!data.items.some((x) => x.id === (current.value && current.value.id))) {
     select(data.items[0] || null);
   }
+}
+
+async function applyNicknameFilter() {
+  appliedNickname.value = nicknameFilter.value.trim();
+  selectedIds.value = [];
+  await loadQueue();
+}
+
+async function pollRecollect() {
+  if (pollingRecollect || !recollectJobIds.length) return;
+  pollingRecollect = true;
+  try {
+    const params = new URLSearchParams();
+    recollectJobIds.forEach((id) => params.append("job_ids", id));
+    const data = await api(`/api/admin/review/recollect/status?${params}`);
+    const missing = recollectJobIds.length - data.jobs.length;
+    const done = data.jobs.filter((job) => ["done", "failed"].includes(job.status));
+    const failed = done.filter((job) => job.status === "failed");
+    recollectStatus.value = `Telegram 重采集：${done.length}/${recollectJobIds.length}，失败 ${failed.length + missing}`;
+    if (missing || done.length === recollectJobIds.length) {
+      clearInterval(recollectTimer);
+      recollectTimer = null;
+      recollectJobIds = [];
+      sessionStorage.removeItem(RECOLLECT_STORAGE_KEY);
+      if (failed.length || missing) {
+        notify(`重采集结束，${failed.length + missing} 条失败或任务已不存在：${failed[0]?.error || "请检查任务状态"}`);
+      } else {
+        notify("原消息和媒体已重新拉取，卡片正在更新");
+      }
+      setTimeout(loadQueue, 1200);
+    }
+  } catch (e) {
+    notify(`重采集状态读取失败：${e.message}`);
+  } finally {
+    pollingRecollect = false;
+  }
+}
+
+async function recollectSelected() {
+  if (!selectedIds.value.length || selectedIds.value.length > 20 || recollectJobIds.length) return;
+  const result = await api("/api/admin/review/recollect", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids: selectedIds.value }),
+  });
+  selectedIds.value = [];
+  recollectJobIds = result.jobs.map((job) => job.job_id);
+  sessionStorage.setItem(RECOLLECT_STORAGE_KEY, JSON.stringify(recollectJobIds));
+  recollectStatus.value = `Telegram 重采集：0/${recollectJobIds.length}`;
+  if (recollectTimer) clearInterval(recollectTimer);
+  await pollRecollect();
+  if (recollectJobIds.length) recollectTimer = setInterval(pollRecollect, 2500);
 }
 
 function notify(msg) {
@@ -106,10 +178,20 @@ onMounted(async () => {
   await loadQueue();
   window.addEventListener("keydown", onKey);
   timer = setInterval(loadQueue, 15000);
+  try {
+    recollectJobIds = JSON.parse(sessionStorage.getItem(RECOLLECT_STORAGE_KEY) || "[]");
+    if (recollectJobIds.length) {
+      await pollRecollect();
+      if (recollectJobIds.length) recollectTimer = setInterval(pollRecollect, 2500);
+    }
+  } catch {
+    sessionStorage.removeItem(RECOLLECT_STORAGE_KEY);
+  }
 });
 onUnmounted(() => {
   window.removeEventListener("keydown", onKey);
   clearInterval(timer);
+  clearInterval(recollectTimer);
 });
 </script>
 
@@ -117,7 +199,7 @@ onUnmounted(() => {
   <div class="space-y-3">
   <AdminTabs />
 
-    <div class="flex items-center gap-3">
+    <div class="flex flex-wrap items-center gap-2">
       <h2 class="text-lg font-semibold">审核工作台</h2>
       <select v-model="statusTab" @change="selectedIds = []; loadQueue()"
         class="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm">
@@ -126,6 +208,15 @@ onUnmounted(() => {
         <option value="rejected">已驳回</option>
         <option value="archived">已下架</option>
       </select>
+      <div class="flex min-w-0 flex-1 items-center gap-1.5 sm:flex-none">
+        <input v-model="nicknameFilter" @keyup.enter="applyNicknameFilter"
+          placeholder="按昵称筛选"
+          class="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm sm:w-36 sm:flex-none" />
+        <button @click="applyNicknameFilter"
+          class="rounded-lg border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800">筛选</button>
+        <button v-if="appliedNickname" @click="nicknameFilter = ''; applyNicknameFilter()"
+          class="rounded-lg px-2 py-1 text-xs text-slate-500 hover:text-slate-300">清除</button>
+      </div>
       <label class="flex items-center gap-1.5 text-xs text-slate-400">
         <input type="checkbox" :checked="allSelected()" @change="toggleSelectAll" class="size-4 accent-sky-500" />
         全选
@@ -134,6 +225,12 @@ onUnmounted(() => {
         class="flex items-center gap-1 rounded-lg border border-rose-700/60 px-3 py-1 text-xs text-rose-300 hover:bg-rose-900/30">
         <Trash2 class="size-3.5" />批量删除（{{ selectedIds.length }}）
       </button>
+      <button v-if="selectedIds.length" @click="recollectSelected"
+        :disabled="selectedIds.length > 20 || recollectJobIds.length > 0"
+        class="rounded-lg border border-sky-700/60 px-3 py-1 text-xs text-sky-300 hover:bg-sky-900/30 disabled:opacity-40">
+        重新采集（{{ selectedIds.length }}）
+      </button>
+      <span v-if="recollectStatus" class="text-xs text-sky-300">{{ recollectStatus }}</span>
       <span class="text-xs text-slate-500">Ctrl+Enter 快捷发布</span>
       <span v-if="flash" class="ml-auto rounded bg-emerald-600/20 px-3 py-1 text-xs text-emerald-300">{{ flash }}</span>
     </div>
@@ -242,6 +339,10 @@ onUnmounted(() => {
           <button v-else-if="statusTab === 'published'" @click="decide('withdraw')"
             class="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-amber-600/60 py-2 text-sm text-amber-300 hover:bg-amber-900/30">
             <ArchiveRestore class="size-4" />撤回下架
+          </button>
+          <button @click="deleteCurrent"
+            class="flex items-center justify-center gap-1.5 rounded-lg border border-rose-700/60 px-3 py-2 text-sm text-rose-300 hover:bg-rose-900/30">
+            <Trash2 class="size-4" />删除
           </button>
         </div>
       </section>
