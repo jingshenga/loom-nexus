@@ -48,11 +48,16 @@ CREATE TABLE IF NOT EXISTS raw_messages (
 CREATE TABLE IF NOT EXISTS ingest_rules (
     id BIGSERIAL PRIMARY KEY,
     rule_name VARCHAR(128) NOT NULL,
+    rule_type VARCHAR(24) NOT NULL DEFAULT 'listing',
     version INT DEFAULT 1,
     config_json JSONB NOT NULL,
     is_active BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+ALTER TABLE ingest_rules
+    ADD COLUMN IF NOT EXISTS rule_type VARCHAR(24) NOT NULL DEFAULT 'listing';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ingest_rules_name
+    ON ingest_rules(rule_name);
 
 -- 5. rule <-> source bindings
 CREATE TABLE IF NOT EXISTS source_rule_bindings (
@@ -61,6 +66,53 @@ CREATE TABLE IF NOT EXISTS source_rule_bindings (
     priority INT DEFAULT 0,
     PRIMARY KEY(source_id, rule_id)
 );
+
+-- Current daily on-duty snapshots.  A business day rolls over at 04:00
+-- Asia/Shanghai; expires_at makes old snapshots disappear without a job.
+CREATE TABLE IF NOT EXISTS duty_snapshots (
+    rule_id BIGINT REFERENCES ingest_rules(id) ON DELETE CASCADE,
+    source_id BIGINT REFERENCES ingest_sources(id) ON DELETE CASCADE,
+    duty_date DATE NOT NULL,
+    platform_msg_id BIGINT NOT NULL,
+    content_hash VARCHAR(64) NOT NULL,
+    contact_usernames JSONB NOT NULL DEFAULT '[]',
+    unresolved_links JSONB NOT NULL DEFAULT '[]',
+    observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (rule_id, source_id, duty_date)
+);
+CREATE INDEX IF NOT EXISTS idx_duty_snapshots_active
+    ON duty_snapshots(duty_date, expires_at);
+
+-- Small persistent cache for aggregate lists that point at a channel post.
+CREATE TABLE IF NOT EXISTS duty_link_cache (
+    target_peer_id BIGINT NOT NULL,
+    target_msg_id BIGINT NOT NULL,
+    contact_username VARCHAR(128) NOT NULL,
+    resolved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (target_peer_id, target_msg_id)
+);
+
+-- Exact message/profile matches queued from the current on-duty digest.
+CREATE TABLE IF NOT EXISTS duty_collection_jobs (
+    id BIGSERIAL PRIMARY KEY,
+    rule_id BIGINT NOT NULL REFERENCES ingest_rules(id) ON DELETE CASCADE,
+    duty_date DATE NOT NULL,
+    source_id BIGINT NOT NULL REFERENCES ingest_sources(id) ON DELETE CASCADE,
+    account_id BIGINT NOT NULL REFERENCES bridge_accounts(id),
+    contact_username VARCHAR(128) NOT NULL,
+    target_peer_id BIGINT NOT NULL,
+    target_msg_id BIGINT,
+    status VARCHAR(16) NOT NULL DEFAULT 'pending',
+    raw_id BIGINT REFERENCES raw_messages(id) ON DELETE SET NULL,
+    error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_duty_collection_jobs_identity
+    ON duty_collection_jobs(duty_date, lower(contact_username));
+CREATE INDEX IF NOT EXISTS idx_duty_collection_jobs_pending
+    ON duty_collection_jobs(status, id);
 
 -- 6. structured listings
 CREATE TABLE IF NOT EXISTS listings (
@@ -83,6 +135,22 @@ CREATE TABLE IF NOT EXISTS listings (
 );
 CREATE INDEX IF NOT EXISTS idx_listings_search
     ON listings(status, district, published_at DESC);
+
+-- Admin-triggered Telegram refreshes for selected listing source messages.
+CREATE TABLE IF NOT EXISTS listing_recollect_jobs (
+    id BIGSERIAL PRIMARY KEY,
+    listing_id BIGINT NOT NULL,
+    raw_id BIGINT NOT NULL REFERENCES raw_messages(id) ON DELETE CASCADE,
+    status VARCHAR(16) NOT NULL DEFAULT 'pending',
+    error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_listing_recollect_jobs_pending
+    ON listing_recollect_jobs(status, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_listing_recollect_jobs_active_listing
+    ON listing_recollect_jobs(listing_id)
+    WHERE status IN ('pending', 'processing');
 
 -- 7. favorites
 CREATE TABLE IF NOT EXISTS user_favorites (
@@ -310,7 +378,8 @@ BEGIN
               COALESCE(
                   (SELECT ir.config_json
                    FROM source_rule_bindings b
-                   JOIN ingest_rules ir ON ir.id = b.rule_id AND ir.is_active
+                   JOIN ingest_rules ir ON ir.id = b.rule_id
+                       AND ir.is_active AND ir.rule_type = 'listing'
                    WHERE b.source_id = rm.source_id
                    ORDER BY b.priority DESC, ir.id
                    LIMIT 1),
@@ -748,8 +817,11 @@ $fn$;
 -- M5: rule workshop (CRUD, binding, dry-run samples)
 -- ============================================================
 
+DROP FUNCTION IF EXISTS rule_upsert(VARCHAR, JSONB, BOOLEAN);
+DROP FUNCTION IF EXISTS rule_upsert(VARCHAR, VARCHAR, JSONB, BOOLEAN);
 CREATE OR REPLACE FUNCTION rule_upsert(
     p_rule_name VARCHAR(128),
+    p_rule_type VARCHAR(24),
     p_config JSONB,
     p_active BOOLEAN
 ) RETURNS TABLE(rule_id BIGINT, version INT)
@@ -760,12 +832,13 @@ BEGIN
     SELECT ir.id, ir.version INTO v_id, v_ver
     FROM ingest_rules ir WHERE ir.rule_name = p_rule_name;
     IF v_id IS NULL THEN
-        INSERT INTO ingest_rules AS ir (rule_name, version, config_json, is_active)
-        VALUES (p_rule_name, 1, p_config, p_active)
+        INSERT INTO ingest_rules AS ir (rule_name, rule_type, version, config_json, is_active)
+        VALUES (p_rule_name, p_rule_type, 1, p_config, p_active)
         RETURNING ir.id, ir.version INTO v_id, v_ver;
     ELSE
         UPDATE ingest_rules ir
-        SET version = ir.version + 1, config_json = p_config, is_active = p_active
+        SET version = ir.version + 1, rule_type = p_rule_type,
+            config_json = p_config, is_active = p_active
         WHERE ir.id = v_id
         RETURNING ir.id, ir.version INTO v_id, v_ver;
     END IF;
@@ -783,13 +856,13 @@ $fn$;
 
 DROP FUNCTION IF EXISTS rule_list();
 CREATE OR REPLACE FUNCTION rule_list()
-RETURNS TABLE(rule_id BIGINT, rule_name VARCHAR(128), version INT,
+RETURNS TABLE(rule_id BIGINT, rule_name VARCHAR(128), rule_type VARCHAR(24), version INT,
               config_json JSONB, is_active BOOLEAN, created_at TIMESTAMPTZ,
               bindings JSONB)
 LANGUAGE plpgsql STABLE AS $fn$
 BEGIN
     RETURN QUERY
-    SELECT ir.id, ir.rule_name, ir.version, ir.config_json, ir.is_active,
+    SELECT ir.id, ir.rule_name, ir.rule_type, ir.version, ir.config_json, ir.is_active,
            ir.created_at,
            COALESCE((
                SELECT jsonb_agg(jsonb_build_object(
@@ -828,6 +901,61 @@ BEGIN
     DELETE FROM source_rule_bindings
     WHERE rule_id = p_rule_id AND source_id = p_source_id;
     RETURN FOUND;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION duty_snapshot_upsert(
+    p_rule_id BIGINT,
+    p_source_id BIGINT,
+    p_duty_date DATE,
+    p_platform_msg_id BIGINT,
+    p_content_hash VARCHAR(64),
+    p_contact_usernames JSONB,
+    p_unresolved_links JSONB,
+    p_observed_at TIMESTAMPTZ,
+    p_expires_at TIMESTAMPTZ
+) RETURNS BOOLEAN
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_changed BOOLEAN := FALSE;
+BEGIN
+    INSERT INTO duty_snapshots AS ds (
+        rule_id, source_id, duty_date, platform_msg_id, content_hash,
+        contact_usernames, unresolved_links, observed_at, expires_at
+    ) VALUES (
+        p_rule_id, p_source_id, p_duty_date, p_platform_msg_id, p_content_hash,
+        p_contact_usernames, p_unresolved_links, p_observed_at, p_expires_at
+    )
+    ON CONFLICT (rule_id, source_id, duty_date) DO UPDATE SET
+        platform_msg_id = EXCLUDED.platform_msg_id,
+        content_hash = EXCLUDED.content_hash,
+        contact_usernames = EXCLUDED.contact_usernames,
+        unresolved_links = EXCLUDED.unresolved_links,
+        observed_at = EXCLUDED.observed_at,
+        expires_at = EXCLUDED.expires_at
+    WHERE ds.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+       OR ds.platform_msg_id IS DISTINCT FROM EXCLUDED.platform_msg_id
+    RETURNING TRUE INTO v_changed;
+    RETURN COALESCE(v_changed, FALSE);
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION duty_link_cache_upsert(
+    p_target_peer_id BIGINT,
+    p_target_msg_id BIGINT,
+    p_contact_username VARCHAR(128)
+) RETURNS BOOLEAN
+LANGUAGE plpgsql AS $fn$
+BEGIN
+    INSERT INTO duty_link_cache AS dlc (
+        target_peer_id, target_msg_id, contact_username
+    ) VALUES (
+        p_target_peer_id, p_target_msg_id, lower(p_contact_username)
+    )
+    ON CONFLICT (target_peer_id, target_msg_id) DO UPDATE SET
+        contact_username = EXCLUDED.contact_username,
+        resolved_at = NOW();
+    RETURN TRUE;
 END
 $fn$;
 
@@ -1084,6 +1212,10 @@ DECLARE
 BEGIN
     DELETE FROM listings l WHERE l.id = ANY(p_ids);
     GET DIAGNOSTICS v_count = ROW_COUNT;
+    UPDATE listing_recollect_jobs
+    SET status = 'failed', error = 'card deleted', updated_at = NOW()
+    WHERE listing_id = ANY(p_ids)
+      AND status IN ('pending', 'processing');
     RETURN v_count;
 END
 $fn$;
@@ -1280,6 +1412,20 @@ BEGIN
     FROM ingest_sources s
     WHERE s.is_active
       AND s.assigned_account_id IS NOT NULL
+      AND (
+          NOT EXISTS (
+              SELECT 1 FROM source_rule_bindings rb
+              JOIN ingest_rules ir ON ir.id = rb.rule_id
+              WHERE rb.source_id = s.id AND ir.is_active
+                AND ir.rule_type = 'on_duty'
+          )
+          OR EXISTS (
+              SELECT 1 FROM source_rule_bindings rb
+              JOIN ingest_rules ir ON ir.id = rb.rule_id
+              WHERE rb.source_id = s.id AND ir.is_active
+                AND ir.rule_type = 'listing'
+          )
+      )
       AND NOT EXISTS (
           SELECT 1 FROM backfill_jobs b
           WHERE b.source_id = s.id AND b.status IN ('pending', 'processing')
@@ -2609,3 +2755,67 @@ $fn$;
 -- outbound image bytes ride on the row (base64); the sender decodes
 -- and streams them straight to Telegram without touching the disk
 ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS media_b64 TEXT;
+
+-- Local OCR results and moderation state for image-based listing cards.
+CREATE TABLE IF NOT EXISTS listing_media_ocr (
+    id BIGSERIAL PRIMARY KEY,
+    raw_id BIGINT NOT NULL REFERENCES raw_messages(id) ON DELETE CASCADE,
+    listing_id BIGINT REFERENCES listings(id) ON DELETE SET NULL,
+    media_path VARCHAR(512) NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'pending',
+    classification VARCHAR(24) NOT NULL DEFAULT 'uncertain',
+    review_status VARCHAR(16) NOT NULL DEFAULT 'pending',
+    raw_text TEXT NOT NULL DEFAULT '',
+    normalized_text TEXT NOT NULL DEFAULT '',
+    fields_json JSONB NOT NULL DEFAULT '{}',
+    evidence_json JSONB NOT NULL DEFAULT '{}',
+    confidence NUMERIC(4, 3) NOT NULL DEFAULT 0,
+    engine_version VARCHAR(64),
+    error_text VARCHAR(500),
+    attempts INT NOT NULL DEFAULT 0,
+    reviewed_by BIGINT,
+    reviewed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (raw_id, media_path)
+);
+CREATE INDEX IF NOT EXISTS idx_listing_media_ocr_queue
+    ON listing_media_ocr(review_status, status, id);
+CREATE INDEX IF NOT EXISTS idx_listing_media_ocr_listing
+    ON listing_media_ocr(listing_id, review_status);
+
+CREATE OR REPLACE FUNCTION media_ocr_set_flags(
+    p_raw_id BIGINT,
+    p_media_path TEXT,
+    p_visibility TEXT,
+    p_status TEXT,
+    p_classification TEXT
+) RETURNS BOOLEAN
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_media JSONB;
+BEGIN
+    UPDATE raw_messages rm
+    SET media_json = COALESCE((
+        SELECT jsonb_agg(
+            CASE WHEN item->>'path' = p_media_path
+                 THEN item || jsonb_build_object(
+                     'visibility', p_visibility,
+                     'ocr_status', p_status,
+                     'ocr_classification', p_classification
+                 )
+                 ELSE item END
+            ORDER BY ord
+        )
+        FROM jsonb_array_elements(rm.media_json) WITH ORDINALITY AS a(item, ord)
+    ), '[]'::jsonb)
+    WHERE rm.id = p_raw_id
+    RETURNING media_json INTO v_media;
+    IF NOT FOUND THEN
+        RETURN FALSE;
+    END IF;
+    UPDATE listings SET media_json = v_media, updated_at = NOW()
+    WHERE source_msg_id = p_raw_id;
+    RETURN TRUE;
+END
+$fn$;

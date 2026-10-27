@@ -17,19 +17,35 @@ def _build_engine():
 
 
 def _extract(engine, image_path: str):
+    return [line["text"] for line in _extract_lines(engine, image_path)]
+
+
+def _extract_lines(engine, image_path: str):
     result = engine(image_path)
     if result is None:
         return []
     texts = getattr(result, "txts", None)
     if texts:
-        return [t for t in texts if t and t.strip()]
+        boxes = getattr(result, "boxes", None)
+        scores = getattr(result, "scores", None)
+        boxes = [] if boxes is None else boxes
+        scores = [] if scores is None else scores
+        out = []
+        for i, text in enumerate(texts):
+            if not text or not text.strip():
+                continue
+            box = boxes[i].tolist() if i < len(boxes) and hasattr(boxes[i], "tolist") else (boxes[i] if i < len(boxes) else None)
+            score = float(scores[i]) if i < len(scores) else None
+            out.append({"text": text.strip(), "box": box, "score": score})
+        return out
     if isinstance(result, (list, tuple)):
         out = []
         for item in result:
             if isinstance(item, (list, tuple)) and len(item) >= 2:
-                text = item[1]
+                box, text = item[0], item[1]
                 if isinstance(text, str) and text.strip():
-                    out.append(text)
+                    score = float(item[2]) if len(item) > 2 else None
+                    out.append({"text": text.strip(), "box": box, "score": score})
         return out
     return []
 
@@ -42,8 +58,9 @@ def main() -> int:
             continue
         try:
             req = json.loads(line)
-            texts = _extract(engine, req["image"])
-            sys.stdout.write(json.dumps({"ok": True, "texts": texts}) + "\n")
+            lines = _extract_lines(engine, req["image"])
+            texts = [line["text"] for line in lines]
+            sys.stdout.write(json.dumps({"ok": True, "texts": texts, "lines": lines}) + "\n")
         except Exception as exc:  # noqa: BLE001 - report any failure as a line
             sys.stdout.write(json.dumps({"ok": False, "error": str(exc)}) + "\n")
         sys.stdout.flush()

@@ -23,6 +23,7 @@ SQL_SOURCE_OF = sqlres.load("source_of.sql")
 SQL_BF_ENQUEUE = sqlres.load("backfill_enqueue.sql")
 SQL_BF_STATUS = sqlres.load("backfill_status.sql")
 SQL_BF_ALL = sqlres.load("backfill_all.sql")
+SQL_MEDIA_SOURCES = sqlres.load("media_backfill_sources.sql")
 
 
 def _pool():
@@ -131,7 +132,7 @@ async def backfill_media_all(body: BackfillBody = None) -> dict:
     pool = _pool()
     limit = max(1, min((body.limit if body else 100), 200))
     queued = 0
-    rows = await pool.fetch(SQL_SOURCES)
+    rows = await pool.fetch(SQL_MEDIA_SOURCES)
     for s in rows:
         if not s["is_active"] or s["account_id"] is None:
             continue

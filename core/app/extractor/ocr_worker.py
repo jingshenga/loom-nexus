@@ -36,11 +36,12 @@ class OcrWorker:
         """OCR several images sequentially; returns merged text lines."""
         texts = []
         for path in image_paths:
-            lines = await self._read_one(path)
-            texts.extend(lines)
+            result = await self.read_document(path)
+            texts.extend(result.get("texts", []))
         return texts
 
-    async def _read_one(self, image_path: str) -> list:
+    async def read_document(self, image_path: str) -> dict:
+        """Return OCR text and per-line geometry for local card classification."""
         async with self._sem:
             proc = await self._ensure()
             try:
@@ -51,18 +52,20 @@ class OcrWorker:
             except Exception as exc:
                 logger.warning("ocr worker call failed (%s); restarting", exc)
                 await self._kill()
-                return []
+                return {"ok": False, "texts": [], "lines": []}
             if not raw:
                 await self._kill()
-                return []
+                return {"ok": False, "texts": [], "lines": []}
             try:
                 resp = json.loads(raw)
             except json.JSONDecodeError:
-                return []
+                return {"ok": False, "texts": [], "lines": []}
             if not resp.get("ok"):
                 logger.warning("ocr rejected %s: %s", image_path, resp.get("error"))
-                return []
-            return resp.get("texts") or []
+                return {"ok": False, "texts": [], "lines": [], "error": resp.get("error")}
+            texts = resp.get("texts") or []
+            lines = resp.get("lines") or [{"text": text} for text in texts]
+            return {"ok": True, "texts": texts, "lines": lines}
 
     async def _kill(self):
         if self._proc is not None:

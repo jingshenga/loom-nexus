@@ -1,7 +1,7 @@
 <script setup>
 import AdminTabs from "../components/AdminTabs.vue";
-import { onMounted, ref } from "vue";
-import { Save, FlaskConical, Sparkles, Trash2, Link2, Settings2, PlugZap, RefreshCw } from "lucide-vue-next";
+import { computed, onMounted, ref } from "vue";
+import { Save, FlaskConical, Sparkles, Trash2, Link2, Settings2, PlugZap, RefreshCw, Copy } from "lucide-vue-next";
 import { api } from "../api/client";
 
 const rules = ref([]);
@@ -12,6 +12,7 @@ const dryrun = ref(null);
 const llm = ref({ available: false, model: null });
 const flash = ref("");
 const sources = ref([]);
+const collectionSources = ref([]);
 const bindSourceId = ref(null);
 const sampleSourceId = ref(null);
 const sampleLimit = ref(20);
@@ -19,6 +20,26 @@ const showSettings = ref(false);
 const llmForm = ref({ base_url: "", model: "", api_key: "", allow_private: false });
 const llmTestResult = ref("");
 const apForm = ref({ autopublish_enabled: true, autopublish_threshold: 0.8 });
+const activeTab = ref("listing");
+const dialogs = ref([]);
+const dutyDialogKey = ref("");
+const dutyForm = ref({});
+const filteredRules = computed(() => rules.value.filter((r) => (r.rule_type || "listing") === activeTab.value));
+
+const EMPTY_DUTY_CONFIG = {
+  sender_username: "",
+  sender_peer_id: null,
+  match_prefix: "",
+  search_text: "",
+  update_mode: "replace_snapshot",
+  identity_mode: "direct_username_links",
+  target_channel_username: "",
+  auto_collect_enabled: true,
+  collection_source_id: null,
+  profile_query_required: false,
+  exclude_usernames: [],
+  business_cutoff_hour: 4,
+};
 
 const EMPTY_CONFIG = {
   gate: { require_any_keywords: [], blocked_sender_peer_ids: [] },
@@ -77,29 +98,49 @@ function select(rule) {
   current.value = rule;
   configText.value = JSON.stringify(rule.config, null, 2);
   dryrun.value = null;
+  dutyForm.value = { ...EMPTY_DUTY_CONFIG, ...(rule.config || {}) };
   // default the sample drawer to the first group this rule is bound to
   const first = (rule.bindings || [])[0];
   if (first) sampleSourceId.value = first.source_id;
 }
 
 function newRule() {
-  current.value = { rule_name: "", is_active: true };
-  configText.value = JSON.stringify(EMPTY_CONFIG, null, 2);
+  current.value = { rule_name: "", rule_type: activeTab.value, is_active: true };
+  const config = activeTab.value === "on_duty" ? EMPTY_DUTY_CONFIG : EMPTY_CONFIG;
+  configText.value = JSON.stringify(config, null, 2);
+  dutyForm.value = { ...EMPTY_DUTY_CONFIG };
   dryrun.value = null;
 }
 
 async function loadRules() {
-  rules.value = (await api("/api/admin/rules")).items;
-  if (!current.value && rules.value.length) select(rules.value[0]);
+  const data = await api("/api/admin/rules");
+  rules.value = data.items;
+  collectionSources.value = data.collection_sources || [];
+  const visible = rules.value.filter((r) => (r.rule_type || "listing") === activeTab.value);
+  if (!current.value) {
+    if (visible.length) select(visible[0]);
+    else newRule();
+  }
+}
+
+function switchTab(tab) {
+  activeTab.value = tab;
+  current.value = null;
+  const first = rules.value.find((r) => (r.rule_type || "listing") === tab);
+  if (first) select(first);
+  else newRule();
 }
 
 async function save() {
   let config;
-  try {
-    config = JSON.parse(configText.value);
-  } catch {
-    notify("JSON 语法错误");
-    return;
+  if (activeTab.value === "on_duty") config = { ...dutyForm.value };
+  else {
+    try {
+      config = JSON.parse(configText.value);
+    } catch {
+      notify("JSON 语法错误");
+      return;
+    }
   }
   if (!current.value.rule_name.trim()) {
     notify("规则名不能为空");
@@ -108,11 +149,48 @@ async function save() {
   const data = await api("/api/admin/rules", {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ rule_name: current.value.rule_name, config, is_active: true }),
+    body: JSON.stringify({ rule_name: current.value.rule_name, rule_type: activeTab.value, config, is_active: current.value.is_active !== false }),
   });
   notify(`已保存 v${data.version}`);
   await loadRules();
   const fresh = rules.value.find((r) => r.id === data.rule_id);
+  if (fresh) select(fresh);
+}
+
+async function copyRule() {
+  if (!current.value?.id) return;
+  const name = `${current.value.rule_name}-副本`;
+  const data = await api(`/api/admin/rules/${current.value.id}/copy`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ rule_name: name }),
+  });
+  current.value = null;
+  await loadRules();
+  const copied = rules.value.find((r) => r.id === data.rule_id);
+  if (copied) select(copied);
+  notify("已复制，来源未绑定");
+}
+
+async function bindDutyDialog() {
+  if (!current.value?.id || !dutyDialogKey.value) return notify("先选择群组");
+  const ruleId = current.value.id;
+  const dialog = dialogs.value.find((d) => `${d.account_id}:${d.peer_id}` === dutyDialogKey.value);
+  if (!dialog) return;
+  const source = await api("/api/admin/sources", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(dialog),
+  });
+  await api(`/api/admin/rules/${current.value.id}/bind`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source_id: source.source_id, priority: 100 }),
+  });
+  notify(`已绑定 ${dialog.title}`);
+  current.value = null;
+  await loadRules();
+  const fresh = rules.value.find((r) => r.id === ruleId);
   if (fresh) select(fresh);
 }
 
@@ -268,6 +346,7 @@ onMounted(async () => {
   await loadRules();
   llm.value = await api("/api/admin/rules/llm-status");
   sources.value = (await api("/api/admin/sources")).items;
+  dialogs.value = (await api("/api/admin/sources/dialogs")).items;
 });
 </script>
 
@@ -340,11 +419,20 @@ onMounted(async () => {
       </div>
     </div>
 
+    <div class="flex gap-2 border-b border-slate-800 pb-2">
+      <button v-for="tab in [{ value: 'listing', label: '名片抓取' }, { value: 'on_duty', label: '在岗规则' }]"
+        :key="tab.value" @click="switchTab(tab.value)"
+        class="rounded-lg px-4 py-2 text-sm"
+        :class="activeTab === tab.value ? 'bg-sky-600 font-semibold text-white' : 'bg-slate-900 text-slate-400'">
+        {{ tab.label }}
+      </button>
+    </div>
+
     <div class="grid grid-cols-1 gap-4 lg:h-[calc(100dvh-190px)] lg:grid-cols-12">
       <aside class="flex gap-2 overflow-x-auto pb-1 lg:col-span-2 lg:block lg:space-y-2 lg:overflow-x-visible">
         <button @click="newRule"
           class="w-full rounded-lg bg-sky-600 py-2 text-sm font-medium hover:bg-sky-500">+ 新规则</button>
-        <button v-for="r in rules" :key="r.id" @click="select(r)"
+        <button v-for="r in filteredRules" :key="r.id" @click="select(r)"
           class="w-full rounded-lg border p-2.5 text-left text-sm"
           :class="current && current.id === r.id ? 'border-sky-500 bg-sky-600/10' : 'border-slate-800 bg-slate-900'">
           <div class="truncate font-medium">{{ r.rule_name }}</div>
@@ -352,7 +440,7 @@ onMounted(async () => {
         </button>
       </aside>
 
-      <section class="lg:col-span-5 space-y-3 lg:overflow-y-auto">
+      <section v-if="activeTab === 'listing'" class="lg:col-span-5 space-y-3 lg:overflow-y-auto">
         <div v-if="boundGroups().length" class="flex flex-wrap items-center gap-2 text-xs">
           <span class="text-slate-500">已绑定群组：</span>
           <span v-for="b in boundGroups()" :key="b.source_id"
@@ -371,6 +459,8 @@ onMounted(async () => {
           </button>
           <button v-if="current.id && current.rule_name !== 'default-rule'" @click="remove"
             class="rounded-lg border border-rose-700/60 p-2 text-rose-300 hover:bg-rose-900/30"><Trash2 class="size-4" /></button>
+          <button v-if="current.id && current.rule_name !== 'default-rule'" @click="copyRule"
+            class="rounded-lg border border-slate-600 p-2 text-slate-300 hover:bg-slate-800" title="复制规则"><Copy class="size-4" /></button>
           <button v-if="current.id" @click="bindToSource"
             class="flex items-center gap-1.5 rounded-lg border border-slate-600 px-3 py-2 text-sm hover:bg-slate-800">
             <Link2 class="size-4" />绑定来源
@@ -403,7 +493,92 @@ onMounted(async () => {
         </details>
       </section>
 
-      <section class="lg:col-span-5 space-y-3 lg:overflow-y-auto">
+      <section v-else class="space-y-3 lg:col-span-5 lg:overflow-y-auto">
+        <div v-if="boundGroups().length" class="flex flex-wrap items-center gap-2 text-xs">
+          <span class="text-slate-500">已绑定群组：</span>
+          <span v-for="b in boundGroups()" :key="b.source_id"
+            class="rounded-full border border-emerald-800/60 bg-emerald-950/40 px-2.5 py-1 text-emerald-300">
+            {{ b.title || `来源#${b.source_id}` }}
+          </span>
+        </div>
+        <div class="flex gap-2">
+          <input v-model="current.rule_name" placeholder="在岗规则名称"
+            class="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
+          <button @click="save" class="flex items-center gap-1 rounded-lg bg-sky-600 px-3 text-sm"><Save class="size-4" />保存</button>
+          <button v-if="current.id" @click="copyRule" class="rounded-lg border border-slate-600 p-2" title="复制"><Copy class="size-4" /></button>
+          <button v-if="current.id" @click="remove" class="rounded-lg border border-rose-700/60 p-2 text-rose-300" title="删除"><Trash2 class="size-4" /></button>
+        </div>
+        <label class="flex items-center gap-2 text-xs text-slate-400">
+          <input v-model="current.is_active" type="checkbox" class="size-4 accent-emerald-500" />启用该规则
+        </label>
+        <div class="grid gap-3 rounded-xl border border-slate-800 bg-slate-900/50 p-4 sm:grid-cols-2">
+          <label class="text-xs text-slate-400">发送 Bot 用户名
+            <input v-model="dutyForm.sender_username" placeholder="XMWGJR_BOT"
+              class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
+          </label>
+          <label class="text-xs text-slate-400">发送者 Telegram ID
+            <input v-model.number="dutyForm.sender_peer_id" type="number"
+              class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
+          </label>
+          <label class="text-xs text-slate-400 sm:col-span-2">消息首行特征
+            <input v-model="dutyForm.match_prefix" placeholder="🔶 在线老师，按地区展示"
+              class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
+          </label>
+          <label class="text-xs text-slate-400">更新方式
+            <select v-model="dutyForm.update_mode" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm">
+              <option value="edited_snapshot">主榜持续编辑</option>
+              <option value="replace_snapshot">新榜单完整替换</option>
+            </select>
+          </label>
+          <label class="text-xs text-slate-400">身份关联
+            <select v-model="dutyForm.identity_mode" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm">
+              <option value="direct_username_links">个人 TG 链接</option>
+              <option value="linked_listing_messages">频道消息链接</option>
+            </select>
+          </label>
+          <label v-if="dutyForm.identity_mode === 'linked_listing_messages'" class="text-xs text-slate-400 sm:col-span-2">目标频道用户名
+            <input v-model="dutyForm.target_channel_username" placeholder="NBXMWBGJ"
+              class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
+          </label>
+          <label class="flex items-center gap-2 text-xs text-slate-300 sm:col-span-2">
+            <input v-model="dutyForm.auto_collect_enabled" type="checkbox" class="size-4 accent-emerald-500" />
+            自动补采今日在岗但尚无卡片的 TG 账号
+          </label>
+          <label v-if="dutyForm.auto_collect_enabled" class="text-xs text-slate-400 sm:col-span-2">名片采集来源
+            <select v-model.number="dutyForm.collection_source_id"
+              class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm">
+              <option :value="null" disabled>选择绑定了名片规则的来源…</option>
+              <option v-for="s in collectionSources" :key="s.id" :value="s.id">
+                {{ s.title || s.username || `来源#${s.id}` }}
+              </option>
+            </select>
+            <span class="mt-1 block text-slate-500">只查询日报关联的消息或精确 TG 用户名，使用该来源现有规则；不扫描群历史，也不按昵称匹配。</span>
+          </label>
+          <label class="flex items-center gap-2 text-xs text-slate-400 sm:col-span-2">
+            <input v-model="dutyForm.profile_query_required" type="checkbox" class="size-4 accent-emerald-500" />
+            仅把带 profile 参数的个人链接识别为老师
+          </label>
+          <div class="text-xs text-slate-500 sm:col-span-2">业务日固定在北京时间 04:00 切换；00:00–03:59 延续前一天记录。</div>
+        </div>
+        <div class="flex gap-2">
+          <select v-model="dutyDialogKey" class="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm">
+            <option value="" disabled>选择账号可见的群组或频道…</option>
+            <option v-for="d in dialogs" :key="`${d.account_id}:${d.peer_id}`" :value="`${d.account_id}:${d.peer_id}`">
+              {{ d.title }} · {{ d.username ? '@' + d.username : d.peer_id }}
+            </option>
+          </select>
+          <button @click="bindDutyDialog" :disabled="!current.id"
+            class="flex items-center gap-1 rounded-lg border border-emerald-700/60 px-3 text-sm text-emerald-300 disabled:opacity-40">
+            <Link2 class="size-4" />绑定群组
+          </button>
+        </div>
+        <details class="rounded-xl border border-slate-800 bg-slate-900/50 p-3 text-xs">
+          <summary class="cursor-pointer text-slate-300">高级配置</summary>
+          <pre class="mt-2 overflow-x-auto whitespace-pre-wrap text-slate-500">{{ JSON.stringify(dutyForm, null, 2) }}</pre>
+        </details>
+      </section>
+
+      <section v-if="activeTab === 'listing'" class="lg:col-span-5 space-y-3 lg:overflow-y-auto">
         <div class="space-y-2 rounded-xl border border-slate-800 bg-slate-900/50 p-3">
           <div class="flex items-center gap-2 text-sm font-medium"><Sparkles class="size-4 text-sky-400" />样本输入</div>
           <textarea v-model="sampleText" rows="5" placeholder="粘贴样本消息，多条用 --- 分隔"
@@ -460,6 +635,24 @@ onMounted(async () => {
               <div class="mt-1 truncate text-slate-500">{{ r.text }}</div>
             </div>
           </div>
+        </div>
+      </section>
+      <section v-else class="space-y-3 lg:col-span-5 lg:overflow-y-auto">
+        <div class="rounded-xl border border-slate-800 bg-slate-900/50 p-4">
+          <h3 class="text-sm font-semibold">当前同步状态</h3>
+          <div class="mt-3 grid grid-cols-2 gap-2 text-sm sm:grid-cols-3">
+            <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-sky-300">{{ current.duty_status?.matched || 0 }}</div><div class="text-xs text-slate-500">日报身份</div></div>
+            <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-emerald-400">{{ current.duty_status?.with_card || 0 }}</div><div class="text-xs text-slate-500">已有卡片</div></div>
+            <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-amber-300">{{ current.duty_status?.queued || 0 }}</div><div class="text-xs text-slate-500">排队补采</div></div>
+            <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-violet-300">{{ current.duty_status?.fetched || 0 }}</div><div class="text-xs text-slate-500">已取回，待提取</div></div>
+            <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-rose-300">{{ current.duty_status?.failed || 0 }}</div><div class="text-xs text-slate-500">失败 / 未找到</div></div>
+            <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-slate-300">{{ current.duty_status?.unqueued || 0 }}</div><div class="text-xs text-slate-500">尚未处理</div></div>
+            <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-amber-400">{{ current.duty_status?.unresolved || 0 }}</div><div class="text-xs text-slate-500">未解析日报链接</div></div>
+          </div>
+          <div class="mt-3 text-xs text-slate-500">最近同步：{{ current.duty_status?.observed_at ? new Date(current.duty_status.observed_at).toLocaleString('zh-CN') : '尚未同步' }}</div>
+        </div>
+        <div class="rounded-xl border border-slate-800 bg-slate-900/50 p-4 text-sm text-slate-400">
+          网关只接收绑定群内指定 Bot 的匹配榜单。其他聊天、抽奖、积分、相册不会下载媒体，也不会写入原始消息表。
         </div>
       </section>
     </div>

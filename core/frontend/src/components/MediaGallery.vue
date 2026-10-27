@@ -43,6 +43,7 @@ async function rotatePhoto(clockwise) {
     body: JSON.stringify({ path: current.value.path, clockwise }),
   });
   emit("rotated", result.media);
+  active.value = 0;
 }
 
 // touch swipe (H5): horizontal drag over 40px flips the page
