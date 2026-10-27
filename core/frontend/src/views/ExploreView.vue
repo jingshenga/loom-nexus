@@ -17,7 +17,7 @@ const districts = ref([]);
 const minPrice = ref(null);
 const maxPrice = ref(null);
 const onlineOnly = ref(false);
-const duty = ref("today");
+const duty = ref("all");
 const offset = ref(0);
 const loading = ref(false);
 const firstLoading = ref(true);
@@ -68,7 +68,7 @@ async function refreshSaved(snapshot) {
   minPrice.value = snapshot.minPrice;
   maxPrice.value = snapshot.maxPrice;
   onlineOnly.value = snapshot.onlineOnly;
-  duty.value = snapshot.duty || "today";
+  duty.value = snapshot.duty || "all";
   const pageOffsets = Array.from(
     { length: Math.ceil(snapshot.items.length / 24) },
     (_, page) => page * 24,
@@ -168,7 +168,7 @@ onUnmounted(() => {
     <!-- 筛选 chips：横滚不换行 -->
     <div class="nx-noscroll -mx-1 flex gap-2 overflow-x-auto px-1 pb-1">
       <button
-        v-for="option in [{ value: 'today', label: '今日在岗' }, { value: 'yesterday', label: '昨日在岗' }]"
+        v-for="option in [{ value: 'all', label: '全部' }, { value: 'today', label: '今日在岗' }, { value: 'yesterday', label: '昨日在岗' }]"
         :key="option.value"
         @click="duty = option.value; load(true)"
         class="flex shrink-0 items-center gap-1.5 rounded-full border px-3.5 py-1.5 text-xs transition"

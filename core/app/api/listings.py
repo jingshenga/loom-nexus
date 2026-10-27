@@ -114,7 +114,7 @@ async def list_listings(
     min_price: float = None,
     max_price: float = None,
     online: bool = None,
-    duty: Literal["today", "yesterday"] = "today",
+    duty: Literal["all", "today", "yesterday"] = "all",
     limit: int = 24,
     offset: int = 0,
 ) -> dict:
