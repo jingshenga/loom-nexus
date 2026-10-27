@@ -9,6 +9,7 @@ const router = useRouter();
 import { api } from "../api/client";
 import ListingCard from "../components/ListingCard.vue";
 
+const PAGE_SIZE = 24;
 const items = ref([]);
 const total = ref(0);
 const q = ref("");
@@ -21,6 +22,10 @@ const duty = ref("all");
 const offset = ref(0);
 const loading = ref(false);
 const firstLoading = ref(true);
+const loadError = ref(false);
+const loadSentinel = ref(null);
+let loadObserver = null;
+let requestId = 0;
 
 const favSet = ref(new Set());
 
@@ -36,16 +41,26 @@ function onToggleFav({ id, favorited, error }) {
 }
 
 async function load(reset) {
+  if (loading.value && !reset) return;
+  const currentRequest = reset ? ++requestId : requestId;
+  const pageOffset = reset ? 0 : offset.value + PAGE_SIZE;
+  loadError.value = false;
   loading.value = true;
-  if (reset) offset.value = 0;
   try {
-    const data = await api(`/api/listings?${listingParams(24, offset.value)}`);
+    const data = await api(`/api/listings?${listingParams(PAGE_SIZE, pageOffset)}`);
+    if (currentRequest !== requestId) return;
     items.value = reset ? data.items : [...items.value, ...data.items];
     total.value = data.total;
+    offset.value = pageOffset;
     syncFavs(items.value);
+  } catch {
+    if (currentRequest === requestId) loadError.value = true;
   } finally {
-    loading.value = false;
-    firstLoading.value = false;
+    if (currentRequest === requestId) {
+      loading.value = false;
+      firstLoading.value = false;
+      requestAnimationFrame(observeLoadSentinel);
+    }
   }
 }
 
@@ -70,14 +85,14 @@ async function refreshSaved(snapshot) {
   onlineOnly.value = snapshot.onlineOnly;
   duty.value = snapshot.duty || "all";
   const pageOffsets = Array.from(
-    { length: Math.ceil(snapshot.items.length / 24) },
-    (_, page) => page * 24,
+    { length: Math.ceil(snapshot.items.length / PAGE_SIZE) },
+    (_, page) => page * PAGE_SIZE,
   );
   if (!pageOffsets.length) return load(true);
   loading.value = true;
   try {
     const pages = await Promise.all(pageOffsets.map((pageOffset) =>
-      api(`/api/listings?${listingParams(24, pageOffset)}`),
+      api(`/api/listings?${listingParams(PAGE_SIZE, pageOffset)}`),
     ));
     items.value = pages.flatMap((page) => page.items);
     total.value = pages[0].total;
@@ -87,12 +102,14 @@ async function refreshSaved(snapshot) {
   } finally {
     loading.value = false;
     firstLoading.value = false;
+    requestAnimationFrame(observeLoadSentinel);
   }
 }
 
-function more() {
-  offset.value += 24;
-  load(false);
+function observeLoadSentinel() {
+  if (!loadObserver || !loadSentinel.value) return;
+  loadObserver.unobserve(loadSentinel.value);
+  loadObserver.observe(loadSentinel.value);
 }
 
 // browsing position restore: keep the last browse snapshot in a module
@@ -130,6 +147,13 @@ function restoreIfBack() {
 
 onMounted(async () => {
   window.addEventListener("popstate", onPopState);
+  loadObserver = new IntersectionObserver((entries) => {
+    if (entries.some((entry) => entry.isIntersecting)
+        && items.value.length < total.value && !loading.value && !loadError.value) {
+      load(false);
+    }
+  }, { rootMargin: "400px 0px" });
+  observeLoadSentinel();
   restoreIfBack();
   if (saved) refreshSaved(saved);
   else load(true);
@@ -140,6 +164,8 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.removeEventListener("popstate", onPopState);
+  loadObserver?.disconnect();
+  loadObserver = null;
   persistScroll(); // leaving the square (detail / other tab): snapshot
 });
 </script>
@@ -218,17 +244,24 @@ onUnmounted(() => {
         :favorited="favSet.has(item.id)" @toggle-favorite="onToggleFav"
         @click="persistScroll" />
     </div>
+    <div v-else-if="loadError" class="py-24 text-center text-slate-500">
+      <button @click="load(true)" class="rounded-lg border border-slate-700 px-4 py-2 text-slate-300 hover:bg-slate-800">
+        加载失败，点击重试
+      </button>
+    </div>
     <div v-else-if="!loading" class="py-24 text-center text-slate-500">
       暂无已发布内容（待审核发布后显示）
     </div>
 
     <BackToTop />
 
-    <div v-if="items.length < total" class="pb-2 text-center">
-      <button @click="more" :disabled="loading"
-        class="w-full rounded-xl border border-slate-700 py-3 text-sm text-slate-300 hover:bg-slate-800 disabled:opacity-50 sm:w-auto sm:px-8 sm:py-2">
-        {{ loading ? "加载中…" : "加载更多" }}
+    <div ref="loadSentinel" class="py-4 text-center text-sm text-slate-500">
+      <span v-if="loading && items.length">正在加载…</span>
+      <button v-else-if="loadError && items.length < total" @click="load(false)"
+        class="rounded-lg border border-slate-700 px-4 py-2 text-slate-300 hover:bg-slate-800">
+        加载失败，点击重试
       </button>
+      <span v-else-if="items.length && items.length >= total">已经到底了</span>
     </div>
   </div>
 </template>
