@@ -1,39 +1,55 @@
-SELECT l.id, rm.source_id, l.nickname, l.district, l.price_amount, l.price_currency,
-       l.description, l.media_json, l.confidence, l.published_at,
-       COALESCE(cp.is_online, FALSE) AS is_online,
-       COALESCE(cp.status_tier, 'unknown') AS presence_tier,
-       CASE WHEN $9::text = 'yesterday' THEN 'yesterday'
-            WHEN $9::text = 'today' THEN 'today'
-            WHEN EXISTS (
-                SELECT 1 FROM duty_snapshots ds
-                WHERE ds.duty_date = ((NOW() AT TIME ZONE 'Asia/Shanghai') - INTERVAL '4 hours')::date
-                  AND ds.contact_usernames ? lower(l.contact_username)
-            ) THEN 'today'
-            WHEN EXISTS (
-                SELECT 1 FROM duty_snapshots ds
-                WHERE ds.duty_date = ((NOW() AT TIME ZONE 'Asia/Shanghai') - INTERVAL '4 hours')::date - 1
-                  AND ds.contact_usernames ? lower(l.contact_username)
-            ) THEN 'yesterday'
-            ELSE NULL END AS duty_label,
-       EXISTS (SELECT 1 FROM user_favorites f
-               WHERE f.listing_id = l.id AND f.user_id = $8::bigint) AS favorited
-FROM listings l
-JOIN raw_messages rm ON rm.id = l.source_msg_id
-LEFT JOIN contact_presence cp ON cp.contact_peer_id = l.contact_peer_id
-WHERE l.status = 'published'
-  AND ($1::text IS NULL OR l.nickname ILIKE '%' || $1 || '%'
-       OR l.description ILIKE '%' || $1 || '%')
-  AND ($2::text IS NULL OR l.district = $2)
-  AND ($3::numeric IS NULL OR l.price_amount >= $3)
-  AND ($4::numeric IS NULL OR l.price_amount <= $4)
-  AND ($7::boolean IS NULL OR COALESCE(cp.is_online, FALSE) = $7)
-  AND ($9::text = 'all' OR EXISTS (
-      SELECT 1 FROM duty_snapshots ds
-      WHERE ds.duty_date = (
-          ((NOW() AT TIME ZONE 'Asia/Shanghai') - INTERVAL '4 hours')::date
-          - CASE WHEN $9::text = 'yesterday' THEN 1 ELSE 0 END
-      )
-        AND ds.contact_usernames ? lower(l.contact_username)
-  ))
-ORDER BY l.created_at DESC, l.id DESC
+WITH clock AS (
+    SELECT ((NOW() AT TIME ZONE 'Asia/Shanghai' - INTERVAL '4 hours')::date
+            + TIME '04:00') AT TIME ZONE 'Asia/Shanghai' AS business_start,
+           ((NOW() AT TIME ZONE 'Asia/Shanghai') - INTERVAL '4 hours')::date AS business_date
+), filtered AS (
+    SELECT l.id, rm.source_id, l.nickname, l.district, l.price_amount, l.price_currency,
+           l.description, l.media_json, l.confidence, l.published_at, l.created_at,
+           COALESCE(cp.is_online, FALSE) AS is_online,
+           COALESCE(cp.status_tier, 'unknown') AS presence_tier,
+           CASE WHEN $9::text = 'yesterday' THEN 'yesterday'
+                WHEN $9::text = 'today' THEN 'today'
+                WHEN EXISTS (
+                    SELECT 1 FROM duty_snapshots ds
+                    WHERE ds.duty_date = c.business_date
+                      AND ds.contact_usernames ? lower(l.contact_username)
+                ) THEN 'today'
+                WHEN EXISTS (
+                    SELECT 1 FROM duty_snapshots ds
+                    WHERE ds.duty_date = c.business_date - 1
+                      AND ds.contact_usernames ? lower(l.contact_username)
+                ) THEN 'yesterday'
+                ELSE NULL END AS duty_label,
+           EXISTS (
+               SELECT 1 FROM duty_snapshots ds
+               WHERE ds.duty_date = c.business_date
+                 AND ds.contact_usernames ? lower(l.contact_username)
+           ) AS on_duty_today,
+           l.created_at >= c.business_start AS newly_collected,
+           EXISTS (SELECT 1 FROM user_favorites f
+                   WHERE f.listing_id = l.id AND f.user_id = $8::bigint) AS favorited
+    FROM listings l
+    JOIN raw_messages rm ON rm.id = l.source_msg_id
+    LEFT JOIN contact_presence cp ON cp.contact_peer_id = l.contact_peer_id
+    CROSS JOIN clock c
+    WHERE l.status = 'published'
+      AND ($1::text IS NULL OR l.nickname ILIKE '%' || $1 || '%'
+           OR l.description ILIKE '%' || $1 || '%')
+      AND ($2::text IS NULL OR l.district = $2)
+      AND ($3::numeric IS NULL OR l.price_amount >= $3)
+      AND ($4::numeric IS NULL OR l.price_amount <= $4)
+      AND ($7::boolean IS NULL OR COALESCE(cp.is_online, FALSE) = $7)
+      AND ($9::text = 'all' OR EXISTS (
+          SELECT 1 FROM duty_snapshots ds
+          WHERE ds.duty_date = c.business_date
+              - CASE WHEN $9::text = 'yesterday' THEN 1 ELSE 0 END
+            AND ds.contact_usernames ? lower(l.contact_username)
+      ))
+)
+SELECT id, source_id, nickname, district, price_amount, price_currency,
+       description, media_json, confidence, published_at, is_online,
+       presence_tier, duty_label, favorited
+FROM filtered
+ORDER BY (on_duty_today AND newly_collected) DESC,
+         newly_collected DESC, created_at DESC, id DESC
 LIMIT GREATEST(1, $5::int) OFFSET GREATEST(0, $6::int);

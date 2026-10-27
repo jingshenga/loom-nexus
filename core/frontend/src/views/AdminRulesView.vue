@@ -12,6 +12,7 @@ const dryrun = ref(null);
 const llm = ref({ available: false, model: null });
 const flash = ref("");
 const sources = ref([]);
+const collectionSources = ref([]);
 const bindSourceId = ref(null);
 const sampleSourceId = ref(null);
 const sampleLimit = ref(20);
@@ -33,6 +34,8 @@ const EMPTY_DUTY_CONFIG = {
   update_mode: "replace_snapshot",
   identity_mode: "direct_username_links",
   target_channel_username: "",
+  auto_collect_enabled: true,
+  collection_source_id: null,
   profile_query_required: false,
   exclude_usernames: [],
   business_cutoff_hour: 4,
@@ -110,7 +113,9 @@ function newRule() {
 }
 
 async function loadRules() {
-  rules.value = (await api("/api/admin/rules")).items;
+  const data = await api("/api/admin/rules");
+  rules.value = data.items;
+  collectionSources.value = data.collection_sources || [];
   const visible = rules.value.filter((r) => (r.rule_type || "listing") === activeTab.value);
   if (!current.value) {
     if (visible.length) select(visible[0]);
@@ -535,6 +540,20 @@ onMounted(async () => {
             <input v-model="dutyForm.target_channel_username" placeholder="NBXMWBGJ"
               class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
           </label>
+          <label class="flex items-center gap-2 text-xs text-slate-300 sm:col-span-2">
+            <input v-model="dutyForm.auto_collect_enabled" type="checkbox" class="size-4 accent-emerald-500" />
+            自动补采今日在岗但尚无卡片的 TG 账号
+          </label>
+          <label v-if="dutyForm.auto_collect_enabled" class="text-xs text-slate-400 sm:col-span-2">名片采集来源
+            <select v-model.number="dutyForm.collection_source_id"
+              class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm">
+              <option :value="null" disabled>选择绑定了名片规则的来源…</option>
+              <option v-for="s in collectionSources" :key="s.id" :value="s.id">
+                {{ s.title || s.username || `来源#${s.id}` }}
+              </option>
+            </select>
+            <span class="mt-1 block text-slate-500">只查询日报关联的消息或精确 TG 用户名，使用该来源现有规则；不扫描群历史，也不按昵称匹配。</span>
+          </label>
           <label class="flex items-center gap-2 text-xs text-slate-400 sm:col-span-2">
             <input v-model="dutyForm.profile_query_required" type="checkbox" class="size-4 accent-emerald-500" />
             仅把带 profile 参数的个人链接识别为老师
@@ -621,9 +640,14 @@ onMounted(async () => {
       <section v-else class="space-y-3 lg:col-span-5 lg:overflow-y-auto">
         <div class="rounded-xl border border-slate-800 bg-slate-900/50 p-4">
           <h3 class="text-sm font-semibold">当前同步状态</h3>
-          <div class="mt-3 grid grid-cols-2 gap-3 text-sm">
-            <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-emerald-400">{{ current.duty_status?.matched || 0 }}</div><div class="text-xs text-slate-500">已匹配 TG 身份</div></div>
-            <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-amber-400">{{ current.duty_status?.unresolved || 0 }}</div><div class="text-xs text-slate-500">未匹配链接</div></div>
+          <div class="mt-3 grid grid-cols-2 gap-2 text-sm sm:grid-cols-3">
+            <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-sky-300">{{ current.duty_status?.matched || 0 }}</div><div class="text-xs text-slate-500">日报身份</div></div>
+            <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-emerald-400">{{ current.duty_status?.with_card || 0 }}</div><div class="text-xs text-slate-500">已有卡片</div></div>
+            <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-amber-300">{{ current.duty_status?.queued || 0 }}</div><div class="text-xs text-slate-500">排队补采</div></div>
+            <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-violet-300">{{ current.duty_status?.fetched || 0 }}</div><div class="text-xs text-slate-500">已取回，待提取</div></div>
+            <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-rose-300">{{ current.duty_status?.failed || 0 }}</div><div class="text-xs text-slate-500">失败 / 未找到</div></div>
+            <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-slate-300">{{ current.duty_status?.unqueued || 0 }}</div><div class="text-xs text-slate-500">尚未处理</div></div>
+            <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-amber-400">{{ current.duty_status?.unresolved || 0 }}</div><div class="text-xs text-slate-500">未解析日报链接</div></div>
           </div>
           <div class="mt-3 text-xs text-slate-500">最近同步：{{ current.duty_status?.observed_at ? new Date(current.duty_status.observed_at).toLocaleString('zh-CN') : '尚未同步' }}</div>
         </div>

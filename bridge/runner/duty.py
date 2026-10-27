@@ -15,6 +15,8 @@ SQL_SNAPSHOT = sqlres.load("duty_snapshot_upsert.sql")
 SQL_LINK_LOOKUP = sqlres.load("duty_link_lookup.sql")
 SQL_LINK_UPSERT = sqlres.load("duty_link_upsert.sql")
 SQL_LISTING_LOOKUP = sqlres.load("duty_listing_lookup.sql")
+SQL_COLLECTION_ENQUEUE = sqlres.load("duty_collection_enqueue.sql")
+SQL_COLLECTION_CANCEL_STALE = sqlres.load("duty_collection_cancel_stale.sql")
 
 TG_URL_RE = re.compile(r"https?://t\.me/([A-Za-z0-9_]+)(?:/(\d+))?[^\s]*", re.I)
 MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])@([A-Za-z][A-Za-z0-9_]{3,31})\b")
@@ -96,10 +98,10 @@ def listing_contact_username(message) -> str | None:
     return match.group(1).lower() if match else None
 
 
-async def _resolve_link(pool, client, channel: str, msg_id: int):
+async def _resolve_link(pool, client, channel: str, msg_id: int, entity=None):
     from telethon import utils
 
-    entity = await client.get_entity(channel)
+    entity = entity or await client.get_entity(channel)
     target_peer_id = utils.get_peer_id(entity)
     rows = await pool.fetch(SQL_LINK_LOOKUP, target_peer_id, msg_id)
     if rows:
@@ -122,31 +124,44 @@ async def _resolve_link(pool, client, channel: str, msg_id: int):
 async def parse_usernames(pool, client, message, config: dict):
     mode = config.get("identity_mode")
     if mode == "direct_username_links":
-        return profile_usernames(message, config), []
+        return profile_usernames(message, config), [], {}
     if mode != "linked_listing_messages":
-        return [], ["unsupported identity mode"]
+        return [], ["unsupported identity mode"], {}
 
     channel = str(config.get("target_channel_username") or "").lstrip("@")
+    posts = linked_posts(message, channel)
+    if not posts:
+        return [], [], {}
+    try:
+        entity = await client.get_entity(channel)
+    except Exception as exc:
+        logger.warning("duty target channel resolve failed (%s): %s", channel, exc)
+        return [], sorted({url for _, _, url in posts}), {}
+    from telethon import utils
+
+    target_peer_id = utils.get_peer_id(entity)
     usernames = []
     unresolved = []
-    for link_channel, msg_id, url in linked_posts(message, channel):
+    linked_targets = {}
+    for link_channel, msg_id, url in posts:
         try:
-            username = await _resolve_link(pool, client, link_channel, msg_id)
+            username = await _resolve_link(pool, client, link_channel, msg_id, entity)
         except Exception as exc:
             logger.warning("duty link resolve failed (%s/%s): %s", link_channel, msg_id, exc)
             username = None
         if username:
             usernames.append(username)
+            linked_targets.setdefault(username, (target_peer_id, msg_id))
         else:
             unresolved.append(url)
-    return sorted(set(usernames)), sorted(set(unresolved))
+    return sorted(set(usernames)), sorted(set(unresolved)), linked_targets
 
 
 async def process_message(pool, client, rule, message) -> bool:
     config = decode_config(rule["config_json"])
     if not message_matches(message, config):
         return False
-    usernames, unresolved = await parse_usernames(pool, client, message, config)
+    usernames, unresolved, linked_targets = await parse_usernames(pool, client, message, config)
     observed_at = message.edit_date or message.date or datetime.now(timezone.utc)
     duty_date, expires_at = business_window(
         observed_at, int(config.get("business_cutoff_hour") or 4),
@@ -161,6 +176,21 @@ async def process_message(pool, client, rule, message) -> bool:
         observed_at, expires_at,
     )
     changed = bool(rows[0]["changed"])
+    if changed:
+        await pool.fetch(SQL_COLLECTION_CANCEL_STALE, duty_date, rule["rule_id"])
+    collection_source_id = config.get("collection_source_id")
+    today, _ = business_window(datetime.now(timezone.utc), int(config.get("business_cutoff_hour") or 4))
+    if (
+        config.get("auto_collect_enabled", True)
+        and collection_source_id
+        and duty_date == today
+    ):
+        for username in usernames:
+            target_peer_id, target_msg_id = linked_targets.get(username, (None, None))
+            await pool.fetch(
+                SQL_COLLECTION_ENQUEUE, rule["rule_id"], duty_date,
+                int(collection_source_id), username, target_peer_id, target_msg_id,
+            )
     logger.info(
         "duty snapshot %s: rule=%s source=%s date=%s matched=%d unresolved=%d",
         "updated" if changed else "unchanged", rule["rule_id"],

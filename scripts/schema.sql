@@ -93,6 +93,27 @@ CREATE TABLE IF NOT EXISTS duty_link_cache (
     PRIMARY KEY (target_peer_id, target_msg_id)
 );
 
+-- Exact message/profile matches queued from the current on-duty digest.
+CREATE TABLE IF NOT EXISTS duty_collection_jobs (
+    id BIGSERIAL PRIMARY KEY,
+    rule_id BIGINT NOT NULL REFERENCES ingest_rules(id) ON DELETE CASCADE,
+    duty_date DATE NOT NULL,
+    source_id BIGINT NOT NULL REFERENCES ingest_sources(id) ON DELETE CASCADE,
+    account_id BIGINT NOT NULL REFERENCES bridge_accounts(id),
+    contact_username VARCHAR(128) NOT NULL,
+    target_peer_id BIGINT NOT NULL,
+    target_msg_id BIGINT,
+    status VARCHAR(16) NOT NULL DEFAULT 'pending',
+    raw_id BIGINT REFERENCES raw_messages(id) ON DELETE SET NULL,
+    error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_duty_collection_jobs_identity
+    ON duty_collection_jobs(duty_date, lower(contact_username));
+CREATE INDEX IF NOT EXISTS idx_duty_collection_jobs_pending
+    ON duty_collection_jobs(status, id);
+
 -- 6. structured listings
 CREATE TABLE IF NOT EXISTS listings (
     id BIGSERIAL PRIMARY KEY,

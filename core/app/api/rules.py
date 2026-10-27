@@ -29,6 +29,8 @@ SQL_SAMPLES = sqlres.load("dryrun_samples.sql")
 SQL_REQUEUE = sqlres.load("requeue_source.sql")
 SQL_COPY = sqlres.load("rule_copy.sql")
 SQL_DUTY_STATUS = sqlres.load("duty_rule_status.sql")
+SQL_DUTY_COLLECTION_SOURCES = sqlres.load("duty_collection_sources.sql")
+SQL_DUTY_COLLECTION_SOURCE_VALIDATE = sqlres.load("duty_collection_source_validate.sql")
 
 LLM_SYSTEM_PROMPT = (
     "你是消息抽取规则生成器。根据用户给出的样本消息，产出一个 JSON 规则对象，"
@@ -93,6 +95,7 @@ def _decode_jsonb(value, fallback):
 async def list_rules() -> dict:
     pool = _pool()
     rows = await pool.fetch(SQL_LIST)
+    collection_sources = await pool.fetch(SQL_DUTY_COLLECTION_SOURCES)
     statuses = {
         r["rule_id"]: r
         for r in await pool.fetch(SQL_DUTY_STATUS)
@@ -112,11 +115,20 @@ async def list_rules() -> dict:
                     if statuses.get(r["rule_id"]) and statuses[r["rule_id"]]["observed_at"]
                     else None,
                     "matched": statuses[r["rule_id"]]["matched"],
+                    "with_card": statuses[r["rule_id"]]["with_card"],
+                    "queued": statuses[r["rule_id"]]["queued"],
+                    "fetched": statuses[r["rule_id"]]["fetched"],
+                    "failed": statuses[r["rule_id"]]["failed"],
+                    "unqueued": statuses[r["rule_id"]]["unqueued"],
                     "unresolved": statuses[r["rule_id"]]["unresolved"],
                 } if r["rule_type"] == "on_duty" else None),
             }
             for r in rows
-        ]
+        ],
+        "collection_sources": [
+            {"id": r["source_id"], "title": r["title"], "username": r["username"]}
+            for r in collection_sources
+        ],
     }
 
 
@@ -133,6 +145,13 @@ async def upsert_rule(body: RuleBody) -> dict:
             raise HTTPException(
                 status_code=422, detail=f"在岗规则缺少配置：{', '.join(missing)}",
             )
+        if body.config.get("auto_collect_enabled", True):
+            try:
+                collection_source_id = int(body.config.get("collection_source_id"))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=422, detail="请选择自动补采的名片来源")
+            if not await pool.fetch(SQL_DUTY_COLLECTION_SOURCE_VALIDATE, collection_source_id):
+                raise HTTPException(status_code=422, detail="自动补采来源需启用且绑定名片抓取规则")
     rows = await pool.fetch(
         SQL_UPSERT, body.rule_name, body.rule_type,
         json.dumps(body.config, ensure_ascii=False), body.is_active,
