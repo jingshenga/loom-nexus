@@ -47,6 +47,24 @@ class MediaOcrTests(unittest.TestCase):
         self.assertIn("02年", fields["unparsed_year_text"][0])
         self.assertIn("age_years", evidence)
 
+    def test_fields_capture_explicit_features_prices_and_fixed_intro_only(self):
+        lines = [
+            {"text": "价格：1P800 2P1500"},
+            {"text": "服务：陪浴"},
+            {"text": "特点：长发"},
+            {"text": "禁嗑药 禁无套 禁醉酒 禁桩基 禁拔套 禁鸽子 禁变态"},
+            {"text": "请携带现金"},
+        ]
+        fields, _ = extract_card_fields(lines)
+        self.assertEqual(fields["features_text"], ["特点：长发"])
+        self.assertEqual(fields["price_1p_text"], ["价格：1P800 2P1500"])
+        self.assertEqual(fields["price_2p_text"], ["价格：1P800 2P1500"])
+        self.assertEqual(fields["fixed_intro_terms"], [
+            "禁嗑药", "禁无套", "禁醉酒", "禁桩基", "禁拔套", "禁鸽子", "禁变态",
+        ])
+        self.assertEqual(fields["cash_text"], ["请携带现金"])
+        self.assertNotIn("stage_name_candidate", fields)
+
     def test_non_admin_media_does_not_include_unclassified_photos(self):
         media = [
             {"kind": "photo", "path": "card.jpg", "visibility": "admin"},

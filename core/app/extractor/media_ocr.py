@@ -28,6 +28,15 @@ _LABELS = (
     re.compile(r"服务|课表|项目|套餐"),
     re.compile(r"禁|不接|不做|不接受|无套"),
 )
+_FIXED_INTRO = {
+    "禁嗑药": re.compile(r"禁[\s:：，,、]*嗑药"),
+    "禁无套": re.compile(r"禁[\s:：，,、]*无套"),
+    "禁醉酒": re.compile(r"禁[\s:：，,、]*醉酒"),
+    "禁桩基": re.compile(r"禁[\s:：，,、]*桩基"),
+    "禁拔套": re.compile(r"禁[\s:：，,、]*拔套"),
+    "禁鸽子": re.compile(r"禁[\s:：，,、]*鸽子"),
+    "禁变态": re.compile(r"禁[\s:：，,、]*变态"),
+}
 
 
 def normalize_ocr_text(text: str) -> str:
@@ -130,7 +139,7 @@ def extract_card_fields(lines: list) -> tuple[dict, dict]:
         for index, line in enumerate(lines)
         if 2 <= len(re.sub(r"\s+", "", text_lines[index])) <= 12
         and re.search(r"[\u3400-\u9fff]", text_lines[index])
-        and not re.search(r"艺名|昵称|身高|体重|胸围|年龄|服务|价格|课费|水费|禁", text_lines[index])
+        and not re.search(r"艺名|昵称|身高|体重|胸围|年龄|服务|特点|特征|特性|价格|课费|水费|现金|携带|禁", text_lines[index])
     ]
     if title_candidates and not any(re.search(r"(?:艺名|昵称)\s*[:：]?", line) for line in text_lines):
         _, index, title = max(title_candidates)
@@ -162,10 +171,15 @@ def extract_card_fields(lines: list) -> tuple[dict, dict]:
 
     locations = []
     services = []
+    features = []
     restrictions = []
     fees = []
+    one_person_fees = []
+    two_person_fees = []
+    cash_lines = []
     handles = []
     other = []
+    fixed_intro_terms = set()
     for index, line in enumerate(text_lines):
         if not line:
             continue
@@ -173,21 +187,42 @@ def extract_card_fields(lines: list) -> tuple[dict, dict]:
             locations.append(line)
         if re.search(r"服务|课表|服务详情|服务内容|项目|套餐", line):
             services.append(line)
+        if re.search(r"特点|特征", line):
+            features.append(line)
         if re.search(r"禁|不接|不做|不接受|无套", line):
             restrictions.append(line)
+        for term, pattern in _FIXED_INTRO.items():
+            if pattern.search(line):
+                fixed_intro_terms.add(term)
+        if re.search(r"现金|現金", line):
+            cash_lines.append(line)
+        if re.search(r"(?:^|[^\w])1\s*p", line, re.I):
+            one_person_fees.append(line)
+        if re.search(r"(?:^|[^\w])2\s*p", line, re.I):
+            two_person_fees.append(line)
         if re.search(r"课费|水费|价格|收费|费用|\bP{1,2}\s*\d|\d\s*P{1,2}\b|\d+\s*分钟", line, re.I):
             fees.append(line)
         handles.extend(re.findall(r"@[A-Za-z0-9_]{3,}", line))
-        if not any(line in group for group in (locations, services, restrictions, fees)):
+        if not any(line in group for group in (locations, services, features, restrictions, fees, cash_lines)):
             other.append(line)
     if locations:
         fields["location_text"] = locations
     if services:
         fields["service_text"] = services
+    if features:
+        fields["features_text"] = features
     if restrictions:
         fields["restriction_text"] = restrictions
+    if fixed_intro_terms:
+        fields["fixed_intro_terms"] = [term for term in _FIXED_INTRO if term in fixed_intro_terms]
+    if cash_lines:
+        fields["cash_text"] = cash_lines
     if fees:
         fields["price_text"] = fees
+    if one_person_fees:
+        fields["price_1p_text"] = one_person_fees
+    if two_person_fees:
+        fields["price_2p_text"] = two_person_fees
     if handles:
         fields["contact_handles"] = sorted(set(handles))
     year_mentions = [line for line in text_lines if re.search(r"\d{2}年", line)]
