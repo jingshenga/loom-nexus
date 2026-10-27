@@ -14,6 +14,11 @@ const selectedIds = ref([]);
 const nicknameFilter = ref("");
 const appliedNickname = ref("");
 const recollectStatus = ref("");
+const activeWorkbench = ref("review");
+const dutyRecovery = ref([]);
+const selectedRecovery = ref(null);
+const recoveryForm = ref({ contact_peer_id: "", profile_url: "", channel_url: "", bot_url: "" });
+const manualForm = ref({ nickname: "", district: "", price_amount: "", price_currency: "CNY", description: "", source_url: "", image_data: "", image_mime: "" });
 let timer = null;
 let recollectTimer = null;
 let recollectJobIds = [];
@@ -79,6 +84,88 @@ async function loadQueue() {
   if (!data.items.some((x) => x.id === (current.value && current.value.id))) {
     select(data.items[0] || null);
   }
+}
+
+async function loadDutyRecovery() {
+  const data = await api("/api/admin/review/duty-recovery");
+  dutyRecovery.value = data.items;
+  const refreshed = data.items.find((item) => item.id === selectedRecovery.value?.id);
+  if (refreshed) {
+    selectedRecovery.value = refreshed;
+  } else {
+    selectRecovery(data.items[0] || null);
+  }
+}
+
+function selectRecovery(item) {
+  selectedRecovery.value = item;
+  recoveryForm.value = item ? {
+    contact_peer_id: item.contact_peer_id || "",
+    profile_url: item.profile_url || "",
+    channel_url: item.channel_url || "",
+    bot_url: item.bot_url || "",
+  } : { contact_peer_id: "", profile_url: "", channel_url: "", bot_url: "" };
+  manualForm.value = {
+    ...manualForm.value,
+    contact_username: item?.contact_username || "",
+    bot_url: item?.bot_url || "",
+  };
+}
+
+async function saveRecoveryLinks() {
+  if (!selectedRecovery.value) return;
+  await api(`/api/admin/review/duty-recovery/${selectedRecovery.value.id}`, {
+    method: "PATCH", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...recoveryForm.value, contact_peer_id: recoveryForm.value.contact_peer_id || null }),
+  });
+  notify("TG 账号与频道/Bot 链接已保存");
+  await loadDutyRecovery();
+}
+
+async function scanRecovery(target) {
+  if (!selectedRecovery.value) return;
+  try {
+    await api(`/api/admin/review/duty-recovery/${selectedRecovery.value.id}/scan`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target }),
+    });
+    notify(`已排入公开频道扫描：最多 ${target} 条`);
+    await loadDutyRecovery();
+  } catch (e) {
+    notify(`扫描未启动：${e.message}`);
+  }
+}
+
+async function chooseRecoveryImage(event) {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || file.size > 10 * 1024 * 1024) {
+    notify("请选择 10 MB 以内的 JPEG、PNG 或 WebP 图片");
+    event.target.value = "";
+    return;
+  }
+  const dataUrl = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+  manualForm.value.image_data = String(dataUrl).split(",", 2)[1];
+  manualForm.value.image_mime = file.type;
+}
+
+async function createManualDutyCard() {
+  if (!selectedRecovery.value) return;
+  const body = { ...manualForm.value, contact_peer_id: recoveryForm.value.contact_peer_id || null,
+    contact_username: selectedRecovery.value.contact_username, bot_url: recoveryForm.value.bot_url };
+  if (body.price_amount === "") body.price_amount = null;
+  const result = await api(`/api/admin/review/duty-recovery/${selectedRecovery.value.id}/manual-card`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  notify(`已创建待审核卡片 #${result.id}`);
+  manualForm.value = { nickname: "", district: "", price_amount: "", price_currency: "CNY", description: "", source_url: "", image_data: "", image_mime: "", contact_username: selectedRecovery.value.contact_username, bot_url: recoveryForm.value.bot_url || "" };
+  await loadQueue();
+  await loadDutyRecovery();
 }
 
 async function applyNicknameFilter() {
@@ -171,8 +258,9 @@ function onKey(e) {
 
 onMounted(async () => {
   await loadQueue();
+  await loadDutyRecovery();
   window.addEventListener("keydown", onKey);
-  timer = setInterval(loadQueue, 15000);
+  timer = setInterval(() => { loadQueue(); loadDutyRecovery(); }, 15000);
   try {
     recollectJobIds = JSON.parse(sessionStorage.getItem(RECOLLECT_STORAGE_KEY) || "[]");
     if (recollectJobIds.length) {
@@ -193,6 +281,67 @@ onUnmounted(() => {
 <template>
   <div class="space-y-3">
   <AdminTabs />
+
+    <div class="flex gap-2">
+      <button @click="activeWorkbench = 'review'" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'review' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">审核队列</button>
+      <button @click="activeWorkbench = 'duty'" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'duty' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">在岗补采（{{ dutyRecovery.length }}）</button>
+    </div>
+
+    <section v-if="activeWorkbench === 'duty'" class="grid gap-4 lg:grid-cols-12">
+      <aside class="max-h-56 space-y-2 overflow-y-auto lg:col-span-4 lg:max-h-[calc(100dvh-210px)]">
+        <button v-for="item in dutyRecovery" :key="item.id" @click="selectRecovery(item)" class="w-full rounded-lg border p-3 text-left" :class="selectedRecovery?.id === item.id ? 'border-sky-500 bg-sky-600/10' : 'border-slate-800 bg-slate-900'">
+          <div class="font-medium">@{{ item.contact_username }}</div>
+          <div class="mt-1 text-xs text-slate-400">{{ item.source_title || '来源群组' }} · {{ item.duty_date }} · {{ item.status }}</div>
+          <div v-if="item.error" class="mt-1 line-clamp-2 text-xs text-amber-300">{{ item.error }}</div>
+        </button>
+        <div v-if="!dutyRecovery.length" class="py-10 text-center text-sm text-slate-500">暂无未找到或失败的在岗账号</div>
+      </aside>
+      <div v-if="selectedRecovery" class="space-y-4 rounded-xl border border-slate-800 bg-slate-900/50 p-4 lg:col-span-8">
+        <div>
+          <h3 class="font-semibold">@{{ selectedRecovery.contact_username }} 的人工补采</h3>
+          <div class="mt-1 text-xs text-slate-400">原来源：{{ selectedRecovery.source_title || '未知' }}；TG 数字 ID 仅在可确认时填写。不会按昵称匹配或读取头像。</div>
+          <a v-if="selectedRecovery.target_msg_id && selectedRecovery.source_username" class="mt-1 inline-block text-xs text-sky-300" :href="`https://t.me/${selectedRecovery.source_username}/${selectedRecovery.target_msg_id}`" target="_blank" rel="noreferrer">打开原在岗消息</a>
+        </div>
+        <div class="grid gap-2 sm:grid-cols-2">
+          <label class="text-xs text-slate-400">Telegram 数字 ID<input v-model="recoveryForm.contact_peer_id" inputmode="numeric" class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm" /></label>
+          <label class="text-xs text-slate-400">公开简介链接<input v-model="recoveryForm.profile_url" class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm" /></label>
+          <label class="text-xs text-slate-400">频道链接<input v-model="recoveryForm.channel_url" class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm" /></label>
+          <label class="text-xs text-slate-400">Bot 联系地址（单独保存）<input v-model="recoveryForm.bot_url" class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm" /></label>
+        </div>
+        <button @click="saveRecoveryLinks" class="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-800">保存账号与链接</button>
+        <div class="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="mr-auto text-sm">频道消息扫描：{{ selectedRecovery.scanned_count }}/{{ selectedRecovery.scan_target }} · {{ selectedRecovery.recovery_scan_status }}</span>
+            <button v-for="depth in [20, 50, 100]" :key="depth" @click="scanRecovery(depth)" :disabled="selectedRecovery.scanned_count >= depth || selectedRecovery.recovery_scan_status === 'processing' || !recoveryForm.channel_url" class="rounded border border-sky-800 px-2 py-1 text-xs text-sky-300 disabled:opacity-40">扫到 {{ depth }} 条</button>
+          </div>
+          <div v-if="selectedRecovery.scan_error" class="mt-2 text-xs text-rose-300">{{ selectedRecovery.scan_error }}</div>
+          <div v-if="selectedRecovery.candidates?.length" class="mt-3 space-y-2">
+            <div v-for="candidate in selectedRecovery.candidates" :key="candidate.message_id" class="rounded bg-slate-900 p-2 text-xs">
+              <div class="flex justify-between gap-2"><a :href="candidate.url" target="_blank" rel="noreferrer" class="text-sky-300">打开候选 Telegram 消息 ↗</a><button @click="manualForm.source_url = candidate.url" class="text-slate-400 hover:text-white">用作卡片来源</button></div>
+              <div v-if="candidate.posted_at" class="mt-1 text-slate-500">{{ new Date(candidate.posted_at).toLocaleString('zh-CN') }}</div>
+              <p v-if="candidate.text" class="mt-1 whitespace-pre-wrap text-slate-300">{{ candidate.text }}</p>
+            </div>
+          </div>
+          <p v-else class="mt-2 text-xs text-slate-500">扫描结果只保存匹配账号的消息链接和文字；如需图片，请打开候选消息并由管理员上传确认后的图片。</p>
+        </div>
+        <div class="border-t border-slate-800 pt-3">
+          <h4 class="mb-2 font-medium">管理员手工补录（创建后进入待审核）</h4>
+          <div class="grid gap-2 sm:grid-cols-2">
+            <input v-model="manualForm.nickname" placeholder="昵称" class="rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm" />
+            <input v-model="manualForm.district" placeholder="位置" class="rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm" />
+            <input v-model.number="manualForm.price_amount" type="number" placeholder="价格" class="rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm" />
+            <input v-model="manualForm.price_currency" placeholder="币种" class="rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm" />
+            <input v-model="manualForm.source_url" placeholder="Telegram 消息/来源链接" class="rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm sm:col-span-2" />
+            <textarea v-model="manualForm.description" rows="3" placeholder="文字介绍" class="rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm sm:col-span-2" />
+            <input type="file" accept="image/jpeg,image/png,image/webp" @change="chooseRecoveryImage" class="text-sm text-slate-400 sm:col-span-2" />
+          </div>
+          <button @click="createManualDutyCard" class="mt-3 rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium hover:bg-sky-500">创建待审核卡片</button>
+        </div>
+      </div>
+      <div v-else class="flex items-center justify-center rounded-xl border border-slate-800 text-sm text-slate-500 lg:col-span-8">选择一个未找到账号</div>
+    </section>
+
+    <template v-else>
 
     <div class="flex flex-wrap items-center gap-2">
       <h2 class="text-lg font-semibold">审核工作台</h2>
@@ -342,5 +491,6 @@ onUnmounted(() => {
         </div>
       </section>
     </div>
+    </template>
   </div>
 </template>

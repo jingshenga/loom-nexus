@@ -17,7 +17,7 @@ SELECT l.id, rm.source_id, l.nickname, l.district, l.price_amount, l.price_curre
          END AS duty_label
 FROM user_favorites f
 JOIN listings l ON l.id = f.listing_id AND l.status = 'published'
-JOIN raw_messages rm ON rm.id = l.source_msg_id
+LEFT JOIN raw_messages rm ON rm.id = l.source_msg_id
 LEFT JOIN contact_presence cp ON cp.contact_peer_id = l.contact_peer_id
 WHERE f.user_id = $1::bigint
 ORDER BY (CASE WHEN EXISTS (

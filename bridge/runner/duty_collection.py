@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import re
 
 from runner import backfill, hub, sqlres
 from runner.duty import listing_contact_username, profile_usernames
@@ -13,6 +14,8 @@ SQL_EXISTING = sqlres.load("duty_collection_existing.sql")
 SQL_APPEND = sqlres.load("append_sample.sql")
 SQL_FINISH = sqlres.load("duty_collection_finish.sql")
 POLL_S = 3.0
+SQL_SCAN_CLAIM = sqlres.load("duty_recovery_scan_claim.sql")
+SQL_SCAN_FINISH = sqlres.load("duty_recovery_scan_finish.sql")
 
 
 def _matches_username(message, username: str) -> bool:
@@ -92,6 +95,46 @@ async def _collect(pool, client, job) -> tuple[str, int | None, str | None]:
     return "fetched", raw_id, None
 
 
+def _json_list(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+            return decoded if isinstance(decoded, list) else []
+        except ValueError:
+            return []
+    return []
+
+
+async def _scan_recovery(client, job):
+    channel_url = str(job["channel_url"] or "").strip()
+    match = re.fullmatch(r"https?://t\.me/([A-Za-z0-9_]+)(?:/\d+)?/?(?:\?.*)?", channel_url, re.I)
+    if not match:
+        raise ValueError("save a public Telegram channel link before scanning")
+    channel = match.group(1)
+    entity = await client.get_entity(channel)
+    cursor = int(job["scan_cursor"] or 0)
+    count = int(job["scanned_count"] or 0)
+    wanted = int(job["scan_target"])
+    remaining = max(0, wanted - count)
+    candidates = _json_list(job["candidates"])
+    seen = {item.get("message_id") for item in candidates}
+    async for message in client.iter_messages(entity, limit=remaining, offset_id=cursor):
+        cursor = int(message.id)
+        count += 1
+        if _matches_username(message, job["contact_username"]) and message.id not in seen:
+            seen.add(message.id)
+            channel_name = getattr(entity, "username", None) or channel
+            candidates.append({
+                "message_id": int(message.id),
+                "url": f"https://t.me/{channel_name}/{message.id}",
+                "text": (message.raw_text or "")[:5000],
+                "posted_at": message.date.isoformat() if message.date else None,
+            })
+    return count, cursor, candidates, "done"
+
+
 async def run_duty_collection(pool, stop) -> None:
     logger.info("on-duty linked-message collection worker started")
     while not stop.is_set():
@@ -117,6 +160,28 @@ async def run_duty_collection(pool, stop) -> None:
                         "on-duty linked-message job failed (job=%s): %s",
                         job["job_id"], exc,
                     )
+            scans = await pool.fetch(SQL_SCAN_CLAIM)
+            for scan in scans:
+                try:
+                    if not scan["session_file"]:
+                        raise RuntimeError("assigned Telegram account is unavailable")
+                    client = await hub.get_client(str(scan["session_file"]).removesuffix(".session"))
+                    if client is None:
+                        raise RuntimeError("Telegram account is unauthorized")
+                    count, cursor, candidates, status = await _scan_recovery(client, scan)
+                    await pool.fetch(
+                        SQL_SCAN_FINISH, scan["scan_id"], count, cursor,
+                        json.dumps(candidates, ensure_ascii=False), status, None,
+                    )
+                    logger.info("on-duty recovery scan %s: job=%s scanned=%s candidates=%s",
+                                status, scan["duty_job_id"], count, len(candidates))
+                except Exception as exc:
+                    await pool.fetch(
+                        SQL_SCAN_FINISH, scan["scan_id"], scan["scanned_count"],
+                        scan["scan_cursor"], json.dumps(_json_list(scan["candidates"])),
+                        "failed", str(exc)[:1000],
+                    )
+                    logger.warning("on-duty recovery scan failed (job=%s): %s", scan["duty_job_id"], exc)
         except Exception:
             logger.exception("on-duty linked-message polling failed")
         try:

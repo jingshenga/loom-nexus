@@ -29,7 +29,7 @@ WITH clock AS (
            EXISTS (SELECT 1 FROM user_favorites f
                    WHERE f.listing_id = l.id AND f.user_id = $8::bigint) AS favorited
     FROM listings l
-    JOIN raw_messages rm ON rm.id = l.source_msg_id
+    LEFT JOIN raw_messages rm ON rm.id = l.source_msg_id
     LEFT JOIN contact_presence cp ON cp.contact_peer_id = l.contact_peer_id
     CROSS JOIN clock c
     WHERE l.status = 'published'
