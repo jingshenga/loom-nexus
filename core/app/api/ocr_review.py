@@ -57,6 +57,14 @@ async def queue(status: str = "pending", limit: int = 40, offset: int = 0) -> di
         "LIMIT GREATEST(1,$2::int) OFFSET GREATEST(0,$3::int)",
         status, limit, offset,
     )
+    total = await pool.fetchval(
+        "SELECT count(*) FROM listing_media_ocr o "
+        "WHERE CASE WHEN $1='pending' THEN o.review_status='pending' "
+        " WHEN $1='confirmed' THEN o.review_status='confirmed' "
+        " WHEN $1='not_card' THEN o.review_status='not_card' "
+        " ELSE o.status='failed' END",
+        status,
+    )
     items = []
     for row in rows:
         items.append({
@@ -79,7 +87,7 @@ async def queue(status: str = "pending", limit: int = 40, offset: int = 0) -> di
             "source_title": row["source_title"],
             "nickname": row["nickname"],
         })
-    return {"items": items}
+    return {"items": items, "total": total}
 
 
 @router.patch("/{asset_id}")

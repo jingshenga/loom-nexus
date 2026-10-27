@@ -7,6 +7,9 @@ import { Check, RotateCw, X, ImageIcon } from "lucide-vue-next";
 const items = ref([]);
 const current = ref(null);
 const status = ref("pending");
+const offset = ref(0);
+const total = ref(0);
+const pageSize = 40;
 const fieldsText = ref("{}");
 const normalizedText = ref("");
 const flash = ref("");
@@ -24,11 +27,27 @@ function notify(message) {
 }
 
 async function load() {
-  const data = await api(`/api/admin/ocr/queue?status=${status.value}`);
+  const data = await api(`/api/admin/ocr/queue?status=${status.value}&limit=${pageSize}&offset=${offset.value}`);
+  total.value = data.total;
+  if (!data.items.length && offset.value > 0 && total.value > 0) {
+    offset.value = Math.floor((total.value - 1) / pageSize) * pageSize;
+    return load();
+  }
   items.value = data.items;
   if (!data.items.some((item) => item.id === current.value?.id)) {
     select(data.items[0] || null);
   }
+}
+
+function changeStatus() {
+  offset.value = 0;
+  load();
+}
+
+function changePage(delta) {
+  const lastOffset = Math.max(0, Math.floor((total.value - 1) / pageSize) * pageSize);
+  offset.value = Math.min(lastOffset, Math.max(0, offset.value + delta * pageSize));
+  load();
 }
 
 async function save() {
@@ -97,13 +116,17 @@ onMounted(load);
     <AdminTabs />
     <div class="flex flex-wrap items-center gap-3">
       <h2 class="text-lg font-semibold">OCR 资料核对</h2>
-      <select v-model="status" @change="load" class="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm">
+      <select v-model="status" @change="changeStatus" class="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm">
         <option value="pending">待核对</option>
         <option value="failed">识别失败</option>
         <option value="confirmed">已确认</option>
         <option value="not_card">非资料卡</option>
       </select>
-      <span class="text-xs text-slate-500">当前 {{ items.length }} 张</span>
+      <span class="text-xs text-slate-500">{{ total ? offset + 1 : 0 }}–{{ Math.min(offset + items.length, total) }} / {{ total }} 张</span>
+      <div class="flex items-center gap-1">
+        <button :disabled="offset === 0" @click="changePage(-1)" class="rounded border border-slate-700 px-2 py-1 text-xs text-slate-300 disabled:opacity-40">上一页</button>
+        <button :disabled="offset + pageSize >= total" @click="changePage(1)" class="rounded border border-slate-700 px-2 py-1 text-xs text-slate-300 disabled:opacity-40">下一页</button>
+      </div>
       <span v-if="flash" class="ml-auto rounded bg-emerald-600/20 px-3 py-1 text-xs text-emerald-300">{{ flash }}</span>
     </div>
 
