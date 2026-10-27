@@ -1,5 +1,5 @@
 """Admin review workbench APIs (token-protected)."""
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
 
 from app import db, sqlres
@@ -16,6 +16,9 @@ SQL_REJECT = sqlres.load("reject.sql")
 SQL_UPDATE = sqlres.load("update_fields.sql")
 SQL_WITHDRAW = sqlres.load("withdraw.sql")
 SQL_BATCH_DELETE = sqlres.load("batch_delete.sql")
+SQL_RECOLLECT_TARGETS = sqlres.load("recollect_targets.sql")
+SQL_RECOLLECT_ENQUEUE = sqlres.load("recollect_enqueue.sql")
+SQL_RECOLLECT_STATUS = sqlres.load("recollect_status.sql")
 
 
 def _decode(value, fallback):
@@ -32,11 +35,14 @@ def _decode(value, fallback):
 
 
 @router.get("/queue")
-async def queue(status: str = "pending", limit: int = 30, offset: int = 0) -> dict:
+async def queue(
+    status: str = "pending", limit: int = 30, offset: int = 0,
+    nickname: str = None,
+) -> dict:
     pool = db.get_pool()
     if pool is None:
         raise HTTPException(status_code=503, detail="database unavailable")
-    rows = await pool.fetch(SQL_QUEUE, status, limit, offset)
+    rows = await pool.fetch(SQL_QUEUE, status, limit, offset, nickname or None)
     items = []
     for r in rows:
         items.append({
@@ -69,6 +75,60 @@ class FieldEdits(BaseModel):
 
 class BatchDeleteBody(BaseModel):
     ids: list
+
+
+class RecollectBody(BaseModel):
+    ids: list[int]
+
+
+@router.post("/recollect")
+async def recollect(body: RecollectBody) -> dict:
+    """Queue a Telegram refresh for up to 20 selected cards."""
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    ids = sorted(set(body.ids))
+    if not ids or len(ids) > 20:
+        raise HTTPException(status_code=400, detail="select between 1 and 20 cards")
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            targets = await conn.fetch(SQL_RECOLLECT_TARGETS, ids)
+            if len(targets) != len(ids):
+                raise HTTPException(
+                    status_code=409,
+                    detail="some cards have no active Telegram source/account",
+                )
+            jobs = await conn.fetch(SQL_RECOLLECT_ENQUEUE, ids)
+            if len(jobs) != len(ids):
+                raise HTTPException(status_code=409, detail="a selected card is already being recollected")
+    return {
+        "jobs": [
+            {"job_id": row["job_id"], "listing_id": row["listing_id"]}
+            for row in jobs
+        ]
+    }
+
+
+@router.get("/recollect/status")
+async def recollect_status(job_ids: list[int] = Query(default=[])) -> dict:
+    if not job_ids or len(job_ids) > 20:
+        raise HTTPException(status_code=400, detail="job_ids required (max 20)")
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    rows = await pool.fetch(SQL_RECOLLECT_STATUS, job_ids)
+    return {
+        "jobs": [
+            {
+                "job_id": row["job_id"],
+                "listing_id": row["listing_id"],
+                "status": row["status"],
+                "error": row["error"],
+                "updated_at": row["updated_at"].isoformat(),
+            }
+            for row in rows
+        ]
+    }
 
 
 @router.post("/batch-delete")

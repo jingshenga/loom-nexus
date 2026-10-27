@@ -31,7 +31,7 @@ MEDIA_DIR = os.getenv("NEXUS_MEDIA_DIR", "/app/data/media")
 MAX_MEDIA_BYTES = int(os.getenv("NEXUS_BRIDGE_MEDIA_MAX_MB", "50")) * 1024 * 1024
 
 
-async def save_media(msg, source_id: int) -> list:
+async def save_media(msg, source_id: int, stable_prefix: str | None = None) -> list:
     """Download photo/video for one message; returns media_json items."""
     try:
         is_photo = bool(msg.photo)
@@ -48,7 +48,13 @@ async def save_media(msg, source_id: int) -> list:
                 return []
         target_dir = os.path.join(MEDIA_DIR, f"src_{source_id}")
         os.makedirs(target_dir, exist_ok=True)
-        saved = await msg.download_media(file=target_dir)
+        target = target_dir
+        if stable_prefix:
+            media_obj = msg.photo or msg.video or msg.video_note or msg.document
+            media_id = getattr(media_obj, "id", None) or msg.id
+            ext = getattr(msg.file, "ext", None) or (".mp4" if is_video else ".jpg")
+            target = os.path.join(target_dir, f"{stable_prefix}_{media_id}{ext}")
+        saved = await msg.download_media(file=target)
         if not saved:
             return []
         rel = os.path.relpath(str(saved), MEDIA_DIR)
