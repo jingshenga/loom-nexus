@@ -1,7 +1,7 @@
 <script setup>
 import { onMounted, onUnmounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { Search, MapPin } from "lucide-vue-next";
+import { Search, MapPin, X } from "lucide-vue-next";
 import BackToTop from "../components/BackToTop.vue";
 
 const route = useRoute();
@@ -180,6 +180,11 @@ onUnmounted(() => {
           v-model="q" @keyup.enter="load(true)" placeholder="关键词 / 昵称"
           class="w-full bg-transparent text-sm outline-none placeholder:text-slate-600 sm:w-44"
         />
+        <button v-if="q" @click="q = ''; load(true)"
+          aria-label="清除昵称搜索" title="清除昵称搜索"
+          class="flex shrink-0 items-center gap-1 rounded-lg px-1.5 py-1 text-xs text-slate-400 hover:bg-slate-800 hover:text-slate-200">
+          <X class="size-3.5" />清除
+        </button>
       </div>
       <div class="ml-auto flex items-center gap-1.5 text-xs text-slate-500">
         <input v-model.number="minPrice" @change="load(true)" placeholder="最低价" type="number"
