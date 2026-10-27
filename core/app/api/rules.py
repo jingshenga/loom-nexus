@@ -6,6 +6,7 @@ config, validated endpoints).
 """
 import json
 import re
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -26,6 +27,8 @@ SQL_BIND = sqlres.load("rule_bind.sql")
 SQL_UNBIND = sqlres.load("rule_unbind.sql")
 SQL_SAMPLES = sqlres.load("dryrun_samples.sql")
 SQL_REQUEUE = sqlres.load("requeue_source.sql")
+SQL_COPY = sqlres.load("rule_copy.sql")
+SQL_DUTY_STATUS = sqlres.load("duty_rule_status.sql")
 
 LLM_SYSTEM_PROMPT = (
     "你是消息抽取规则生成器。根据用户给出的样本消息，产出一个 JSON 规则对象，"
@@ -41,6 +44,7 @@ LLM_SYSTEM_PROMPT = (
 
 class RuleBody(BaseModel):
     rule_name: str
+    rule_type: Literal["listing", "on_duty"] = "listing"
     config: dict
     is_active: bool = True
 
@@ -61,6 +65,10 @@ class DryRunBody(BaseModel):
 
 class GenerateBody(BaseModel):
     samples: list
+
+
+class CopyBody(BaseModel):
+    rule_name: str
 
 
 def _pool():
@@ -85,15 +93,27 @@ def _decode_jsonb(value, fallback):
 async def list_rules() -> dict:
     pool = _pool()
     rows = await pool.fetch(SQL_LIST)
+    statuses = {
+        r["rule_id"]: r
+        for r in await pool.fetch(SQL_DUTY_STATUS)
+    }
     return {
         "items": [
             {
                 "id": r["rule_id"],
                 "rule_name": r["rule_name"],
+                "rule_type": r["rule_type"],
                 "version": r["version"],
                 "config": _decode_jsonb(r["config_json"], {}),
                 "is_active": r["is_active"],
                 "bindings": _decode_jsonb(r["bindings"], []),
+                "duty_status": ({
+                    "observed_at": statuses[r["rule_id"]]["observed_at"].isoformat()
+                    if statuses.get(r["rule_id"]) and statuses[r["rule_id"]]["observed_at"]
+                    else None,
+                    "matched": statuses[r["rule_id"]]["matched"],
+                    "unresolved": statuses[r["rule_id"]]["unresolved"],
+                } if r["rule_type"] == "on_duty" else None),
             }
             for r in rows
         ]
@@ -103,10 +123,34 @@ async def list_rules() -> dict:
 @router.put("")
 async def upsert_rule(body: RuleBody) -> dict:
     pool = _pool()
+    if body.rule_type == "on_duty":
+        required = ("sender_peer_id", "match_prefix", "update_mode", "identity_mode")
+        missing = [key for key in required if not body.config.get(key)]
+        if body.config.get("identity_mode") == "linked_listing_messages" \
+                and not body.config.get("target_channel_username"):
+            missing.append("target_channel_username")
+        if missing:
+            raise HTTPException(
+                status_code=422, detail=f"在岗规则缺少配置：{', '.join(missing)}",
+            )
     rows = await pool.fetch(
-        SQL_UPSERT, body.rule_name,
+        SQL_UPSERT, body.rule_name, body.rule_type,
         json.dumps(body.config, ensure_ascii=False), body.is_active,
     )
+    return {"rule_id": rows[0]["rule_id"], "version": rows[0]["version"]}
+
+
+@router.post("/{rule_id}/copy")
+async def copy_rule(rule_id: int, body: CopyBody) -> dict:
+    pool = _pool()
+    try:
+        rows = await pool.fetch(SQL_COPY, rule_id, body.rule_name.strip())
+    except Exception as exc:
+        if "unique" in str(exc).lower():
+            raise HTTPException(status_code=409, detail="规则名已存在") from exc
+        raise
+    if not rows:
+        raise HTTPException(status_code=404, detail="not found or protected")
     return {"rule_id": rows[0]["rule_id"], "version": rows[0]["version"]}
 
 

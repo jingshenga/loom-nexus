@@ -2,6 +2,7 @@ SELECT l.id, rm.source_id, l.nickname, l.district, l.price_amount, l.price_curre
        l.description, l.media_json, l.confidence, l.published_at,
        COALESCE(cp.is_online, FALSE) AS is_online,
        COALESCE(cp.status_tier, 'unknown') AS presence_tier,
+       CASE WHEN $9::text = 'yesterday' THEN 'yesterday' ELSE 'today' END AS duty_label,
        EXISTS (SELECT 1 FROM user_favorites f
                WHERE f.listing_id = l.id AND f.user_id = $8::bigint) AS favorited
 FROM listings l
@@ -14,5 +15,13 @@ WHERE l.status = 'published'
   AND ($3::numeric IS NULL OR l.price_amount >= $3)
   AND ($4::numeric IS NULL OR l.price_amount <= $4)
   AND ($7::boolean IS NULL OR COALESCE(cp.is_online, FALSE) = $7)
-ORDER BY l.published_at DESC
+  AND EXISTS (
+      SELECT 1 FROM duty_snapshots ds
+      WHERE ds.duty_date = (
+          ((NOW() AT TIME ZONE 'Asia/Shanghai') - INTERVAL '4 hours')::date
+          - CASE WHEN $9::text = 'yesterday' THEN 1 ELSE 0 END
+      )
+        AND ds.contact_usernames ? lower(l.contact_username)
+  )
+ORDER BY l.created_at DESC, l.id DESC
 LIMIT GREATEST(1, $5::int) OFFSET GREATEST(0, $6::int);

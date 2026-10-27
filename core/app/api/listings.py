@@ -1,6 +1,7 @@
 """Public square APIs: published listings, detail, favorites."""
 import re
 import time
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 
@@ -100,6 +101,7 @@ def _row_to_item(row, display_filters=None, is_admin=True) -> dict:
         "published_at": row["published_at"].isoformat() if row["published_at"] else None,
         "online": tier == "online",
         "online_tier": tier or "unknown",
+        "duty_label": row["duty_label"] if "duty_label" in row.keys() else None,
         "favorited": bool(row["favorited"]) if "favorited" in row.keys() else False,
     }
 
@@ -112,6 +114,7 @@ async def list_listings(
     min_price: float = None,
     max_price: float = None,
     online: bool = None,
+    duty: Literal["today", "yesterday"] = "today",
     limit: int = 24,
     offset: int = 0,
 ) -> dict:
@@ -120,9 +123,11 @@ async def list_listings(
         raise HTTPException(status_code=503, detail="database unavailable")
     rows = await pool.fetch(
         SQL_LIST, q, district, min_price, max_price, limit, offset, online,
-        current_user_id(authorization),
+        current_user_id(authorization), duty,
     )
-    total = await pool.fetchval(SQL_COUNT, q, district, min_price, max_price, online)
+    total = await pool.fetchval(
+        SQL_COUNT, q, district, min_price, max_price, online, duty,
+    )
     identity = bearer_identity(authorization)
     is_admin = bool(identity and identity[1])
     filters = await _compiled_display_filters(pool)

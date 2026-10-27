@@ -17,6 +17,7 @@ const districts = ref([]);
 const minPrice = ref(null);
 const maxPrice = ref(null);
 const onlineOnly = ref(false);
+const duty = ref("today");
 const offset = ref(0);
 const loading = ref(false);
 const firstLoading = ref(true);
@@ -55,6 +56,7 @@ function listingParams(limit, pageOffset) {
   if (minPrice.value != null && minPrice.value !== "") params.set("min_price", minPrice.value);
   if (maxPrice.value != null && maxPrice.value !== "") params.set("max_price", maxPrice.value);
   if (onlineOnly.value) params.set("online", "true");
+  params.set("duty", duty.value);
   params.set("limit", limit);
   params.set("offset", pageOffset);
   return params;
@@ -66,6 +68,7 @@ async function refreshSaved(snapshot) {
   minPrice.value = snapshot.minPrice;
   maxPrice.value = snapshot.maxPrice;
   onlineOnly.value = snapshot.onlineOnly;
+  duty.value = snapshot.duty || "today";
   const pageOffsets = Array.from(
     { length: Math.ceil(snapshot.items.length / 24) },
     (_, page) => page * 24,
@@ -111,6 +114,7 @@ function persistScroll() {
     minPrice: minPrice.value,
     maxPrice: maxPrice.value,
     onlineOnly: onlineOnly.value,
+    duty: duty.value,
   };
 }
 
@@ -163,6 +167,17 @@ onUnmounted(() => {
 
     <!-- 筛选 chips：横滚不换行 -->
     <div class="nx-noscroll -mx-1 flex gap-2 overflow-x-auto px-1 pb-1">
+      <button
+        v-for="option in [{ value: 'today', label: '今日在岗' }, { value: 'yesterday', label: '昨日在岗' }]"
+        :key="option.value"
+        @click="duty = option.value; load(true)"
+        class="flex shrink-0 items-center gap-1.5 rounded-full border px-3.5 py-1.5 text-xs transition"
+        :class="duty === option.value
+          ? 'border-transparent nx-grad text-white font-semibold'
+          : 'border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200'"
+      >
+        {{ option.label }}
+      </button>
       <button
         @click="onlineOnly = !onlineOnly; load(true)"
         class="flex shrink-0 items-center gap-1.5 rounded-full border px-3.5 py-1.5 text-xs transition"

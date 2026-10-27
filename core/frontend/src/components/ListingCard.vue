@@ -30,6 +30,9 @@ const tierText = () =>
 const tierClass = () =>
   props.item.online_tier === "online" ? "bg-emerald-400"
     : props.item.online_tier === "recent" ? "bg-amber-400" : "bg-slate-400";
+const dutyText = () =>
+  props.item.duty_label === "today" ? "今日在岗"
+    : props.item.duty_label === "yesterday" ? "昨日在岗" : "";
 
 async function toggleFavorite() {
   // optimistic: the caller owns the state and updates instantly; on
@@ -67,7 +70,7 @@ async function toggleFavorite() {
       </span>
       <!-- 悬浮价格徽章 -->
       <span v-if="item.price_amount != null"
-        class="nx-price-chip absolute left-2.5 top-2.5 rounded-xl px-2.5 py-0.5 text-[15px] sm:bottom-2.5 sm:top-auto">
+        class="nx-price-chip absolute left-2.5 top-2.5 rounded-xl px-2.5 py-0.5 text-[15px]">
         {{ item.price_amount }}<small class="ml-0.5 text-[10px] font-normal opacity-85">{{ item.price_currency }}</small>
       </span>
       <span v-if="mediaCount() > 1"
@@ -80,6 +83,11 @@ async function toggleFavorite() {
         :class="favorited ? 'text-amber-400' : 'text-slate-300 hover:text-amber-400'">
         <Star class="size-5" :class="favorited ? 'fill-amber-400' : ''" />
       </button>
+      <span v-if="dutyText()"
+        class="absolute bottom-2.5 left-2.5 rounded-lg px-2 py-1 text-[10px] font-semibold text-white shadow backdrop-blur"
+        :class="item.duty_label === 'today' ? 'bg-emerald-600/85' : 'bg-amber-600/85'">
+        {{ dutyText() }}
+      </span>
     </div>
     <div class="min-w-0 space-y-1.5 p-2.5 sm:p-3">
       <div class="flex min-w-0 items-center gap-2">

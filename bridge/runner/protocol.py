@@ -16,7 +16,7 @@ import asyncio
 import logging
 import os
 
-from runner import accounts, hub, sqlres
+from runner import accounts, duty, hub, sqlres
 from runner.backfill import save_media
 from runner.listener import LINK_PATTERN, expand_embedded_links
 
@@ -115,11 +115,11 @@ def _make_dm_handler(pool, account_id):
 async def run_protocol_intake(pipeline, pool, stop) -> None:
     from telethon import events
 
-    handlers = {}            # (account_id|'dm', peer_id|account_id) -> (client, handler, event)
+    handlers = {}            # routing key -> (client, handler, event)
     session_by_account = {}  # account_id -> session_name (clients online)
 
     async def disconnect_account(account_id) -> None:
-        for key in [k for k in handlers if k[0] == account_id]:
+        for key in [k for k in handlers if k[0] == account_id or k == ("dm", account_id)]:
             client, handler, event = handlers.pop(key)
             try:
                 client.remove_event_handler(handler, event)
@@ -153,14 +153,29 @@ async def run_protocol_intake(pipeline, pool, stop) -> None:
             logger.warning("no active gateway accounts; nothing to listen")
             return
 
-        wanted = {}   # key -> (source_id, title) ; DM keys map to None
+        wanted = {}
         for account_id in client_by_account:
             rows = await pool.fetch(
                 sqlres.load("sources_for_account.sql"), account_id,
             )
             for row in rows:
-                wanted[(account_id, row["peer_id"])] = (row["id"], row["title"])
+                wanted[(account_id, "source", row["peer_id"])] = {
+                    "kind": "source", "source_id": row["id"],
+                    "peer_id": row["peer_id"], "title": row["title"],
+                }
             wanted[("dm", account_id)] = None
+            duty_rows = await pool.fetch(
+                sqlres.load("duty_rules_for_account.sql"), account_id,
+            )
+            for row in duty_rows:
+                meta = dict(row)
+                config = duty.decode_config(row["config_json"])
+                if not config.get("sender_peer_id") or not config.get("match_prefix"):
+                    logger.warning("invalid duty rule skipped: %s", row["rule_id"])
+                    continue
+                wanted[(account_id, "duty-new", row["rule_id"], row["source_id"])] = meta
+                if config.get("update_mode") == "edited_snapshot":
+                    wanted[(account_id, "duty-edit", row["rule_id"], row["source_id"])] = meta
 
         for key in [k for k in handlers if k not in wanted]:
             client, handler, event = handlers.pop(key)
@@ -181,14 +196,33 @@ async def run_protocol_intake(pipeline, pool, stop) -> None:
                 handlers[key] = (client, handler, event)
                 logger.info("dm router attached (account=%s)", key[1])
                 continue
-            account_id, peer_id = key
-            source_id, title = meta
+            account_id = key[0]
             client = client_by_account[account_id]
-            event = events.NewMessage(chats=peer_id)
-            handler = _make_handler(pipeline, source_id, client)
+            if meta.get("kind") == "source":
+                event = events.NewMessage(chats=meta["peer_id"])
+                handler = _make_handler(pipeline, meta["source_id"], client)
+                client.add_event_handler(handler, event)
+                handlers[key] = (client, handler, event)
+                logger.info(
+                    "listening: %s (peer=%s account=%s)",
+                    meta["title"], meta["peer_id"], account_id,
+                )
+                continue
+            config = duty.decode_config(meta["config_json"])
+            event_cls = events.MessageEdited if key[1] == "duty-edit" else events.NewMessage
+            event = event_cls(
+                chats=meta["peer_id"],
+                from_users=int(config["sender_peer_id"]),
+            )
+            handler = duty.make_handler(pool, client, meta)
             client.add_event_handler(handler, event)
             handlers[key] = (client, handler, event)
-            logger.info("listening: %s (peer=%s account=%s)", title, peer_id, account_id)
+            logger.info(
+                "duty listening: %s (%s peer=%s account=%s)",
+                meta["rule_name"], key[1], meta["peer_id"], account_id,
+            )
+            if key[1] == "duty-new":
+                await duty.recover_latest(pool, client, meta)
 
     try:
         while not stop.is_set():

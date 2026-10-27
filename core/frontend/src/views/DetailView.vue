@@ -53,6 +53,7 @@ const fieldRowsTop = (it) => [
 ];
 const fieldRowsBottom = (it) => [
   ["状态", it.online_tier === "online" ? "在线" : it.online_tier === "recent" ? "近期活跃" : "未知"],
+  ["在岗", it.duty_label === "today" ? "今日在岗" : it.duty_label === "yesterday" ? "昨日在岗" : null],
   ["发布时间", it.published_at ? new Date(it.published_at).toLocaleString("zh-CN") : null],
 ];
 </script>
