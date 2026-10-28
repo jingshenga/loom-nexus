@@ -61,7 +61,7 @@ const fieldRowsBottom = (it) => [
 <template>
   <div v-if="error" class="py-24 text-center text-slate-500">{{ error }}</div>
   <div v-else-if="item" class="grid gap-6 pb-[calc(150px+env(safe-area-inset-bottom,0px))] lg:grid-cols-2 lg:pb-0">
-    <MediaGallery :media="item.media" />
+    <MediaGallery :media="item.media" fixed-mobile-frame />
     <div class="space-y-4">
       <div class="flex items-center gap-3">
         <h2 class="flex items-center gap-2 text-2xl font-bold">

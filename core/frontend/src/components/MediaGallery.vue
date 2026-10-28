@@ -3,7 +3,10 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import { mediaUrl } from "../api/client";
 import { ImageIcon, Clapperboard, ChevronLeft, ChevronRight } from "lucide-vue-next";
 
-const props = defineProps({ media: { type: Array, default: () => [] } });
+const props = defineProps({
+  media: { type: Array, default: () => [] },
+  fixedMobileFrame: { type: Boolean, default: false },
+});
 const active = ref(0);
 
 // photos first, videos last (defensive: also enforced at ingestion)
@@ -55,11 +58,12 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
 <template>
   <div v-if="sorted.length" class="space-y-2">
     <div class="relative overflow-hidden rounded-xl border border-slate-800 bg-black"
+      :class="fixedMobileFrame ? 'flex aspect-[4/5] max-h-[70vh] items-center justify-center sm:aspect-auto' : ''"
       @touchstart.passive="onTouchStart" @touchend.passive="onTouchEnd">
       <img
         v-if="current && current.kind === 'photo'"
         :src="mediaUrl(current.path)"
-        class="max-h-[70vh] w-full object-contain"
+        :class="fixedMobileFrame ? 'size-full object-contain sm:h-auto sm:max-h-[70vh] sm:w-full' : 'max-h-[70vh] w-full object-contain'"
         loading="lazy"
       />
       <video
@@ -68,7 +72,7 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
         :poster="current.poster ? mediaUrl(current.poster) : undefined"
         controls
         playsinline
-        class="max-h-[70vh] w-full object-contain"
+        :class="fixedMobileFrame ? 'size-full object-contain sm:h-auto sm:max-h-[70vh] sm:w-full' : 'max-h-[70vh] w-full object-contain'"
       ></video>
       <!-- 桌面翻页箭头（触屏用滑动） -->
       <button v-if="multi" @click="step(-1)" aria-label="上一张"
