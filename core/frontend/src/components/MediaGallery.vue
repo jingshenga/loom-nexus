@@ -1,19 +1,34 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from "vue";
-import { mediaUrl } from "../api/client";
-import { ImageIcon, Clapperboard, ChevronLeft, ChevronRight } from "lucide-vue-next";
+import { api, mediaUrl } from "../api/client";
+import { ImageIcon, Clapperboard, ChevronLeft, ChevronRight, RotateCcw, RotateCw } from "lucide-vue-next";
 
 const props = defineProps({
   media: { type: Array, default: () => [] },
   fixedMobileFrame: { type: Boolean, default: false },
+  adminListingId: { type: Number, default: null },
 });
+const emit = defineEmits(["rotated"]);
 const active = ref(0);
 
-// photos first, videos last (defensive: also enforced at ingestion)
+// Highest-scored photos first, followed by videos.
 const sorted = computed(() =>
-  [...(props.media || [])].sort((a, b) =>
-    (a.kind === "photo" ? 0 : 1) - (b.kind === "photo" ? 0 : 1),
-  ),
+  [...(props.media || [])].sort((a, b) => {
+    const aManual = Number.isInteger(a.manual_order);
+    const bManual = Number.isInteger(b.manual_order);
+    if (aManual || bManual) {
+      if (!aManual) return 1;
+      if (!bManual) return -1;
+      return a.manual_order - b.manual_order;
+    }
+    const kindOrder = (a.kind === "photo" ? 0 : 1) - (b.kind === "photo" ? 0 : 1);
+    if (kindOrder) return kindOrder;
+    if (a.kind !== "photo") return 0;
+    const visibilityOrder = { public: 0, pending: 1, admin: 2 };
+    const visibilityDiff = (visibilityOrder[a.visibility] ?? 1)
+      - (visibilityOrder[b.visibility] ?? 1);
+    return visibilityDiff || Number(b.score || 0) - Number(a.score || 0);
+  }),
 );
 const counts = computed(() => {
   const photos = sorted.value.filter((m) => m.kind === "photo").length;
@@ -29,6 +44,17 @@ const multi = computed(() => sorted.value.length > 1);
 function step(delta) {
   if (!multi.value) return;
   active.value = (active.value + delta + sorted.value.length) % sorted.value.length;
+}
+
+async function rotatePhoto(clockwise) {
+  if (!props.adminListingId || current.value?.kind !== "photo") return;
+  const result = await api(`/api/admin/review/${props.adminListingId}/rotate-photo`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: current.value.path, clockwise }),
+  });
+  emit("rotated", result.media);
+  active.value = 0;
 }
 
 // touch swipe (H5): horizontal drag over 40px flips the page
@@ -83,6 +109,16 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
         class="absolute right-2 top-1/2 hidden -translate-y-1/2 rounded-full bg-slate-950/70 p-2.5 text-slate-200 backdrop-blur transition hover:bg-slate-900 sm:block">
         <ChevronRight class="size-5" />
       </button>
+      <div v-if="adminListingId && current?.kind === 'photo'" class="absolute bottom-2 right-2 flex gap-1.5">
+        <button @click="rotatePhoto(false)" aria-label="逆时针旋转 90 度" title="逆时针旋转 90°"
+          class="rounded-lg bg-slate-950/80 p-2 text-white backdrop-blur hover:bg-slate-800">
+          <RotateCcw class="size-4" />
+        </button>
+        <button @click="rotatePhoto(true)" aria-label="顺时针旋转 90 度" title="顺时针旋转 90°"
+          class="rounded-lg bg-slate-950/80 p-2 text-white backdrop-blur hover:bg-slate-800">
+          <RotateCw class="size-4" />
+        </button>
+      </div>
       <!-- 页点指示器（手机主用） -->
       <div v-if="multi" class="absolute bottom-2.5 left-1/2 flex -translate-x-1/2 gap-1.5">
         <span v-for="(m, i) in sorted" :key="i"

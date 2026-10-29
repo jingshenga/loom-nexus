@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from app import db
-from app.api import accounts, auth, chat, chat_media, gateway, health, listings, probe, review, rules, settings, sources, users
+from app.api import accounts, auth, chat, chat_media, gateway, health, listings, ocr_review, probe, review, rules, settings, sources, users
 from app.config import get_settings
 
 logger = logging.getLogger("nexus-core")
@@ -22,7 +22,8 @@ logging.basicConfig(
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     settings = get_settings()
-    extractor_task = None
+    background_tasks = []
+    ocr_worker = None
     stop = asyncio.Event()
     try:
         await db.init_pool()
@@ -30,22 +31,34 @@ async def lifespan(_: FastAPI):
         logger.warning("database pool unavailable at startup: %s", exc)
     else:
         await auth.ensure_admin_account()
+        from app.extractor.media_ocr import MediaOcrProcessor
+        from app.extractor.ocr_worker import OcrWorker
         from app.extractor.pipeline import Extractor
 
-        extractor_task = asyncio.create_task(
-            Extractor(
-                db.get_pool(), settings.media_dir, settings.extract_ocr_enabled,
-            ).run(stop, settings.extract_batch, settings.extract_interval_s),
-            name="extractor",
+        ocr_worker = OcrWorker()
+        extractor = Extractor(
+            db.get_pool(), settings.media_dir, settings.extract_ocr_enabled,
+            ocr_worker,
         )
+        background_tasks.append(asyncio.create_task(
+            extractor.run(stop, settings.extract_batch, settings.extract_interval_s),
+            name="extractor",
+        ))
+        background_tasks.append(asyncio.create_task(
+            MediaOcrProcessor(db.get_pool(), settings.media_dir, ocr_worker).run(stop),
+            name="media-card-ocr",
+        ))
     yield
     stop.set()
-    if extractor_task is not None:
-        extractor_task.cancel()
+    for task in background_tasks:
+        task.cancel()
+    for task in background_tasks:
         try:
-            await extractor_task
+            await task
         except (asyncio.CancelledError, Exception):
             pass
+    if ocr_worker is not None:
+        await ocr_worker.close()
     await db.close_pool()
 
 
@@ -54,6 +67,7 @@ app.include_router(health.router)
 app.include_router(auth.router)
 app.include_router(listings.router)
 app.include_router(review.router)
+app.include_router(ocr_review.router)
 app.include_router(gateway.router)
 app.include_router(chat.router)
 app.include_router(chat_media.router)
@@ -88,8 +102,29 @@ async def media_file(file_path: str, t: str = ""):
     from fastapi.responses import FileResponse
     from fastapi import HTTPException as _HTTPException
 
-    if auth.verify_token(t) is None:
+    identity = auth.verify_token(t)
+    if identity is None:
         raise _HTTPException(status_code=401, detail="login required")
+    if not identity[1]:
+        pool = db.get_pool()
+        if pool is None:
+            raise _HTTPException(status_code=503, detail="database unavailable")
+        restricted = await pool.fetchval(
+            "SELECT EXISTS ("
+            " SELECT 1 FROM raw_messages rm "
+            " CROSS JOIN LATERAL jsonb_array_elements(rm.media_json) item "
+            " WHERE item->>'kind'='photo' AND item->>'path'=$1 "
+            "   AND item->>'visibility' IS DISTINCT FROM 'public'"
+            ") OR EXISTS ("
+            " SELECT 1 FROM listings l "
+            " CROSS JOIN LATERAL jsonb_array_elements(l.media_json) item "
+            " WHERE item->>'kind'='photo' AND item->>'path'=$1 "
+            "   AND item->>'visibility' IS DISTINCT FROM 'public'"
+            ")",
+            file_path,
+        )
+        if restricted:
+            raise _HTTPException(status_code=403, detail="admin-only media")
     target = (MEDIA_DIR / file_path).resolve()
     if not str(target).startswith(str(MEDIA_DIR.resolve()) + os.sep):
         raise _HTTPException(status_code=404, detail="not found")

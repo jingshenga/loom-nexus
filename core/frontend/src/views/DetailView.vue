@@ -1,8 +1,8 @@
 <script setup>
 import { onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { Star, ArrowLeft, MessageCircle, TriangleAlert, ExternalLink } from "lucide-vue-next";
-import { api } from "../api/client";
+import { Star, ArrowLeft, MessageCircle, TriangleAlert, ExternalLink, Pencil, Save, X, ChevronUp, ChevronDown, RotateCcw } from "lucide-vue-next";
+import { api, mediaUrl } from "../api/client";
 import { useSession } from "../stores/session";
 import MediaGallery from "../components/MediaGallery.vue";
 import BackToTop from "../components/BackToTop.vue";
@@ -14,6 +14,97 @@ const item = ref(null);
 const favorited = ref(false);
 const error = ref("");
 const conflict = ref(false);
+const editing = ref(false);
+const savingEdit = ref(false);
+const editError = ref("");
+const editForm = ref(null);
+const manualOrder = ref(false);
+
+function startEdit() {
+  editForm.value = {
+    nickname: item.value.nickname || "",
+    district: item.value.district || "",
+    price_amount: item.value.price_amount,
+    price_currency: item.value.price_currency || "CNY",
+    description: item.value.description || "",
+    media: JSON.parse(JSON.stringify(item.value.media || [])),
+  };
+  manualOrder.value = editForm.value.media.some((media) => Number.isInteger(media.manual_order));
+  editing.value = true;
+  editError.value = "";
+}
+
+function cancelEdit() {
+  editing.value = false;
+  editForm.value = null;
+  editError.value = "";
+}
+
+function moveMedia(index, delta) {
+  const target = index + delta;
+  if (target < 0 || target >= editForm.value.media.length) return;
+  const media = editForm.value.media;
+  [media[index], media[target]] = [media[target], media[index]];
+  manualOrder.value = true;
+}
+
+function setVisibility(index, value) {
+  const media = editForm.value.media[index];
+  media.visibility = value;
+  media.visibility_override = true;
+}
+
+function restoreAutomaticMedia() {
+  for (const media of editForm.value.media) {
+    delete media.manual_order;
+    delete media.visibility_override;
+    if (media.kind === "photo") {
+      media.visibility = media.ocr_classification === "profile_photo"
+        ? "public"
+        : media.ocr_classification === "info_card" ? "admin" : "pending";
+    }
+  }
+  editForm.value.media.sort((a, b) => {
+    const kind = (a.kind === "photo" ? 0 : 1) - (b.kind === "photo" ? 0 : 1);
+    if (kind) return kind;
+    if (a.kind !== "photo") return 0;
+    const visibilityOrder = { public: 0, pending: 1, admin: 2 };
+    const visibility = (visibilityOrder[a.visibility] ?? 1)
+      - (visibilityOrder[b.visibility] ?? 1);
+    return visibility || Number(b.score || 0) - Number(a.score || 0);
+  });
+  manualOrder.value = false;
+}
+
+async function saveEdit() {
+  savingEdit.value = true;
+  editError.value = "";
+  try {
+    await api(`/api/admin/review/${item.value.id}/content`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        nickname: editForm.value.nickname,
+        district: editForm.value.district,
+        price_amount: editForm.value.price_amount === "" ? null : editForm.value.price_amount,
+        price_currency: editForm.value.price_currency,
+        description: editForm.value.description,
+        manual_order: manualOrder.value,
+        media: editForm.value.media.map((media) => ({
+          path: media.path,
+          visibility: media.visibility,
+          visibility_override: media.visibility_override === true,
+        })),
+      }),
+    });
+    item.value = await api(`/api/listings/${item.value.id}`);
+    cancelEdit();
+  } catch (err) {
+    editError.value = err.message || "保存失败，请重试";
+  } finally {
+    savingEdit.value = false;
+  }
+}
 
 async function toggleFavorite() {
   const data = await api(`/api/favorites/${route.params.id}`, { method: "POST" });
@@ -61,9 +152,9 @@ const fieldRowsBottom = (it) => [
 <template>
   <div v-if="error" class="py-24 text-center text-slate-500">{{ error }}</div>
   <div v-else-if="item" class="grid gap-6 pb-[calc(150px+env(safe-area-inset-bottom,0px))] lg:grid-cols-2 lg:pb-0">
-    <MediaGallery :media="item.media" fixed-mobile-frame />
+    <MediaGallery :media="editing && editForm ? editForm.media : item.media" fixed-mobile-frame />
     <div class="space-y-4">
-      <div class="flex items-center gap-3">
+      <div class="flex flex-wrap items-center gap-2">
         <h2 class="flex items-center gap-2 text-2xl font-bold">
           {{ item.nickname || "未命名" }}
           <span v-if="item.online_tier === 'online' || item.online_tier === 'recent'"
@@ -71,6 +162,18 @@ const fieldRowsBottom = (it) => [
             :class="item.online_tier === 'online' ? 'bg-emerald-400' : 'bg-amber-400'"
             :title="item.online_tier === 'online' ? '在线' : '近期活跃'"></span>
         </h2>
+        <button v-if="session.isAdmin && !editing" @click="startEdit"
+          class="flex items-center gap-1 rounded-lg border border-slate-700 px-3 py-1.5 text-sm text-slate-300 hover:text-sky-400">
+          <Pencil class="size-4" />编辑
+        </button>
+        <button v-if="session.isAdmin && editing" @click="saveEdit" :disabled="savingEdit"
+          class="flex items-center gap-1 rounded-lg border border-emerald-700 px-3 py-1.5 text-sm text-emerald-300 disabled:opacity-50">
+          <Save class="size-4" />{{ savingEdit ? "保存中" : "保存" }}
+        </button>
+        <button v-if="session.isAdmin && editing" @click="cancelEdit"
+          class="flex items-center gap-1 rounded-lg border border-slate-700 px-3 py-1.5 text-sm text-slate-400">
+          <X class="size-4" />取消
+        </button>
         <button @click="toggleFavorite"
           class="flex items-center gap-1 rounded-lg border border-slate-700 px-3 py-1.5 text-sm"
           :class="favorited ? 'border-amber-500 text-amber-400' : 'text-slate-400 hover:text-slate-200'">
@@ -89,11 +192,11 @@ const fieldRowsBottom = (it) => [
           <ExternalLink class="size-3.5" />官方客户端直连
         </a>
       </div>
-      <p class="text-3xl font-bold text-sky-400">
+      <p v-if="!editing" class="text-3xl font-bold text-sky-400">
         {{ item.price_amount != null ? item.price_amount : "?" }}
         <span class="text-base text-slate-400">{{ item.price_currency }}</span>
       </p>
-      <table class="w-full overflow-hidden rounded-xl border border-slate-800 text-sm">
+      <table v-if="!editing" class="w-full overflow-hidden rounded-xl border border-slate-800 text-sm">
         <tbody>
           <tr v-for="([label, value], i) in fieldRowsTop(item)" :key="label"
             class="border-b border-slate-800" :class="i % 2 ? 'bg-slate-900/60' : ''">
@@ -123,15 +226,65 @@ const fieldRowsBottom = (it) => [
           </tr>
         </tbody>
       </table>
-      <p v-if="item.description"
+      <p v-if="!editing && item.description"
         class="whitespace-pre-wrap rounded-xl border border-slate-800 bg-slate-900 p-4 text-sm leading-relaxed text-slate-300">
         {{ item.description }}
       </p>
+      <div v-if="editing && editForm" class="space-y-3 rounded-xl border border-slate-800 bg-slate-900 p-4">
+        <p class="text-xs leading-relaxed text-slate-500">自动识别与排序优先；这里的修改仅覆盖当前卡片。在线和在岗状态仍由自动采集维护。</p>
+        <label class="block space-y-1 text-sm"><span class="text-slate-400">昵称</span>
+          <input v-model="editForm.nickname" maxlength="128" class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
+        </label>
+        <div class="grid grid-cols-2 gap-2">
+          <label class="space-y-1 text-sm"><span class="text-slate-400">城区</span>
+            <input v-model="editForm.district" maxlength="64" class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
+          </label>
+          <label class="space-y-1 text-sm"><span class="text-slate-400">价格</span>
+            <input v-model.number="editForm.price_amount" type="number" min="0" step="0.01" class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
+          </label>
+          <label class="col-span-2 space-y-1 text-sm"><span class="text-slate-400">货币单位</span>
+            <input v-model="editForm.price_currency" maxlength="16" class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
+          </label>
+        </div>
+        <label class="block space-y-1 text-sm"><span class="text-slate-400">介绍</span>
+          <textarea v-model="editForm.description" rows="6" class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
+        </label>
+        <div class="flex items-center justify-between gap-2">
+          <h3 class="text-sm font-semibold">媒体顺序与公开范围</h3>
+          <button @click="restoreAutomaticMedia" class="flex items-center gap-1 text-xs text-sky-400 hover:text-sky-300">
+            <RotateCcw class="size-3.5" />恢复自动识别与排序
+          </button>
+        </div>
+        <div v-for="(media, index) in editForm.media" :key="media.path"
+          class="flex items-center gap-2 rounded-lg border border-slate-800 bg-slate-950 p-2">
+          <img v-if="media.kind === 'photo' || media.poster"
+            :src="mediaUrl(media.kind === 'photo' ? media.path : media.poster)"
+            class="size-14 shrink-0 rounded-md object-cover" />
+          <div v-else class="flex size-14 shrink-0 items-center justify-center rounded-md bg-slate-800 text-xs">视频</div>
+          <div class="min-w-0 flex-1">
+            <p class="truncate text-xs text-slate-300">{{ media.ocr_classification || media.kind }} · {{ media.path.split('/').pop() }}</p>
+            <label v-if="media.kind === 'photo'" class="mt-1 flex items-center gap-2 text-xs text-slate-500">
+              <span>可见范围</span>
+              <select :value="media.visibility || 'pending'" @change="setVisibility(index, $event.target.value)"
+                class="rounded border border-slate-700 bg-slate-900 px-1.5 py-1 text-slate-300">
+                <option value="public">公开</option><option value="admin">仅管理员</option>
+              </select>
+            </label>
+          </div>
+          <div class="flex shrink-0 flex-col">
+            <button @click="moveMedia(index, -1)" :disabled="index === 0" aria-label="上移"
+              class="rounded p-1 text-slate-400 disabled:opacity-30"><ChevronUp class="size-4" /></button>
+            <button @click="moveMedia(index, 1)" :disabled="index === editForm.media.length - 1" aria-label="下移"
+              class="rounded p-1 text-slate-400 disabled:opacity-30"><ChevronDown class="size-4" /></button>
+          </div>
+        </div>
+        <p v-if="editError" class="text-sm text-rose-400">{{ editError }}</p>
+      </div>
     </div>
     <BackToTop />
 
     <!-- 手机吸底拇指区：收藏 + 立即聊天 -->
-    <div
+    <div v-if="!editing"
       class="nx-glass fixed inset-x-0 z-40 flex gap-2.5 border-t border-slate-800 p-3 lg:hidden"
       style="bottom: calc(62px + env(safe-area-inset-bottom, 0px));"
     >

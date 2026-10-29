@@ -76,6 +76,11 @@ function select(item) {
   };
 }
 
+function onMediaRotated(media) {
+  if (current.value) current.value.media = media;
+  notify("照片已旋转，正在重新计算人脸焦点");
+}
+
 async function loadQueue() {
   const params = new URLSearchParams({ status: statusTab.value });
   if (appliedNickname.value) params.set("nickname", appliedNickname.value);
@@ -439,7 +444,7 @@ onUnmounted(() => {
         <p class="whitespace-pre-wrap rounded-lg bg-slate-950 p-3 text-sm leading-relaxed text-slate-200">
           {{ current.source_text || "（无正文）" }}
         </p>
-        <MediaGallery :media="current.media" />
+        <MediaGallery :media="current.media" :admin-listing-id="current.id" @rotated="onMediaRotated" />
       </section>
       <section v-else class="lg:col-span-5 flex items-center justify-center rounded-xl border border-slate-800 text-slate-600">
         选择左侧任务

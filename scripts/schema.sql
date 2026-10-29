@@ -154,6 +154,7 @@ CREATE TABLE IF NOT EXISTS listings (
     price_currency VARCHAR(16) DEFAULT 'CNY',
     description TEXT,
     media_json JSONB DEFAULT '[]',
+    manual_fields JSONB NOT NULL DEFAULT '{}',
     evidence_json JSONB DEFAULT '{}',
     status VARCHAR(32) DEFAULT 'pending',       -- pending | published | archived | rejected
     confidence NUMERIC(3, 2) DEFAULT 1.0,
@@ -161,6 +162,7 @@ CREATE TABLE IF NOT EXISTS listings (
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS manual_fields JSONB NOT NULL DEFAULT '{}';
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS duty_collection_job_id BIGINT
     REFERENCES duty_collection_jobs(id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_listings_duty_collection_job
@@ -1295,13 +1297,19 @@ BEGIN
         -- 600): identical evidence means a no-op, so reviewer field
         -- edits are never clobbered by a plain re-run
         UPDATE listings l SET
-            nickname = COALESCE(NULLIF(p_nickname, ''), l.nickname),
-            district = COALESCE(NULLIF(p_district, ''), l.district),
-            price_amount = COALESCE(p_price_amount, l.price_amount),
-            price_currency = COALESCE(NULLIF(p_price_currency, ''), l.price_currency),
-            description = COALESCE(NULLIF(p_description, ''), l.description),
+            nickname = CASE WHEN l.manual_fields ? 'nickname' THEN l.nickname
+                            ELSE COALESCE(NULLIF(p_nickname, ''), l.nickname) END,
+            district = CASE WHEN l.manual_fields ? 'district' THEN l.district
+                            ELSE COALESCE(NULLIF(p_district, ''), l.district) END,
+            price_amount = CASE WHEN l.manual_fields ? 'price_amount' THEN l.price_amount
+                                ELSE COALESCE(p_price_amount, l.price_amount) END,
+            price_currency = CASE WHEN l.manual_fields ? 'price_currency' THEN l.price_currency
+                                  ELSE COALESCE(NULLIF(p_price_currency, ''), l.price_currency) END,
+            description = CASE WHEN l.manual_fields ? 'description' THEN l.description
+                               ELSE COALESCE(NULLIF(p_description, ''), l.description) END,
             evidence_json = COALESCE(p_evidence_json, l.evidence_json),
-            media_json = CASE WHEN COALESCE(jsonb_array_length(p_media_json), 0) > 0
+            media_json = CASE WHEN l.manual_fields ? 'media' THEN l.media_json
+                              WHEN COALESCE(jsonb_array_length(p_media_json), 0) > 0
                               THEN p_media_json ELSE l.media_json END,
             confidence = GREATEST(l.confidence, p_confidence),
             published_at = CASE WHEN l.status = 'published'
@@ -2788,3 +2796,82 @@ $fn$;
 -- outbound image bytes ride on the row (base64); the sender decodes
 -- and streams them straight to Telegram without touching the disk
 ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS media_b64 TEXT;
+
+-- Local OCR results and moderation state for image-based listing cards.
+CREATE TABLE IF NOT EXISTS listing_media_ocr (
+    id BIGSERIAL PRIMARY KEY,
+    raw_id BIGINT NOT NULL REFERENCES raw_messages(id) ON DELETE CASCADE,
+    listing_id BIGINT REFERENCES listings(id) ON DELETE SET NULL,
+    media_path VARCHAR(512) NOT NULL,
+    status VARCHAR(16) NOT NULL DEFAULT 'pending',
+    classification VARCHAR(24) NOT NULL DEFAULT 'uncertain',
+    review_status VARCHAR(16) NOT NULL DEFAULT 'pending',
+    raw_text TEXT NOT NULL DEFAULT '',
+    normalized_text TEXT NOT NULL DEFAULT '',
+    fields_json JSONB NOT NULL DEFAULT '{}',
+    evidence_json JSONB NOT NULL DEFAULT '{}',
+    confidence NUMERIC(4, 3) NOT NULL DEFAULT 0,
+    engine_version VARCHAR(64),
+    error_text VARCHAR(500),
+    attempts INT NOT NULL DEFAULT 0,
+    reviewed_by BIGINT,
+    reviewed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (raw_id, media_path)
+);
+CREATE INDEX IF NOT EXISTS idx_listing_media_ocr_queue
+    ON listing_media_ocr(review_status, status, id);
+CREATE INDEX IF NOT EXISTS idx_listing_media_ocr_listing
+    ON listing_media_ocr(listing_id, review_status);
+
+CREATE OR REPLACE FUNCTION media_ocr_set_flags(
+    p_raw_id BIGINT,
+    p_media_path TEXT,
+    p_visibility TEXT,
+    p_status TEXT,
+    p_classification TEXT
+) RETURNS BOOLEAN
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_media JSONB;
+BEGIN
+    UPDATE raw_messages rm
+    SET media_json = COALESCE((
+        SELECT jsonb_agg(
+            CASE WHEN item->>'path' = p_media_path
+                 THEN item || jsonb_build_object(
+                     'visibility', CASE
+                         WHEN item->'visibility_override' = 'true'::jsonb
+                             THEN item->>'visibility'
+                         ELSE p_visibility
+                     END,
+                     'ocr_status', p_status,
+                     'ocr_classification', p_classification
+                 )
+                 ELSE item END
+            ORDER BY ord
+        )
+        FROM jsonb_array_elements(rm.media_json) WITH ORDINALITY AS a(item, ord)
+    ), '[]'::jsonb)
+    WHERE rm.id = p_raw_id
+    RETURNING media_json INTO v_media;
+    IF NOT FOUND THEN
+        RETURN FALSE;
+    END IF;
+    UPDATE listings SET media_json = v_media, updated_at = NOW()
+    WHERE source_msg_id = p_raw_id;
+    RETURN TRUE;
+END
+$fn$;
+
+CREATE TABLE IF NOT EXISTS listing_edit_history (
+    id BIGSERIAL PRIMARY KEY,
+    listing_id BIGINT REFERENCES listings(id) ON DELETE SET NULL,
+    editor_user_id BIGINT REFERENCES site_users(id) ON DELETE SET NULL,
+    before_json JSONB NOT NULL,
+    after_json JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_listing_edit_history_listing
+    ON listing_edit_history(listing_id, created_at DESC);

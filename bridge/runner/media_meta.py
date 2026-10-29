@@ -16,6 +16,9 @@ import json
 import logging
 import os
 import subprocess
+from pathlib import Path
+
+from PIL import Image, ImageOps
 
 from runner import sqlres
 
@@ -49,6 +52,83 @@ def _get_detector():
     except Exception as exc:
         _detector_failed = True
         logger.warning("face detector unavailable (enrichment degrades): %s", exc)
+        return None
+
+
+def _upright_path(rel: str) -> str:
+    """Return a corrected derivative path, keeping the Telegram original."""
+    path = Path(_abs(rel))
+    return os.path.relpath(path.with_name(f"{path.stem}_upright.jpg"), MEDIA_ROOT)
+
+
+def _orientation_from_scores(scores: dict[int, float]) -> int | None:
+    """Choose a non-zero clockwise rotation only when face evidence is clear."""
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    if len(ranked) < 2 or ranked[0][0] == 0:
+        return None
+    if ranked[0][1] < 0.72 or ranked[0][1] - ranked[1][1] < 0.14:
+        return None
+    return ranked[0][0]
+
+
+def normalize_photo(rel: str) -> tuple[str, str]:
+    """Normalize EXIF direction or a clearly detectable sideways face.
+
+    Returns (display_path, status). Original downloaded bytes are preserved.
+    """
+    src = Path(_abs(rel))
+    try:
+        with Image.open(src) as image:
+            orientation = image.getexif().get(274, 1)
+            corrected = ImageOps.exif_transpose(image)
+            if orientation not in (None, 1):
+                out_rel = _upright_path(rel)
+                out = Path(_abs(out_rel))
+                out.parent.mkdir(parents=True, exist_ok=True)
+                corrected.convert("RGB").save(out, "JPEG", quality=95)
+                return out_rel, "exif"
+            if corrected.width == 0 or corrected.height == 0:
+                return rel, "checked"
+            rotation = _detect_rotation(corrected)
+            if rotation is None:
+                return rel, "checked"
+            # PIL's rotate() is counter-clockwise; detector choices are clockwise.
+            rotated = corrected.rotate(-rotation, expand=True)
+            out_rel = _upright_path(rel)
+            out = Path(_abs(out_rel))
+            out.parent.mkdir(parents=True, exist_ok=True)
+            rotated.convert("RGB").save(out, "JPEG", quality=95)
+            return out_rel, "face"
+    except Exception as exc:
+        logger.warning("photo orientation check failed (%s): %s", rel, exc)
+        return rel, "error"
+
+
+def _detect_rotation(image) -> int | None:
+    detector = _get_detector()
+    if detector is None:
+        return None
+    try:
+        import cv2
+        import numpy as np
+
+        rgb = image.convert("RGB")
+        scores = {}
+        for degrees in (0, 90, 180, 270):
+            candidate = rgb.rotate(-degrees, expand=True)
+            array = cv2.cvtColor(np.asarray(candidate), cv2.COLOR_RGB2BGR)
+            h, w = array.shape[:2]
+            detector.setInputSize((w, h))
+            faces = detector.detect(array)[1]
+            if faces is None or len(faces) == 0:
+                scores[degrees] = 0.0
+                continue
+            best = max(faces, key=lambda f: float(f[14]))
+            area_ratio = (float(best[2]) * float(best[3])) / (w * h)
+            scores[degrees] = min(1.0, float(best[14]) * 0.5 + min(area_ratio * 4, 1) * 0.5)
+        return _orientation_from_scores(scores)
+    except Exception as exc:
+        logger.warning("photo orientation detection failed: %s", exc)
         return None
 
 
@@ -124,6 +204,17 @@ def enrich_entries(media: list) -> list:
     others = [m for m in entries if m.get("kind") not in ("photo", "video")]
 
     for m in photos:
+        if not m.get("orientation_checked"):
+            path = m.get("path", "")
+            if path:
+                normalized, status = normalize_photo(path)
+                if normalized != path:
+                    m["path"] = normalized
+                    m.pop("focus_x", None)
+                    m.pop("focus_y", None)
+                    m.pop("score", None)
+                m["orientation"] = status
+            m["orientation_checked"] = True
         if "score" in m:
             continue
         info = detect_focus(m.get("path", ""))
