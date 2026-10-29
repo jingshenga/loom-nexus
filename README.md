@@ -1,4 +1,4 @@
-# nexus-edge
+# nexus
 
 自托管的消息抽取 / 实体状态 / 代理通信平台，面向低功耗 x86_64 NAS（Intel N100 / 16GB 内存）。
 
