@@ -82,6 +82,26 @@ def _apply_excludes(text, patterns) -> str:
     return filtered or text
 
 
+def _visible_media(media, is_admin: bool) -> list:
+    items = [item for item in media if is_admin or item.get("kind") != "photo"
+             or item.get("visibility") == "public"]
+
+    def order(item):
+        if isinstance(item.get("manual_order"), int):
+            return (0, item["manual_order"], 0, 0)
+        kind = 0 if item.get("kind") == "photo" else 1
+        visibility = {"public": 0, "pending": 1, "admin": 2}.get(
+            item.get("visibility"), 1,
+        )
+        try:
+            score = float(item.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0
+        return (1, kind, visibility, -score)
+
+    return sorted(items, key=order)
+
+
 def _row_to_item(row, display_filters=None, is_admin=True) -> dict:
     patterns = (display_filters or {}).get(row["source_id"])
     tier = row["presence_tier"] if "presence_tier" in row.keys() else None
@@ -90,6 +110,7 @@ def _row_to_item(row, display_filters=None, is_admin=True) -> dict:
     description = _apply_excludes(row["description"], patterns)
     if not is_admin:
         description = None
+    media = _visible_media(_decode(row["media_json"], []), is_admin)
     return {
         "id": row["id"],
         "nickname": row["nickname"],
@@ -97,7 +118,7 @@ def _row_to_item(row, display_filters=None, is_admin=True) -> dict:
         "price_amount": float(row["price_amount"]) if row["price_amount"] is not None else None,
         "price_currency": row["price_currency"],
         "description": description,
-        "media": _decode(row["media_json"], []),
+        "media": media,
         "published_at": row["published_at"].isoformat() if row["published_at"] else None,
         "online": tier == "online",
         "online_tier": tier or "unknown",

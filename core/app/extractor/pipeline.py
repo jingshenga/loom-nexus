@@ -24,6 +24,8 @@ SQL_CREATE_LISTING = sqlres.load("upsert_newest.sql")
 SQL_ARCHIVE = sqlres.load("archive_for_contact.sql")
 SQL_POLICY = sqlres.load("settings_get_num.sql")
 SQL_POLICY_ENABLED = sqlres.load("settings_get.sql")
+SQL_MEDIA_FLAGS = sqlres.load("media_ocr_set_flags.sql")
+SQL_LISTING_SYNC_MEDIA = sqlres.load("listing_sync_media.sql")
 
 FALLBACK_RULE = {"gate": {}, "extract": {}, "lifecycle_terms": []}
 
@@ -71,27 +73,24 @@ def _decode_jsonb(value, fallback):
 
 
 class Extractor:
-    def __init__(self, pool: asyncpg.Pool, media_dir: str, ocr_enabled: bool):
+    def __init__(self, pool: asyncpg.Pool, media_dir: str, ocr_enabled: bool, ocr_worker=None):
         self._pool = pool
         self._media_dir = media_dir
         self._ocr_enabled = ocr_enabled
-        self._ocr = OcrWorker()
+        self._ocr = ocr_worker or OcrWorker()
 
     async def run(self, stop: asyncio.Event, batch_size: int, idle_s: float) -> None:
         logger.info(
             "extractor loop started (batch=%d idle=%.1fs ocr=%s)",
             batch_size, idle_s, self._ocr_enabled,
         )
-        try:
-            while not stop.is_set():
-                rows = await self._pool.fetch(SQL_CLAIM, batch_size)
-                if not rows:
-                    await _sleep(stop, idle_s)
-                    continue
-                for row in rows:
-                    await self._process_one(row)
-        finally:
-            await self._ocr.close()
+        while not stop.is_set():
+            rows = await self._pool.fetch(SQL_CLAIM, batch_size)
+            if not rows:
+                await _sleep(stop, idle_s)
+                continue
+            for row in rows:
+                await self._process_one(row)
 
     async def _process_one(self, row) -> None:
         raw_id = row["raw_id"]
@@ -101,6 +100,18 @@ class Extractor:
             rule = FALLBACK_RULE
         media = _decode_jsonb(row["media_json"], [])
         try:
+            for item in media:
+                if item.get("kind") != "photo" or item.get("ocr_status") in (
+                    "processing", "done", "failed",
+                ):
+                    continue
+                item["visibility"] = "pending"
+                item["ocr_status"] = "pending"
+                await self._pool.fetch(
+                    SQL_MEDIA_FLAGS, raw_id, item.get("path", ""),
+                    "pending", "pending", "uncertain",
+                )
+
             ok, reason = ast_rules.gate_pass(rule, text, row["sender_peer_id"])
             if not ok:
                 await self._mark(raw_id, "dropped")
@@ -187,6 +198,9 @@ class Extractor:
                                    # message's own time, not collect time
             )
             result = rows[0]
+            await self._pool.execute(
+                SQL_LISTING_SYNC_MEDIA, result["listing_id"], raw_id,
+            )
             await self._mark(raw_id, "done")
             extra = ""
             if result["conflicted"]:

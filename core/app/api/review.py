@@ -7,12 +7,12 @@ import uuid
 from pathlib import Path
 from PIL import Image
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
 
 from app import db, sqlres
 from app.config import get_settings
-from app.api.auth import require_admin
+from app.api.auth import current_user_id, require_admin
 
 router = APIRouter(
     prefix="/api/admin/review", tags=["admin-review"],
@@ -86,12 +86,27 @@ class FieldEdits(BaseModel):
     description: str = None
 
 
+class ListingContentEdit(BaseModel):
+    nickname: str
+    district: str
+    price_amount: float | None = None
+    price_currency: str
+    description: str
+    media: list[dict]
+    manual_order: bool = False
+
+
 class BatchDeleteBody(BaseModel):
     ids: list
 
 
 class RecollectBody(BaseModel):
     ids: list[int]
+
+
+class RotatePhotoBody(BaseModel):
+    path: str
+    clockwise: bool
 
 
 @router.post("/recollect")
@@ -317,6 +332,163 @@ async def edit_fields(listing_id: int, edits: FieldEdits) -> dict:
     if not rows[0]["ok"]:
         raise HTTPException(status_code=404, detail="listing not found")
     return {"ok": True}
+
+
+@router.patch("/{listing_id}/content")
+async def edit_content(
+    listing_id: int, body: ListingContentEdit,
+    authorization: str = Header(default=""),
+) -> dict:
+    """Last-resort admin edits for a published card and its media display."""
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    if body.price_amount is not None and body.price_amount < 0:
+        raise HTTPException(status_code=400, detail="price cannot be negative")
+    if body.price_amount is not None and not body.price_currency.strip():
+        raise HTTPException(status_code=400, detail="currency is required for a price")
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT id, source_msg_id, nickname, district, price_amount, "
+                "price_currency, description, media_json, manual_fields FROM listings "
+                "WHERE id=$1 FOR UPDATE",
+                listing_id,
+            )
+            if row is None:
+                raise HTTPException(status_code=404, detail="listing not found")
+            old_media = _decode(row["media_json"], [])
+            old_by_path = {entry.get("path"): entry for entry in old_media}
+            paths = [entry.get("path") for entry in body.media]
+            if (len(paths) != len(old_media) or len(set(paths)) != len(paths)
+                    or set(paths) != set(old_by_path)):
+                raise HTTPException(status_code=400, detail="media items cannot be added or removed here")
+
+            updated_media = []
+            for index, submitted in enumerate(body.media):
+                entry = dict(old_by_path[submitted["path"]])
+                if entry.get("kind") == "photo":
+                    visibility = submitted.get("visibility", entry.get("visibility"))
+                    if visibility not in {"public", "admin", "pending"}:
+                        raise HTTPException(status_code=400, detail="invalid media visibility")
+                    entry["visibility"] = visibility
+                    if submitted.get("visibility_override"):
+                        entry["visibility_override"] = True
+                    elif "visibility_override" in submitted:
+                        entry.pop("visibility_override", None)
+                if body.manual_order:
+                    entry["manual_order"] = index
+                else:
+                    entry.pop("manual_order", None)
+                updated_media.append(entry)
+
+            before = {
+                key: row[key]
+                for key in ("nickname", "district", "price_amount", "price_currency", "description")
+            }
+            before["media"] = old_media
+            after = {
+                "nickname": body.nickname,
+                "district": body.district,
+                "price_amount": body.price_amount,
+                "price_currency": body.price_currency,
+                "description": body.description,
+                "media": updated_media,
+            }
+            manual_fields = _decode(row["manual_fields"], {})
+            edited_values = {
+                "nickname": body.nickname.strip(),
+                "district": body.district.strip(),
+                "price_amount": body.price_amount,
+                "price_currency": body.price_currency.strip(),
+                "description": body.description,
+            }
+            for field, value in edited_values.items():
+                if value != row[field]:
+                    manual_fields[field] = True
+            if body.manual_order or any(entry.get("visibility_override") for entry in updated_media):
+                manual_fields["media"] = True
+            else:
+                manual_fields.pop("media", None)
+            encoded = json.dumps(updated_media, ensure_ascii=False)
+            await conn.execute(
+                "UPDATE listings SET nickname=$2, district=$3, price_amount=$4, "
+                "price_currency=$5, description=$6, media_json=$7::jsonb, "
+                "manual_fields=$8::jsonb, updated_at=NOW() WHERE id=$1",
+                listing_id, body.nickname.strip(), body.district.strip(),
+                body.price_amount, body.price_currency.strip(), body.description,
+                encoded, json.dumps(manual_fields),
+            )
+            if row["source_msg_id"] is not None:
+                await conn.execute(
+                    "UPDATE raw_messages SET media_json=$2::jsonb WHERE id=$1",
+                    row["source_msg_id"], encoded,
+                )
+            await conn.execute(
+                "INSERT INTO listing_edit_history "
+                "(listing_id, editor_user_id, before_json, after_json) "
+                "VALUES ($1, $2, $3::jsonb, $4::jsonb)",
+                listing_id, current_user_id(authorization),
+                json.dumps(before, ensure_ascii=False, default=str),
+                json.dumps(after, ensure_ascii=False, default=str),
+            )
+    return {"ok": True}
+
+
+@router.post("/{listing_id}/rotate-photo")
+async def rotate_photo(listing_id: int, body: RotatePhotoBody) -> dict:
+    """Create a rotated photo copy and update only its listing media entry."""
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    media_root = Path(get_settings().media_dir).resolve()
+    source = (media_root / body.path).resolve()
+    if not source.is_relative_to(media_root) or not source.is_file():
+        raise HTTPException(status_code=404, detail="photo not found")
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT l.source_msg_id, l.media_json "
+                "FROM listings l JOIN raw_messages rm ON rm.id = l.source_msg_id "
+                "WHERE l.id = $1 FOR UPDATE OF rm",
+                listing_id,
+            )
+            if row is None:
+                raise HTTPException(status_code=404, detail="listing not found")
+            media = _decode(row["media_json"], [])
+            item = next(
+                (entry for entry in media if entry.get("kind") == "photo" and entry.get("path") == body.path),
+                None,
+            )
+            if item is None:
+                raise HTTPException(status_code=404, detail="photo is not part of this listing")
+
+            target = source.with_name(f"{source.stem}_manual_{uuid.uuid4().hex[:8]}.jpg")
+            try:
+                with Image.open(source) as image:
+                    image.rotate(-90 if body.clockwise else 90, expand=True).convert("RGB").save(
+                        target, "JPEG", quality=95,
+                    )
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail="photo could not be rotated") from exc
+
+            item["path"] = str(target.relative_to(media_root))
+            item["orientation"] = "manual"
+            item["orientation_checked"] = True
+            for key in ("focus_x", "focus_y", "score"):
+                item.pop(key, None)
+            encoded = json.dumps(media, ensure_ascii=False)
+            await conn.execute(
+                "UPDATE listings SET media_json=$2::jsonb WHERE id=$1",
+                listing_id, encoded,
+            )
+            await conn.execute(
+                "UPDATE raw_messages SET media_json=$2::jsonb WHERE id=$1",
+                row["source_msg_id"], encoded,
+            )
+    return {"media": media}
 
 
 @router.post("/{listing_id}/publish")

@@ -16,6 +16,7 @@ import {
   ShieldQuestion,
   Users,
   UserCog,
+  ImageIcon,
   Sun,
   Moon,
   MonitorSmartphone,
@@ -33,6 +34,7 @@ const nav = [
 ];
 const adminNav = [
   { to: "/admin/review", label: "审核", icon: ShieldCheck },
+  { to: "/admin/ocr", label: "OCR核对", icon: ImageIcon },
   { to: "/admin/rules", label: "规则", icon: Wrench },
   { to: "/admin/probe", label: "穿透", icon: ShieldQuestion },
   { to: "/admin/gateway", label: "大盘", icon: Activity },

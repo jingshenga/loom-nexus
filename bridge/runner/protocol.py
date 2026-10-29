@@ -18,7 +18,7 @@ import os
 
 from runner import accounts, duty, hub, sqlres
 from runner.backfill import save_media
-from runner.listener import LINK_PATTERN, expand_embedded_links
+from runner.listener import LINK_PATTERN, expand_embedded_links, order_media
 
 logger = logging.getLogger("nexus-bridge.protocol")
 
@@ -57,6 +57,35 @@ def _make_handler(pipeline, source_id, client):
             text=text,
             media=media,
             posted_at=msg.date,
+        )
+    return handler
+
+
+def _make_album_handler(pipeline, source_id, client):
+    async def handler(event):
+        messages = sorted(event.messages, key=lambda msg: msg.id)
+        if not messages:
+            return
+        caption = next(
+            (msg for msg in messages if (msg.raw_text or "").strip()),
+            messages[0],
+        )
+        parts = await asyncio.gather(
+            *(save_media(msg, source_id) for msg in messages)
+        )
+        media = order_media([entry for part in parts for entry in part])
+        text = caption.raw_text or ""
+        if LINK_PATTERN.search(text):
+            text, fetched = await expand_embedded_links(text, _make_link_fetcher(client))
+            logger.info("type-B album %s merged %d link target(s)", event.grouped_id, fetched)
+        await pipeline.accept(
+            source_id=source_id,
+            platform_msg_id=caption.id,
+            sender_peer_id=caption.sender_id,
+            grouped_id=event.grouped_id,
+            text=text,
+            media=media,
+            posted_at=caption.date,
         )
     return handler
 
@@ -115,16 +144,17 @@ def _make_dm_handler(pool, account_id):
 async def run_protocol_intake(pipeline, pool, stop) -> None:
     from telethon import events
 
-    handlers = {}            # routing key -> (client, handler, event)
+    handlers = {}            # routing key -> (client, [(handler, event), ...])
     session_by_account = {}  # account_id -> session_name (clients online)
 
     async def disconnect_account(account_id) -> None:
         for key in [k for k in handlers if k[0] == account_id or k == ("dm", account_id)]:
-            client, handler, event = handlers.pop(key)
-            try:
-                client.remove_event_handler(handler, event)
-            except Exception:
-                pass
+            client, registrations = handlers.pop(key)
+            for handler, event in registrations:
+                try:
+                    client.remove_event_handler(handler, event)
+                except Exception:
+                    pass
         session_name = session_by_account.pop(account_id, None)
         if session_name:
             await hub.disconnect_client(session_name)
@@ -178,11 +208,12 @@ async def run_protocol_intake(pipeline, pool, stop) -> None:
                     wanted[(account_id, "duty-edit", row["rule_id"], row["source_id"])] = meta
 
         for key in [k for k in handlers if k not in wanted]:
-            client, handler, event = handlers.pop(key)
-            try:
-                client.remove_event_handler(handler, event)
-            except Exception:
-                pass
+            client, registrations = handlers.pop(key)
+            for handler, event in registrations:
+                try:
+                    client.remove_event_handler(handler, event)
+                except Exception:
+                    pass
             logger.info("stopped listening: account=%s peer=%s", key[0], key[1])
 
         for key, meta in wanted.items():
@@ -193,16 +224,25 @@ async def run_protocol_intake(pipeline, pool, stop) -> None:
                 event = events.NewMessage(incoming=True)
                 handler = _make_dm_handler(pool, key[1])
                 client.add_event_handler(handler, event)
-                handlers[key] = (client, handler, event)
+                handlers[key] = (client, [(handler, event)])
                 logger.info("dm router attached (account=%s)", key[1])
                 continue
             account_id = key[0]
             client = client_by_account[account_id]
             if meta.get("kind") == "source":
-                event = events.NewMessage(chats=meta["peer_id"])
-                handler = _make_handler(pipeline, meta["source_id"], client)
-                client.add_event_handler(handler, event)
-                handlers[key] = (client, handler, event)
+                standalone_event = events.NewMessage(
+                    chats=meta["peer_id"],
+                    func=lambda event: event.message.grouped_id is None,
+                )
+                standalone_handler = _make_handler(pipeline, meta["source_id"], client)
+                client.add_event_handler(standalone_handler, standalone_event)
+                album_event = events.Album(chats=meta["peer_id"])
+                album_handler = _make_album_handler(pipeline, meta["source_id"], client)
+                client.add_event_handler(album_handler, album_event)
+                handlers[key] = (
+                    client,
+                    [(standalone_handler, standalone_event), (album_handler, album_event)],
+                )
                 logger.info(
                     "listening: %s (peer=%s account=%s)",
                     meta["title"], meta["peer_id"], account_id,
@@ -216,7 +256,7 @@ async def run_protocol_intake(pipeline, pool, stop) -> None:
             )
             handler = duty.make_handler(pool, client, meta)
             client.add_event_handler(handler, event)
-            handlers[key] = (client, handler, event)
+            handlers[key] = (client, [(handler, event)])
             logger.info(
                 "duty listening: %s (%s peer=%s account=%s)",
                 meta["rule_name"], key[1], meta["peer_id"], account_id,
@@ -233,8 +273,9 @@ async def run_protocol_intake(pipeline, pool, stop) -> None:
             except TimeoutError:
                 pass
     finally:
-        for _client, handler in [(v[0], v[1]) for v in handlers.values()]:
-            try:
-                _client.remove_event_handler(handler)
-            except Exception:
-                pass
+        for _client, registrations in handlers.values():
+            for handler, event in registrations:
+                try:
+                    _client.remove_event_handler(handler, event)
+                except Exception:
+                    pass

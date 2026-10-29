@@ -62,9 +62,27 @@ async def expand_embedded_links(text, fetch_target):
 
 
 def order_media(media: list) -> list:
-    """Photos first, then videos, then other files."""
+    """Public face photos first, then private info cards, videos and files."""
     order = {"photo": 0, "video": 1, "file": 2}
-    return sorted(media or [], key=lambda m: order.get(m.get("kind"), 3))
+
+    def sort_key(item):
+        if isinstance(item.get("manual_order"), int):
+            return (0, item["manual_order"], 0, 0)
+        visibility = {"public": 0, "pending": 1, "admin": 2}.get(
+            item.get("visibility"), 1,
+        )
+        try:
+            score = float(item.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0
+        return (
+            1, order.get(item.get("kind"), 3), visibility,
+            -score if item.get("kind") == "photo" else 0,
+        )
+
+    return sorted(
+        media or [], key=sort_key,
+    )
 
 
 class _Album:

@@ -74,8 +74,25 @@ MEDIA_ORDER = {"photo": 0, "video": 1, "file": 2}
 
 
 def order_media(media: list) -> list:
-    """Photos first, then videos, then other files."""
-    return sorted(media or [], key=lambda m: MEDIA_ORDER.get(m.get("kind"), 3))
+    """Public face photos first, then private info cards, videos and files."""
+    def sort_key(item):
+        if isinstance(item.get("manual_order"), int):
+            return (0, item["manual_order"], 0, 0)
+        visibility = {"public": 0, "pending": 1, "admin": 2}.get(
+            item.get("visibility"), 1,
+        )
+        try:
+            score = float(item.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0
+        return (
+            1, MEDIA_ORDER.get(item.get("kind"), 3), visibility,
+            -score if item.get("kind") == "photo" else 0,
+        )
+
+    return sorted(
+        media or [], key=sort_key,
+    )
 
 
 async def _fetch_history(client, peer_id: int, limit: int, source_id: int):
