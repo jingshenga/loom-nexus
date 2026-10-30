@@ -330,7 +330,7 @@ onUnmounted(() => {
     <div class="flex gap-2">
       <button @click="activeWorkbench = 'review'" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'review' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">审核队列</button>
       <button @click="activeWorkbench = 'duplicates'; loadDuplicatePairs()" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'duplicates' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">疑似重复</button>
-      <button @click="activeWorkbench = 'duty'" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'duty' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">在岗补采（{{ dutyRecovery.length }}）</button>
+      <button @click="activeWorkbench = 'duty'" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'duty' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">签到补采（{{ dutyRecovery.length }}）</button>
     </div>
 
     <section v-if="activeWorkbench === 'duty'" class="grid gap-4 lg:grid-cols-12">
@@ -341,7 +341,7 @@ onUnmounted(() => {
           <div class="mt-1 text-xs text-slate-400">{{ item.source_title || '来源群组' }} · {{ item.duty_date }} · {{ item.status === 'deferred' ? 'Telegram 冷却，自动重试' : item.status }}</div>
           <div v-if="item.error" class="mt-1 line-clamp-2 text-xs text-amber-300">{{ item.error }}</div>
         </button>
-        <div v-if="!dutyRecovery.length" class="py-10 text-center text-sm text-slate-500">暂无未找到或失败的在岗账号</div>
+        <div v-if="!dutyRecovery.length" class="py-10 text-center text-sm text-slate-500">暂无未找到或失败的签到账号</div>
       </aside>
       <div v-if="selectedRecovery" class="space-y-4 rounded-xl border border-slate-800 bg-slate-900/50 p-4 lg:col-span-8">
         <div>
@@ -349,7 +349,7 @@ onUnmounted(() => {
           <div class="mt-1 text-xs text-slate-400">原来源：{{ selectedRecovery.source_title || '未知' }}；TG 数字 ID 仅在可确认时填写。不会按昵称匹配或读取头像。</div>
           <p v-if="selectedRecovery.profile_about" class="mt-2 whitespace-pre-wrap rounded bg-slate-950 p-2 text-sm text-slate-300">公开简介：{{ selectedRecovery.profile_about }}</p>
           <div v-if="selectedRecovery.profile_checked_at" class="mt-1 text-xs text-slate-500">资料检查时间：{{ new Date(selectedRecovery.profile_checked_at).toLocaleString('zh-CN') }}</div>
-          <a v-if="selectedRecovery.target_msg_id && selectedRecovery.source_username" class="mt-1 inline-block text-xs text-sky-300" :href="`https://t.me/${selectedRecovery.source_username}/${selectedRecovery.target_msg_id}`" target="_blank" rel="noreferrer">打开原在岗消息</a>
+          <a v-if="selectedRecovery.target_msg_id && selectedRecovery.source_username" class="mt-1 inline-block text-xs text-sky-300" :href="`https://t.me/${selectedRecovery.source_username}/${selectedRecovery.target_msg_id}`" target="_blank" rel="noreferrer">打开原签到消息</a>
         </div>
         <div v-if="selectedRecovery.status === 'deferred'" class="rounded-lg border border-amber-800 bg-amber-950/40 p-3 text-sm text-amber-200">
           Telegram 暂时限制了资料查询，系统会在 {{ selectedRecovery.next_attempt_at ? new Date(selectedRecovery.next_attempt_at).toLocaleString('zh-CN') : '冷却结束后' }} 自动重试。此任务仍在自动采集中，暂不需要人工补录。

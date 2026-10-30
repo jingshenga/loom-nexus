@@ -1,5 +1,9 @@
+<script>
+let saved = null;
+</script>
+
 <script setup>
-import { onMounted, onUnmounted, ref } from "vue";
+import { nextTick, onBeforeUnmount, onMounted, onUnmounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { Search, MapPin, X } from "lucide-vue-next";
 import BackToTop from "../components/BackToTop.vue";
@@ -17,7 +21,6 @@ const district = ref("");
 const districts = ref([]);
 const minPrice = ref(null);
 const maxPrice = ref(null);
-const onlineOnly = ref(false);
 const duty = ref("all");
 const offset = ref(0);
 const loading = ref(false);
@@ -26,6 +29,9 @@ const loadError = ref(false);
 const loadSentinel = ref(null);
 let loadObserver = null;
 let requestId = 0;
+let viewActive = false;
+let restoringPosition = false;
+let navigationSnapshotSaved = false;
 
 const favSet = ref(new Set());
 
@@ -70,7 +76,6 @@ function listingParams(limit, pageOffset) {
   if (district.value) params.set("district", district.value);
   if (minPrice.value != null && minPrice.value !== "") params.set("min_price", minPrice.value);
   if (maxPrice.value != null && maxPrice.value !== "") params.set("max_price", maxPrice.value);
-  if (onlineOnly.value) params.set("online", "true");
   params.set("duty", duty.value);
   params.set("limit", limit);
   params.set("offset", pageOffset);
@@ -78,11 +83,11 @@ function listingParams(limit, pageOffset) {
 }
 
 async function refreshSaved(snapshot) {
+  const currentRequest = ++requestId;
   q.value = snapshot.q;
   district.value = snapshot.district;
   minPrice.value = snapshot.minPrice;
   maxPrice.value = snapshot.maxPrice;
-  onlineOnly.value = snapshot.onlineOnly;
   duty.value = snapshot.duty || "all";
   const pageOffsets = Array.from(
     { length: Math.ceil(snapshot.items.length / PAGE_SIZE) },
@@ -94,15 +99,22 @@ async function refreshSaved(snapshot) {
     const pages = await Promise.all(pageOffsets.map((pageOffset) =>
       api(`/api/listings?${listingParams(PAGE_SIZE, pageOffset)}`),
     ));
+    if (!viewActive || currentRequest !== requestId) return;
     items.value = pages.flatMap((page) => page.items);
     total.value = pages[0].total;
     offset.value = pageOffsets[pageOffsets.length - 1];
     syncFavs(items.value);
-    requestAnimationFrame(() => window.scrollTo(0, snapshot.y));
+    await nextTick();
+    await restoreScrollPosition(snapshot);
+  } catch {
+    if (viewActive && currentRequest === requestId) loadError.value = true;
   } finally {
-    loading.value = false;
-    firstLoading.value = false;
-    requestAnimationFrame(observeLoadSentinel);
+    if (viewActive && currentRequest === requestId) {
+      loading.value = false;
+      firstLoading.value = false;
+      restoringPosition = false;
+      requestAnimationFrame(observeLoadSentinel);
+    }
   }
 }
 
@@ -112,17 +124,29 @@ function observeLoadSentinel() {
   loadObserver.observe(loadSentinel.value);
 }
 
-// browsing position restore: keep the last browse snapshot in a module
-// cache; returning to the square restores items+scroll instantly
-let saved = null;
+// Keep the last browse snapshot across ExploreView unmounts.
 
 function onPopState() {
   if (location.pathname === "/explore" && saved) restoreIfBack();
 }
 
-function persistScroll() {
+function onCardClick(event) {
+  if (!event.target?.closest?.("[data-listing-id]")) return;
+  persistScroll(event);
+  navigationSnapshotSaved = true;
+}
+
+function persistScroll(event) {
+  const clickedCard = event?.target?.closest?.("[data-listing-id]");
+  const visibleCard = [...document.querySelectorAll("[data-listing-id]")].find((card) => {
+    const rect = card.getBoundingClientRect();
+    return rect.bottom > 0 && rect.top < window.innerHeight;
+  });
+  const anchor = clickedCard || visibleCard;
   saved = {
     y: window.scrollY,
+    anchorId: anchor?.dataset.listingId || null,
+    anchorTop: anchor?.getBoundingClientRect().top ?? null,
     offset: offset.value,
     items: items.value,
     total: total.value,
@@ -130,43 +154,69 @@ function persistScroll() {
     district: district.value,
     minPrice: minPrice.value,
     maxPrice: maxPrice.value,
-    onlineOnly: onlineOnly.value,
     duty: duty.value,
   };
 }
 
-function restoreIfBack() {
-  // only for back/forward navigation (popstate), never fresh visits
-  if (saved && window.navigationTriggeredByPopstate !== false) {
-    items.value = saved.items;
-    total.value = saved.total;
-    offset.value = saved.offset;
-    requestAnimationFrame(() => window.scrollTo(0, saved.y));
-  }
+function restoreScrollPosition(snapshot) {
+  return new Promise((resolve) => requestAnimationFrame(() => {
+    if (!viewActive) return resolve();
+    const anchor = snapshot.anchorId
+      ? document.getElementById(`listing-card-${snapshot.anchorId}`)
+      : null;
+    if (anchor && snapshot.anchorTop != null) {
+      window.scrollTo(0, Math.max(0, window.scrollY + anchor.getBoundingClientRect().top - snapshot.anchorTop));
+    } else {
+      window.scrollTo(0, snapshot.y);
+    }
+    requestAnimationFrame(resolve);
+  }));
+}
+
+function restoreIfBack(snapshot = saved) {
+  if (!snapshot) return;
+  items.value = snapshot.items;
+  total.value = snapshot.total;
+  offset.value = snapshot.offset;
+  firstLoading.value = false;
+  restoringPosition = true;
+  nextTick(() => restoreScrollPosition(snapshot));
 }
 
 onMounted(async () => {
+  viewActive = true;
+  navigationSnapshotSaved = false;
+  window.history.scrollRestoration = "manual";
   window.addEventListener("popstate", onPopState);
+  document.addEventListener("click", onCardClick, true);
   loadObserver = new IntersectionObserver((entries) => {
     if (entries.some((entry) => entry.isIntersecting)
-        && items.value.length < total.value && !loading.value && !loadError.value) {
+        && items.value.length < total.value && !loading.value && !loadError.value && !restoringPosition) {
       load(false);
     }
   }, { rootMargin: "400px 0px" });
   observeLoadSentinel();
-  restoreIfBack();
-  if (saved) refreshSaved(saved);
+  if (saved) {
+    const snapshot = saved;
+    restoreIfBack(snapshot);
+    refreshSaved(snapshot);
+  }
   else load(true);
   try {
     districts.value = (await api("/api/meta/districts")).districts;
   } catch { /* non-fatal */ }
 });
 
+onBeforeUnmount(() => {
+  viewActive = false;
+  if (!navigationSnapshotSaved) persistScroll(); // save while the card grid is still in the DOM
+});
+
 onUnmounted(() => {
   window.removeEventListener("popstate", onPopState);
+  document.removeEventListener("click", onCardClick, true);
   loadObserver?.disconnect();
   loadObserver = null;
-  persistScroll(); // leaving the square (detail / other tab): snapshot
 });
 </script>
 
@@ -199,7 +249,7 @@ onUnmounted(() => {
     <!-- 筛选 chips：横滚不换行 -->
     <div class="nx-noscroll -mx-1 flex gap-2 overflow-x-auto px-1 pb-1">
       <button
-        v-for="option in [{ value: 'all', label: '全部' }, { value: 'today', label: '今日在岗' }, { value: 'yesterday', label: '昨日在岗' }]"
+        v-for="option in [{ value: 'all', label: '全部' }, { value: 'today', label: '今日签到' }, { value: 'yesterday', label: '昨日签到' }]"
         :key="option.value"
         @click="duty = option.value; load(true)"
         class="flex shrink-0 items-center gap-1.5 rounded-full border px-3.5 py-1.5 text-xs transition"
@@ -208,16 +258,6 @@ onUnmounted(() => {
           : 'border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200'"
       >
         {{ option.label }}
-      </button>
-      <button
-        @click="onlineOnly = !onlineOnly; load(true)"
-        class="flex shrink-0 items-center gap-1.5 rounded-full border px-3.5 py-1.5 text-xs transition"
-        :class="onlineOnly
-          ? 'border-transparent nx-grad text-white font-semibold'
-          : 'border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200'"
-      >
-        <span class="inline-block size-2 rounded-full" :class="onlineOnly ? 'bg-white' : 'bg-slate-500'"></span>
-        仅在线
       </button>
       <button
         v-for="d in districts" :key="d"

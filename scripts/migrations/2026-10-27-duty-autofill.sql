@@ -20,8 +20,8 @@ CREATE INDEX IF NOT EXISTS idx_duty_collection_jobs_pending
 
 WITH mappings(rule_name, source_title) AS (
     VALUES
-        ('天一今日在岗', '宁波TG老师专榜'),
-        ('小木屋今日在岗', '宁波小木屋分享榜')
+        ('天一今日签到', '宁波TG老师专榜'),
+        ('小木屋今日签到', '宁波小木屋分享榜')
 )
 UPDATE ingest_rules ir
 SET config_json = ir.config_json || jsonb_build_object(

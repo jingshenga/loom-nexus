@@ -144,7 +144,7 @@ const fieldRowsTop = (it) => [
 ];
 const fieldRowsBottom = (it) => [
   ["状态", it.online_tier === "online" ? "在线" : it.online_tier === "recent" ? "近期活跃" : "未知"],
-  ["在岗", it.duty_label === "today" ? "今日在岗" : it.duty_label === "yesterday" ? "昨日在岗" : null],
+  ["签到", it.duty_label === "today" ? "今日签到" : it.duty_label === "yesterday" ? "昨日签到" : null],
   ["发布时间", it.published_at ? new Date(it.published_at).toLocaleString("zh-CN") : null],
 ];
 </script>
@@ -231,7 +231,7 @@ const fieldRowsBottom = (it) => [
         {{ item.description }}
       </p>
       <div v-if="editing && editForm" class="space-y-3 rounded-xl border border-slate-800 bg-slate-900 p-4">
-        <p class="text-xs leading-relaxed text-slate-500">自动识别与排序优先；这里的修改仅覆盖当前卡片。在线和在岗状态仍由自动采集维护。</p>
+        <p class="text-xs leading-relaxed text-slate-500">自动识别与排序优先；这里的修改仅覆盖当前卡片。在线和签到状态仍由自动采集维护。</p>
         <label class="block space-y-1 text-sm"><span class="text-slate-400">昵称</span>
           <input v-model="editForm.nickname" maxlength="128" class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
         </label>

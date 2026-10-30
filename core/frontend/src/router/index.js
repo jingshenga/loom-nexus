@@ -48,7 +48,15 @@ const routes = [
   },
 ];
 
-const router = createRouter({ history: createWebHistory(), routes });
+const router = createRouter({
+  history: createWebHistory(),
+  routes,
+  scrollBehavior(to, from, savedPosition) {
+    // ExploreView restores its own saved card anchor after loading the list.
+    if (to.path === "/explore") return false;
+    return savedPosition || { top: 0, left: 0 };
+  },
+});
 
 router.beforeEach((to) => {
   const session = useSession();

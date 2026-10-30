@@ -420,7 +420,7 @@ onMounted(async () => {
     </div>
 
     <div class="flex gap-2 border-b border-slate-800 pb-2">
-      <button v-for="tab in [{ value: 'listing', label: '名片抓取' }, { value: 'on_duty', label: '在岗规则' }]"
+      <button v-for="tab in [{ value: 'listing', label: '名片抓取' }, { value: 'on_duty', label: '签到规则' }]"
         :key="tab.value" @click="switchTab(tab.value)"
         class="rounded-lg px-4 py-2 text-sm"
         :class="activeTab === tab.value ? 'bg-sky-600 font-semibold text-white' : 'bg-slate-900 text-slate-400'">
@@ -502,7 +502,7 @@ onMounted(async () => {
           </span>
         </div>
         <div class="flex gap-2">
-          <input v-model="current.rule_name" placeholder="在岗规则名称"
+          <input v-model="current.rule_name" placeholder="签到规则名称"
             class="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
           <button @click="save" class="flex items-center gap-1 rounded-lg bg-sky-600 px-3 text-sm"><Save class="size-4" />保存</button>
           <button v-if="current.id" @click="copyRule" class="rounded-lg border border-slate-600 p-2" title="复制"><Copy class="size-4" /></button>
@@ -542,7 +542,7 @@ onMounted(async () => {
           </label>
           <label class="flex items-center gap-2 text-xs text-slate-300 sm:col-span-2">
             <input v-model="dutyForm.auto_collect_enabled" type="checkbox" class="size-4 accent-emerald-500" />
-            自动补采今日在岗但尚无卡片的 TG 账号
+            自动补采今日签到但尚无卡片的 TG 账号
           </label>
           <label v-if="dutyForm.auto_collect_enabled" class="text-xs text-slate-400 sm:col-span-2">名片采集来源
             <select v-model.number="dutyForm.collection_source_id"

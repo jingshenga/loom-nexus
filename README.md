@@ -50,7 +50,7 @@ docker compose exec -T nexus-db psql -U nexus -d nexus < scripts/schema.sql
 - **M4（已完成）**：Outbox 防串线代理私聊 + WebSocket 实时收发 + CONFLICT_LOCKED 隔离
 - **M5（已完成）**：规则工坊（CRUD / 沙盒回测 / 来源绑定 / 可插拔 AI 生成）
 - **M6（已完成）**：类型 B 聚合链接消息（引用拉取合并）、联系人公开在离线、
-  广场「仅在线」过滤、详情页站内咨询直连聊天（含 CONFLICT_LOCKED 警示卡）
+  广场在线状态展示与签到筛选、详情页站内咨询直连聊天（含 CONFLICT_LOCKED 警示卡）
 - **M7（已完成）**：类型 C 联系人简介穿透链路 —— bio 候选房间入队、
   管理端「穿透」页人工确认门禁、确认后网关进入房间将置顶帖与房主近况合并入库
 - **M8（已完成）**：会话生命周期与体验补全 —— 手动「结束会话」释放网关账号、

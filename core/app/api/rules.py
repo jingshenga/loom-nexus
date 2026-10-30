@@ -143,7 +143,7 @@ async def upsert_rule(body: RuleBody) -> dict:
             missing.append("target_channel_username")
         if missing:
             raise HTTPException(
-                status_code=422, detail=f"在岗规则缺少配置：{', '.join(missing)}",
+                status_code=422, detail=f"签到规则缺少配置：{', '.join(missing)}",
             )
         if body.config.get("auto_collect_enabled", True):
             try:

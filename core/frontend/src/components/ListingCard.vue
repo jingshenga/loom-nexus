@@ -31,8 +31,8 @@ const tierClass = () =>
   props.item.online_tier === "online" ? "bg-emerald-400"
     : props.item.online_tier === "recent" ? "bg-amber-400" : "bg-slate-400";
 const dutyText = () =>
-  props.item.duty_label === "today" ? "今日在岗"
-    : props.item.duty_label === "yesterday" ? "昨日在岗" : "";
+  props.item.duty_label === "today" ? "今日签到"
+    : props.item.duty_label === "yesterday" ? "昨日签到" : "";
 
 async function toggleFavorite() {
   // optimistic: the caller owns the state and updates instantly; on
@@ -49,6 +49,8 @@ async function toggleFavorite() {
 <template>
   <RouterLink
     :to="`/explore/${item.id}`"
+    :id="`listing-card-${item.id}`"
+    :data-listing-id="item.id"
     class="group block overflow-hidden rounded-2xl border border-slate-800 bg-slate-900 transition hover:border-sky-400/60 hover:shadow-lg hover:shadow-sky-400/5"
   >
     <div class="relative aspect-[4/5] bg-slate-800">

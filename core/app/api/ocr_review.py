@@ -45,7 +45,7 @@ async def queue(status: str = "pending", limit: int = 40, offset: int = 0) -> di
         "o.error_text, COALESCE(rm.raw_text, l.description) AS message_text, "
         "COALESCE(rm.posted_at, l.created_at) AS posted_at, "
         "COALESCE(s.title, CASE WHEN l.duty_collection_job_id IS NOT NULL "
-        "THEN '在岗资料自动采集' END) AS source_title, l.nickname "
+        "THEN '签到资料自动采集' END) AS source_title, l.nickname "
         "FROM listing_media_ocr o "
         "LEFT JOIN raw_messages rm ON rm.id=o.raw_id "
         "LEFT JOIN ingest_sources s ON s.id=rm.source_id "
