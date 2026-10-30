@@ -21,6 +21,11 @@ SQL_DEFER = sqlres.load("duty_collection_defer.sql")
 POLL_S = 3.0
 SQL_SCAN_CLAIM = sqlres.load("duty_recovery_scan_claim.sql")
 SQL_SCAN_FINISH = sqlres.load("duty_recovery_scan_finish.sql")
+SQL_PROFILE_CLAIM = sqlres.load("profile_collection_claim.sql")
+SQL_PROFILE_FINISH = sqlres.load("profile_collection_finish.sql")
+SQL_PROFILE_DEFER = sqlres.load("profile_collection_defer.sql")
+SQL_PROFILE_RESULT = sqlres.load("profile_collection_result.sql")
+SQL_PROFILE_OCR_ENQUEUE = sqlres.load("profile_collection_ocr_enqueue.sql")
 
 
 def _matches_username(message, username: str) -> bool:
@@ -135,6 +140,7 @@ PROMO_URL_RE = re.compile(r"(?:https?://|www\.|t\.me/)", re.I)
 MAX_PINNED_MESSAGES = 3
 MAX_PROFILE_PHOTOS = 4
 MAX_PROFILE_VIDEOS = 2
+MAX_PROFILE_V2_PHOTOS = 6
 
 
 def _is_obvious_promo(text: str) -> bool:
@@ -185,7 +191,7 @@ async def _save_profile(pool, job, user, about, channel, channel_url, bot_url,
 
 
 async def _profile_channel(pool, client, job, full, user, about, saved_channel_url, saved_bot_url):
-    from telethon.tl.types import Channel, PeerChannel
+    from telethon.tl.types import Channel, Chat, PeerChannel
 
     full_user = full.full_user
     channel = None
@@ -208,7 +214,7 @@ async def _profile_channel(pool, client, job, full, user, about, saved_channel_u
         if saved_match:
             try:
                 entity = await _rate_limited_entity(pool, client, job["account_id"], saved_match.group(1))
-                if isinstance(entity, Channel):
+                if isinstance(entity, (Channel, Chat)):
                     channel = entity
                     channel_url = _entity_url(channel, channel_url)
             except Exception as exc:
@@ -233,7 +239,7 @@ async def _profile_channel(pool, client, job, full, user, about, saved_channel_u
             continue
         if getattr(entity, "bot", False):
             bot_url = bot_url or link
-        elif channel is None and isinstance(entity, Channel):
+        elif channel is None and isinstance(entity, (Channel, Chat)):
             channel = entity
             channel_url = _entity_url(entity, link)
 
@@ -411,6 +417,167 @@ async def _collect_profile_listing(pool, client, job) -> tuple[str, int | None, 
     return "fetched", None, None
 
 
+async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
+    """Collect a V2 result into its isolated trial table; never writes a listing."""
+    from telethon.tl.functions.users import GetFullUserRequest
+
+    user = await _rate_limited_entity(pool, client, job["account_id"], job["contact_username"])
+    if not getattr(user, "id", None) or not hasattr(user, "first_name"):
+        raise RuntimeError("Telegram username did not resolve to a user profile")
+    full = await client(GetFullUserRequest(user))
+    full_user = full.full_user
+    about = (getattr(full_user, "about", None) or "").strip()
+    channel, channel_url, bot_url, _, full_user = await _profile_channel(
+        pool, client, job, full, user, about, "", "",
+    )
+    cfg = job["config_json"]
+    if isinstance(cfg, str):
+        cfg = json.loads(cfg)
+    cfg = cfg if isinstance(cfg, dict) else {}
+    recent_window = max(1, min(10, int(cfg.get("recent_window", 10))))
+    scan_limit = max(recent_window, min(100, int(cfg.get("max_scan_messages", 100))))
+    photo_limit = max(1, min(MAX_PROFILE_V2_PHOTOS, int(cfg.get("max_photos", 6))))
+    video_limit = max(0, min(MAX_PROFILE_VIDEOS, int(cfg.get("max_videos", 2))))
+    min_chars = max(1, int(cfg.get("intro_min_chars", 30)))
+    min_lines = max(1, int(cfg.get("intro_min_lines", 3)))
+    spotlight_id = getattr(full_user, "personal_channel_message", None)
+    messages, pinned_ids = [], set()
+    profile_link_ids = set()
+    scanned = 0
+    if channel is not None:
+        channel_name = (getattr(channel, "username", None) or "").lower()
+        for link_name, message_id in _profile_links(about):
+            if message_id and link_name.lower() == channel_name:
+                try:
+                    linked_message = await client.get_messages(channel, ids=int(message_id))
+                    if linked_message is not None and not isinstance(linked_message, list):
+                        messages.append(linked_message)
+                        profile_link_ids.add(int(linked_message.id))
+                except Exception as exc:
+                    if _is_flood_wait(exc):
+                        raise
+        try:
+            from telethon.tl.types import InputMessagesFilterPinned
+            async for msg in client.iter_messages(channel, filter=InputMessagesFilterPinned, limit=3):
+                messages.append(msg)
+                pinned_ids.add(int(msg.id))
+        except Exception as exc:
+            if _is_flood_wait(exc):
+                raise
+            logger.info("V2 linked-channel pins unavailable (user=%s): %s", user.id, exc)
+        if spotlight_id:
+            try:
+                msg = await client.get_messages(channel, ids=spotlight_id)
+                if msg is not None and not isinstance(msg, list):
+                    messages.append(msg)
+            except Exception as exc:
+                if _is_flood_wait(exc):
+                    raise
+        usable = [m for m in messages if _has_profile_content(m)]
+        intro = about or "\n".join((m.raw_text or "").strip() for m in usable)
+        pinned_photos = sum(bool(part.photo) for msg in usable for part in [msg])
+        if len(re.sub(r"\s+", "", intro)) < min_chars or pinned_photos < 3:
+            recent = []
+            try:
+                async for msg in client.iter_messages(channel, limit=recent_window):
+                    recent.append(msg)
+            except Exception as exc:
+                if _is_flood_wait(exc):
+                    raise
+                logger.info("V2 recent channel scan unavailable (user=%s): %s", user.id, exc)
+            scanned += len(recent)
+            messages.extend(recent)
+            intro = about or "\n".join((m.raw_text or "").strip() for m in messages if _has_profile_content(m))
+            recent_photos = sum(bool(msg.photo) for msg in messages)
+            if (len(re.sub(r"\s+", "", intro)) < min_chars or recent_photos < 3) and scanned < scan_limit and recent:
+                remaining = scan_limit - scanned
+                try:
+                    async for msg in client.iter_messages(channel, limit=remaining, offset_id=min(m.id for m in recent)):
+                        messages.append(msg)
+                        scanned += 1
+                except Exception as exc:
+                    if _is_flood_wait(exc):
+                        raise
+                    logger.info("V2 older channel scan unavailable (user=%s): %s", user.id, exc)
+
+    unique = []
+    seen_ids = set()
+    filtered_count = 0
+    for msg in messages:
+        if not msg or int(msg.id) in seen_ids:
+            continue
+        seen_ids.add(int(msg.id))
+        if _is_obvious_promo((msg.raw_text or "").strip()):
+            filtered_count += 1
+            continue
+        if _has_profile_content(msg):
+            unique.append(msg)
+
+    text_parts = [f"个人简介：\n{about}"] if about else []
+    media, video_candidates, sources = [], [], []
+    channel_username = getattr(channel, "username", None) if channel is not None else None
+    for msg in unique:
+        parts = await _fetch_album(client, channel, msg) if channel is not None else [msg]
+        anchor = next((part for part in parts if (part.raw_text or "").strip()), msg)
+        raw_text = (anchor.raw_text or "").strip()
+        if len(re.sub(r"\s+", "", raw_text)) >= min_chars or any(p.photo or p.video for p in parts):
+            if raw_text:
+                text_parts.append(raw_text)
+            if channel_username:
+                sources.append({
+                    "url": f"https://t.me/{channel_username}/{msg.id}",
+                    "message_id": int(msg.id),
+                    "posted_at": msg.date.isoformat() if msg.date else None,
+                    "pinned": int(msg.id) in pinned_ids,
+                    "profile_linked": int(msg.id) in profile_link_ids,
+                    "matched_by": "profile_link" if int(msg.id) in profile_link_ids else "linked_channel_any_sender",
+                })
+        for part in parts:
+            if any(item.get("message_id") == int(part.id) for item in media):
+                continue
+            if part.photo and sum(item["kind"] == "photo" for item in media) < photo_limit:
+                entries = await backfill.save_media(
+                    part, job["source_id"], stable_prefix=f"profile_v2_{job['job_id']}_{part.id}",
+                )
+                media.extend({**item, "message_id": int(part.id)} for item in entries if item.get("kind") == "photo")
+            elif part.video or part.video_note:
+                video_candidates.append(part)
+
+    if not any(item["kind"] == "photo" for item in media):
+        for part in video_candidates[:video_limit]:
+            entries = await backfill.save_media(
+                part, job["source_id"], stable_prefix=f"profile_v2_{job['job_id']}_{part.id}",
+            )
+            media.extend({**item, "message_id": int(part.id)} for item in entries if item.get("kind") == "video")
+    description = "\n\n".join(dict.fromkeys(text_parts)).strip()
+    if not description and not media:
+        return "not_found", "No usable profile, linked-channel, or media content found"
+
+    evidence = {
+        "collection_method": "profile -> linked channel pins/spotlight -> recent 10 -> older messages",
+        "profile_url": f"https://t.me/{user.username or job['contact_username']}",
+        "source_messages": sources,
+        "scan_count": scanned,
+        "scan_limit": scan_limit,
+        "filtered_promo_count": filtered_count,
+        "photo_limit": photo_limit,
+        "video_limit_when_no_photos": video_limit,
+        "avatar_used": False,
+        "intro_min_chars": min_chars,
+        "intro_min_lines": min_lines,
+        "any_sender_in_linked_channel": True,
+    }
+    rows = await pool.fetch(
+        SQL_PROFILE_RESULT, job["job_id"], int(user.id), job["contact_username"],
+        evidence["profile_url"], channel_url or "", bot_url or "", description,
+        json.dumps(backfill.order_media(media), ensure_ascii=False),
+        json.dumps(evidence, ensure_ascii=False), json.dumps(cfg, ensure_ascii=False),
+    )
+    result_id = rows[0]["id"]
+    await pool.fetch(SQL_PROFILE_OCR_ENQUEUE, result_id, json.dumps(media, ensure_ascii=False))
+    return "fetched", None
+
+
 async def _scan_recovery(client, job):
     channel_url = str(job["channel_url"] or "").strip()
     match = re.fullmatch(r"https?://t\.me/([A-Za-z0-9_]+)(?:/\d+)?/?(?:\?.*)?", channel_url, re.I)
@@ -494,6 +661,27 @@ async def run_duty_collection(pool, stop) -> None:
                         "failed", str(exc)[:1000],
                     )
                     logger.warning("on-duty recovery scan failed (job=%s): %s", scan["duty_job_id"], exc)
+            profile_jobs = await pool.fetch(SQL_PROFILE_CLAIM)
+            for job in profile_jobs:
+                try:
+                    if not job["session_file"]:
+                        raise RuntimeError("assigned Telegram account is unavailable")
+                    client = await hub.get_client(str(job["session_file"]).removesuffix(".session"))
+                    if client is None:
+                        raise RuntimeError("Telegram account is unauthorized")
+                    status, error = await _collect_profile_trial(pool, client, job)
+                    await pool.fetch(SQL_PROFILE_FINISH, job["job_id"], status, error)
+                    logger.info("profile V2 job %s: job=%s username=%s",
+                                status, job["job_id"], job["contact_username"])
+                except Exception as exc:
+                    if _is_flood_wait(exc):
+                        wait_s = _flood_wait_seconds(exc)
+                        await pool.fetch(SQL_PROFILE_DEFER, job["job_id"], wait_s)
+                        logger.warning("profile V2 job deferred by FloodWait (job=%s wait=%ss)",
+                                       job["job_id"], wait_s)
+                        continue
+                    await pool.fetch(SQL_PROFILE_FINISH, job["job_id"], "failed", str(exc)[:1000])
+                    logger.warning("profile V2 job failed (job=%s): %s", job["job_id"], exc)
         except Exception:
             logger.exception("on-duty linked-message polling failed")
         try:

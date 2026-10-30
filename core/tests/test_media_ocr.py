@@ -1,7 +1,9 @@
 import unittest
 
 from app.api.listings import _visible_media
-from app.extractor.media_ocr import classify_image, extract_card_fields, normalize_ocr_text
+from app.extractor.media_ocr import (
+    classify_image, classify_profile_image, extract_card_fields, normalize_ocr_text,
+)
 
 
 class MediaOcrTests(unittest.TestCase):
@@ -28,6 +30,21 @@ class MediaOcrTests(unittest.TestCase):
             [{"text": "周末快乐"}], 0.64, 0.35,
         )
         self.assertEqual(classification, "profile_photo")
+
+    def test_profile_trial_uses_text_volume_and_line_count(self):
+        classification, confidence, text = classify_profile_image(
+            [{"text": "昵称：小雨"}, {"text": "身高：165"}, {"text": "价格：800"}], 15, 3,
+        )
+        self.assertEqual(classification, "info_card")
+        self.assertGreater(confidence, 0.8)
+        self.assertIn("身高", text)
+
+    def test_profile_trial_marks_ambiguous_text_for_review(self):
+        classification, confidence, _ = classify_profile_image(
+            [{"text": "价格：800元，可联系看详情"}, {"text": "欢迎联系本人了解更多介绍内容"}], 40, 4,
+        )
+        self.assertEqual(classification, "uncertain")
+        self.assertLess(confidence, 0.8)
 
     def test_fields_keep_explicit_age_and_do_not_turn_birth_year_into_age(self):
         lines = [

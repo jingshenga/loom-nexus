@@ -31,6 +31,7 @@ SQL_COPY = sqlres.load("rule_copy.sql")
 SQL_DUTY_STATUS = sqlres.load("duty_rule_status.sql")
 SQL_DUTY_COLLECTION_SOURCES = sqlres.load("duty_collection_sources.sql")
 SQL_DUTY_COLLECTION_SOURCE_VALIDATE = sqlres.load("duty_collection_source_validate.sql")
+SQL_PROFILE_COLLECTION_RESULTS = sqlres.load("profile_collection_results.sql")
 
 LLM_SYSTEM_PROMPT = (
     "你是消息抽取规则生成器。根据用户给出的样本消息，产出一个 JSON 规则对象，"
@@ -46,7 +47,7 @@ LLM_SYSTEM_PROMPT = (
 
 class RuleBody(BaseModel):
     rule_name: str
-    rule_type: Literal["listing", "on_duty"] = "listing"
+    rule_type: Literal["listing", "on_duty", "profile_collection"] = "listing"
     config: dict
     is_active: bool = True
 
@@ -135,6 +136,25 @@ async def list_rules() -> dict:
 @router.put("")
 async def upsert_rule(body: RuleBody) -> dict:
     pool = _pool()
+    if body.rule_type == "profile_collection":
+        limits = {
+            "recent_window": (1, 10),
+            "max_scan_messages": (10, 100),
+            "max_photos": (1, 6),
+            "max_videos": (0, 2),
+            "intro_min_chars": (1, 500),
+            "intro_min_lines": (1, 30),
+        }
+        for key, (minimum, maximum) in limits.items():
+            value = body.config.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or not minimum <= value <= maximum:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"资料深采配置 {key} 必须在 {minimum}–{maximum} 之间",
+                )
+        for key in ("channel_any_sender_matches", "skip_video_when_photo_found", "exclude_avatar"):
+            if body.config.get(key) is not True:
+                raise HTTPException(status_code=422, detail=f"资料深采配置 {key} 必须启用")
     if body.rule_type == "on_duty":
         required = ("sender_peer_id", "match_prefix", "update_mode", "identity_mode")
         missing = [key for key in required if not body.config.get(key)]
@@ -187,6 +207,28 @@ async def bind_rule(rule_id: int, body: BindBody) -> dict:
     pool = _pool()
     await pool.fetch(SQL_BIND, rule_id, body.source_id, body.priority)
     return {"ok": True}
+
+
+@router.get("/{rule_id}/profile-collection")
+async def profile_collection_results(rule_id: int, limit: int = 50) -> dict:
+    pool = _pool()
+    rows = await pool.fetch(SQL_PROFILE_COLLECTION_RESULTS, rule_id, max(1, min(limit, 100)))
+    return {"items": [
+        {
+            "job_id": row["job_id"], "duty_date": str(row["duty_date"]),
+            "contact_username": row["contact_username"], "status": row["status"],
+            "error": row["error"], "next_attempt_at": row["next_attempt_at"].isoformat()
+                if row["next_attempt_at"] else None,
+            "retry_count": row["retry_count"], "queued_at": row["queued_at"].isoformat(),
+            "result_id": row["result_id"], "contact_peer_id": row["contact_peer_id"],
+            "profile_url": row["profile_url"], "channel_url": row["channel_url"],
+            "bot_url": row["bot_url"], "description": row["description"],
+            "media": _decode_jsonb(row["media_json"], []),
+            "evidence": _decode_jsonb(row["evidence_json"], {}),
+            "collected_at": row["collected_at"].isoformat() if row["collected_at"] else None,
+            "ocr_pending": row["ocr_pending"], "ocr_review": row["ocr_review"],
+        } for row in rows
+    ]}
 
 
 @router.post("/{rule_id}/unbind")

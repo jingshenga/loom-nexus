@@ -2,7 +2,7 @@
 import AdminTabs from "../components/AdminTabs.vue";
 import { computed, onMounted, ref } from "vue";
 import { Save, FlaskConical, Sparkles, Trash2, Link2, Settings2, PlugZap, RefreshCw, Copy } from "lucide-vue-next";
-import { api } from "../api/client";
+import { api, mediaUrl } from "../api/client";
 
 const rules = ref([]);
 const current = ref(null);
@@ -24,6 +24,8 @@ const activeTab = ref("listing");
 const dialogs = ref([]);
 const dutyDialogKey = ref("");
 const dutyForm = ref({});
+const profileForm = ref({});
+const profileResults = ref([]);
 const filteredRules = computed(() => rules.value.filter((r) => (r.rule_type || "listing") === activeTab.value));
 
 const EMPTY_DUTY_CONFIG = {
@@ -39,6 +41,18 @@ const EMPTY_DUTY_CONFIG = {
   profile_query_required: false,
   exclude_usernames: [],
   business_cutoff_hour: 4,
+};
+
+const EMPTY_PROFILE_CONFIG = {
+  recent_window: 10,
+  max_scan_messages: 100,
+  max_photos: 6,
+  max_videos: 2,
+  intro_min_chars: 30,
+  intro_min_lines: 3,
+  channel_any_sender_matches: true,
+  skip_video_when_photo_found: true,
+  exclude_avatar: true,
 };
 
 const EMPTY_CONFIG = {
@@ -99,16 +113,28 @@ function select(rule) {
   configText.value = JSON.stringify(rule.config, null, 2);
   dryrun.value = null;
   dutyForm.value = { ...EMPTY_DUTY_CONFIG, ...(rule.config || {}) };
+  profileForm.value = { ...EMPTY_PROFILE_CONFIG, ...(rule.config || {}) };
   // default the sample drawer to the first group this rule is bound to
   const first = (rule.bindings || [])[0];
   if (first) sampleSourceId.value = first.source_id;
+  if (activeTab.value === "profile_collection" && rule.id) loadProfileResults(rule.id);
+  else profileResults.value = [];
+}
+
+async function loadProfileResults(ruleId = current.value?.id) {
+  if (!ruleId) return;
+  const data = await api(`/api/admin/rules/${ruleId}/profile-collection`);
+  profileResults.value = data.items || [];
 }
 
 function newRule() {
   current.value = { rule_name: "", rule_type: activeTab.value, is_active: true };
-  const config = activeTab.value === "on_duty" ? EMPTY_DUTY_CONFIG : EMPTY_CONFIG;
+  const config = activeTab.value === "on_duty" ? EMPTY_DUTY_CONFIG
+    : activeTab.value === "profile_collection" ? EMPTY_PROFILE_CONFIG : EMPTY_CONFIG;
   configText.value = JSON.stringify(config, null, 2);
   dutyForm.value = { ...EMPTY_DUTY_CONFIG };
+  profileForm.value = { ...EMPTY_PROFILE_CONFIG };
+  profileResults.value = [];
   dryrun.value = null;
 }
 
@@ -134,6 +160,7 @@ function switchTab(tab) {
 async function save() {
   let config;
   if (activeTab.value === "on_duty") config = { ...dutyForm.value };
+  else if (activeTab.value === "profile_collection") config = { ...profileForm.value };
   else {
     try {
       config = JSON.parse(configText.value);
@@ -228,6 +255,12 @@ async function bindToSource() {
     body: JSON.stringify({ source_id: bindSourceId.value, priority: 100 }),
   });
   notify(`已绑定来源#${bindSourceId.value}（优先级 100，覆盖默认规则）`);
+  if (activeTab.value === "profile_collection") {
+    const ruleId = current.value.id;
+    await loadRules();
+    const fresh = rules.value.find((rule) => rule.id === ruleId);
+    if (fresh) select(fresh);
+  }
 }
 
 async function loadRecentSamples() {
@@ -420,7 +453,11 @@ onMounted(async () => {
     </div>
 
     <div class="flex gap-2 border-b border-slate-800 pb-2">
-      <button v-for="tab in [{ value: 'listing', label: '名片抓取' }, { value: 'on_duty', label: '签到规则' }]"
+      <button v-for="tab in [
+        { value: 'listing', label: '名片抓取' },
+        { value: 'on_duty', label: '在岗规则 V1' },
+        { value: 'profile_collection', label: '资料深采 V2' },
+      ]"
         :key="tab.value" @click="switchTab(tab.value)"
         class="rounded-lg px-4 py-2 text-sm"
         :class="activeTab === tab.value ? 'bg-sky-600 font-semibold text-white' : 'bg-slate-900 text-slate-400'">
@@ -493,7 +530,7 @@ onMounted(async () => {
         </details>
       </section>
 
-      <section v-else class="space-y-3 lg:col-span-5 lg:overflow-y-auto">
+      <section v-else-if="activeTab === 'on_duty'" class="space-y-3 lg:col-span-5 lg:overflow-y-auto">
         <div v-if="boundGroups().length" class="flex flex-wrap items-center gap-2 text-xs">
           <span class="text-slate-500">已绑定群组：</span>
           <span v-for="b in boundGroups()" :key="b.source_id"
@@ -578,6 +615,66 @@ onMounted(async () => {
         </details>
       </section>
 
+      <section v-else class="space-y-3 lg:col-span-5 lg:overflow-y-auto">
+        <div class="flex items-center gap-2">
+          <input v-model="current.rule_name" placeholder="规则名称"
+            class="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
+          <button @click="save" class="flex items-center gap-1 rounded-lg bg-violet-600 px-3 py-2 text-sm">
+            <Save class="size-4" />保存
+          </button>
+          <button v-if="current.id" @click="copyRule" class="rounded-lg border border-slate-600 p-2" title="复制规则">
+            <Copy class="size-4" />
+          </button>
+          <button v-if="current.id" @click="remove" class="rounded-lg border border-rose-700/60 p-2 text-rose-300" title="删除规则">
+            <Trash2 class="size-4" />
+          </button>
+        </div>
+        <label class="flex items-center gap-2 text-xs text-slate-400">
+          <input v-model="current.is_active" type="checkbox" class="size-4 accent-violet-500" />启用 V2 试采规则
+        </label>
+        <div class="rounded-xl border border-violet-800/50 bg-violet-950/20 p-4 text-xs leading-relaxed text-slate-300">
+          V2 与 V1 独立运行。频道关联后，频道内任意发送者的消息都可作为候选；采集结果先进入试采区，验证通过后再替换旧卡片。
+        </div>
+        <div class="grid gap-3 rounded-xl border border-slate-800 bg-slate-900/50 p-4 sm:grid-cols-2">
+          <label class="text-xs text-slate-400">先检查最近消息数
+            <input v-model.number="profileForm.recent_window" type="number" min="1" max="10"
+              class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
+          </label>
+          <label class="text-xs text-slate-400">总扫描上限
+            <input v-model.number="profileForm.max_scan_messages" type="number" min="10" max="100"
+              class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
+          </label>
+          <label class="text-xs text-slate-400">最多照片
+            <input v-model.number="profileForm.max_photos" type="number" min="1" max="6"
+              class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
+          </label>
+          <label class="text-xs text-slate-400">无照片时最多视频
+            <input v-model.number="profileForm.max_videos" type="number" min="0" max="2"
+              class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
+          </label>
+          <label class="text-xs text-slate-400">介绍图最少识别字数
+            <input v-model.number="profileForm.intro_min_chars" type="number" min="1" max="500"
+              class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
+          </label>
+          <label class="text-xs text-slate-400">介绍图最少文字行数
+            <input v-model.number="profileForm.intro_min_lines" type="number" min="1" max="30"
+              class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
+          </label>
+          <label class="flex items-center gap-2 text-xs text-slate-300">
+            <input v-model="profileForm.channel_any_sender_matches" type="checkbox" disabled class="size-4 accent-violet-500" />
+            关联频道内任意发送者均可作为候选
+          </label>
+          <label class="flex items-center gap-2 text-xs text-slate-300">
+            <input v-model="profileForm.skip_video_when_photo_found" type="checkbox" disabled class="size-4 accent-violet-500" />
+            找到照片后不采视频
+          </label>
+          <label class="flex items-center gap-2 text-xs text-slate-300 sm:col-span-2">
+            <input v-model="profileForm.exclude_avatar" type="checkbox" disabled class="size-4 accent-violet-500" />
+            排除 Telegram 头像
+          </label>
+        </div>
+      </section>
+
       <section v-if="activeTab === 'listing'" class="lg:col-span-5 space-y-3 lg:overflow-y-auto">
         <div class="space-y-2 rounded-xl border border-slate-800 bg-slate-900/50 p-3">
           <div class="flex items-center gap-2 text-sm font-medium"><Sparkles class="size-4 text-sky-400" />样本输入</div>
@@ -637,7 +734,7 @@ onMounted(async () => {
           </div>
         </div>
       </section>
-      <section v-else class="space-y-3 lg:col-span-5 lg:overflow-y-auto">
+      <section v-else-if="activeTab === 'on_duty'" class="space-y-3 lg:col-span-5 lg:overflow-y-auto">
         <div class="rounded-xl border border-slate-800 bg-slate-900/50 p-4">
           <h3 class="text-sm font-semibold">当前同步状态</h3>
           <div class="mt-3 grid grid-cols-2 gap-2 text-sm sm:grid-cols-3">
@@ -653,6 +750,58 @@ onMounted(async () => {
         </div>
         <div class="rounded-xl border border-slate-800 bg-slate-900/50 p-4 text-sm text-slate-400">
           网关只接收绑定群内指定 Bot 的匹配榜单。其他聊天、抽奖、积分、相册不会下载媒体，也不会写入原始消息表。
+        </div>
+      </section>
+      <section v-else class="space-y-3 lg:col-span-5 lg:overflow-y-auto">
+        <div class="rounded-xl border border-violet-800/50 bg-violet-950/20 p-4">
+          <h3 class="text-sm font-semibold">V2 试采策略</h3>
+          <p class="mt-2 text-xs leading-relaxed text-slate-400">
+            先读个人简介关联消息和置顶；资料不足时查最近消息，再向前扩扫至总上限。对照片 OCR 统计文字量和行数；有照片不取视频。试采数据独立保存，不会直接覆盖 V1 卡片。
+          </p>
+        </div>
+        <div v-if="current.id" class="flex flex-wrap gap-2 rounded-xl border border-slate-800 bg-slate-900/50 p-3">
+          <select v-model="bindSourceId" class="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-2 py-2 text-xs">
+            <option :value="null" disabled>选择资料来源…</option>
+            <option v-for="s in sources" :key="s.id" :value="s.id">{{ s.title || `来源#${s.id}` }}{{ s.is_active ? "" : "（已暂停）" }}</option>
+          </select>
+          <button @click="bindToSource" class="flex items-center gap-1 rounded-lg border border-slate-600 px-3 py-2 text-xs">
+            <Link2 class="size-3.5" />绑定来源
+          </button>
+          <button @click="loadProfileResults()" class="flex items-center gap-1 rounded-lg border border-slate-600 px-3 py-2 text-xs">
+            <RefreshCw class="size-3.5" />刷新试采结果
+          </button>
+        </div>
+        <div v-if="boundGroups().length" class="flex flex-wrap gap-2 text-xs text-slate-400">
+          <span>已绑定：</span><span v-for="b in boundGroups()" :key="b.source_id" class="rounded-full border border-slate-700 px-2 py-1">{{ b.title || `来源#${b.source_id}` }}</span>
+        </div>
+        <div class="space-y-3">
+          <article v-for="item in profileResults" :key="item.job_id" class="rounded-xl border border-slate-800 bg-slate-900/50 p-3">
+            <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
+              <div class="font-medium text-slate-200">@{{ item.contact_username }} <span class="ml-1 text-slate-500">{{ item.duty_date }}</span></div>
+              <div class="flex gap-2 text-slate-400"><span>{{ item.status }}</span><span v-if="item.ocr_pending">OCR {{ item.ocr_pending }} 项待跑</span><span v-if="item.ocr_review">{{ item.ocr_review }} 张待看</span></div>
+            </div>
+            <div v-if="item.error" class="mt-2 text-xs text-rose-300">{{ item.error }}</div>
+            <div v-if="item.result_id" class="mt-2 space-y-2">
+              <div class="flex flex-wrap gap-2 text-xs">
+                <a v-if="item.profile_url" :href="item.profile_url" target="_blank" class="text-sky-300">Telegram 个人简介</a>
+                <a v-if="item.channel_url" :href="item.channel_url" target="_blank" class="text-sky-300">关联频道</a>
+                <a v-if="item.bot_url" :href="item.bot_url" target="_blank" class="text-violet-300">联系 Bot</a>
+              </div>
+              <p v-if="item.description" class="max-h-32 overflow-auto whitespace-pre-wrap text-xs leading-relaxed text-slate-300">{{ item.description }}</p>
+              <div v-if="item.media?.length" class="grid grid-cols-3 gap-2 sm:grid-cols-6">
+                <div v-for="(media, index) in item.media" :key="media.path || index" class="overflow-hidden rounded-lg border border-slate-800">
+                  <img v-if="media.kind === 'photo'" :src="mediaUrl(media.path)" class="aspect-square w-full object-cover" loading="lazy" />
+                  <video v-else-if="media.poster" :src="mediaUrl(media.path)" :poster="mediaUrl(media.poster)" controls class="aspect-square w-full object-cover" />
+                  <div class="p-1 text-[10px] text-slate-400">{{ media.kind }}<span v-if="media.ocr_classification"> · {{ media.ocr_classification }}</span></div>
+                  <p v-if="media.ocr_text" class="max-h-12 overflow-auto px-1 pb-1 text-[10px] text-slate-500">{{ media.ocr_text }}</p>
+                </div>
+              </div>
+              <details class="text-xs text-slate-500"><summary class="cursor-pointer">采集证据</summary><pre class="mt-2 max-h-40 overflow-auto whitespace-pre-wrap">{{ JSON.stringify(item.evidence, null, 2) }}</pre></details>
+            </div>
+          </article>
+          <div v-if="!profileResults.length" class="rounded-xl border border-slate-800 bg-slate-900/50 p-4 text-xs text-slate-500">
+            暂无试采任务。新任务由已绑定来源的在岗采集流程自动产生；结果先独立保存，不会覆盖旧卡片。
+          </div>
         </div>
       </section>
     </div>

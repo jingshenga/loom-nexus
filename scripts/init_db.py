@@ -29,6 +29,8 @@ EXPECTED_TABLES = (
     "listings",
     "listing_duplicate_decisions",
     "outbox_jobs",
+    "profile_collection_jobs",
+    "profile_collection_results",
     "raw_messages",
     "source_rule_bindings",
     "user_favorites",
@@ -37,6 +39,7 @@ EXPECTED_INDEXES = (
     "idx_chat_single_active_session",
     "idx_listings_search",
     "idx_listing_media_ocr_profile_media",
+    "idx_listing_media_ocr_profile_result_media",
     "idx_outbox_queue",
 )
 EXPECTED_SEED_RULE = "default-rule"

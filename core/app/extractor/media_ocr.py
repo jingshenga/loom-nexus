@@ -15,6 +15,8 @@ SQL_CLAIM = sqlres.load("media_ocr_claim.sql")
 SQL_FINISH = sqlres.load("media_ocr_finish.sql")
 SQL_MEDIA_FLAGS = sqlres.load("media_ocr_set_flags.sql")
 SQL_RESET = sqlres.load("media_ocr_reset_processing.sql")
+SQL_PROFILE_DISCOVER = sqlres.load("profile_collection_ocr_discover.sql")
+SQL_PROFILE_FLAGS = sqlres.load("profile_collection_ocr_flags.sql")
 
 ENGINE_VERSION = "rapidocr-local-v1"
 _DECORATIVE = re.compile(
@@ -110,6 +112,21 @@ def classify_image(
     if face_present:
         return "profile_photo", 0.9
     return "other", 0.82 if chars < 18 else 0.6
+
+
+def classify_profile_image(lines: list, min_chars: int, min_lines: int) -> tuple[str, float, str]:
+    """Classify V2 profile photos by recognized text volume, without background color."""
+    text_lines = [str(line.get("text") or "").strip() for line in lines]
+    text_lines = [line for line in text_lines if line]
+    text = " ".join(text_lines)
+    compact = re.sub(r"\s+", "", text)
+    chars = len(compact)
+    count = len(text_lines)
+    if chars >= min_chars and count >= min_lines:
+        return "info_card", 0.9, text
+    if chars >= max(12, min_chars // 2) or count >= max(2, min_lines - 1):
+        return "uncertain", 0.55, text
+    return "profile_photo", 0.82, text
 
 
 def extract_card_fields(lines: list) -> tuple[dict, dict]:
@@ -252,7 +269,8 @@ class MediaOcrProcessor:
         logger.info("media-card OCR worker started")
         while not stop.is_set():
             try:
-                await self._pool.fetch(SQL_DISCOVER)
+                await self._pool.execute(SQL_DISCOVER)
+                await self._pool.execute(SQL_PROFILE_DISCOVER)
                 row = await self._claim_one()
                 if row:
                     await self._process(row)
@@ -287,7 +305,12 @@ class MediaOcrProcessor:
             lines = document.get("lines", [])
             raw_text = "\n".join(str(item.get("text") or "").strip() for item in lines if item.get("text"))
             normalized = normalize_ocr_text(raw_text)
-            if row["raw_id"] is not None:
+            if row["profile_result_id"] is not None:
+                media = await self._pool.fetchrow(
+                    "SELECT media_json, profile_config FROM profile_collection_results WHERE id=$1",
+                    row["profile_result_id"],
+                )
+            elif row["raw_id"] is not None:
                 media = await self._pool.fetchrow(
                     "SELECT media_json FROM raw_messages WHERE id=$1", row["raw_id"],
                 )
@@ -304,6 +327,22 @@ class MediaOcrProcessor:
                 if item.get("path") == row["media_path"]
                 or item.get("poster") == row["media_path"]
             ), {})
+            if row["profile_result_id"] is not None:
+                config = media["profile_config"] or {}
+                if isinstance(config, str):
+                    import json
+                    config = json.loads(config)
+                classification, confidence, profile_text = classify_profile_image(
+                    lines,
+                    max(1, int(config.get("intro_min_chars", 30))),
+                    max(1, int(config.get("intro_min_lines", 3))),
+                )
+                review_status = "pending" if classification in ("info_card", "uncertain") else "not_required"
+                await self._finish(
+                    row, "done", classification, review_status, "admin",
+                    profile_text, normalize_ocr_text(profile_text), {}, {}, confidence, None,
+                )
+                return
             face_score = entry.get("score")
             uniformity, dimensions = image_signals(str(media_path))
             classification, confidence = classify_image(lines, face_score, uniformity, dimensions)
@@ -336,4 +375,10 @@ class MediaOcrProcessor:
             raw_text, normalized, json.dumps(fields, ensure_ascii=False),
             json.dumps(evidence, ensure_ascii=False), confidence, ENGINE_VERSION, error,
         )
-        await self._pool.fetch(SQL_MEDIA_FLAGS, row["raw_id"], row["media_path"], visibility, status, classification)
+        if row["profile_result_id"] is not None:
+            await self._pool.fetch(
+                SQL_PROFILE_FLAGS, row["profile_result_id"], row["media_path"],
+                status, classification, review_status, raw_text, confidence,
+            )
+        else:
+            await self._pool.fetch(SQL_MEDIA_FLAGS, row["raw_id"], row["media_path"], visibility, status, classification)
