@@ -27,6 +27,7 @@ EXPECTED_TABLES = (
     "ingest_rules",
     "ingest_sources",
     "listings",
+    "listing_duplicate_decisions",
     "outbox_jobs",
     "raw_messages",
     "source_rule_bindings",

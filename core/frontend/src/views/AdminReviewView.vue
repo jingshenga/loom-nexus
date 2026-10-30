@@ -6,6 +6,9 @@ import { api } from "../api/client";
 import MediaGallery from "../components/MediaGallery.vue";
 
 const queue = ref([]);
+const duplicatePairs = ref([]);
+const selectedDuplicate = ref(null);
+const duplicateSaving = ref(false);
 const current = ref(null);
 const form = ref({ nickname: "", district: "", price_amount: null, price_currency: "", description: "" });
 const flash = ref("");
@@ -88,6 +91,43 @@ async function loadQueue() {
   queue.value = data.items;
   if (!data.items.some((x) => x.id === (current.value && current.value.id))) {
     select(data.items[0] || null);
+  }
+}
+
+async function loadDuplicatePairs() {
+  const data = await api("/api/admin/review/duplicates");
+  duplicatePairs.value = data.items;
+  const selected = data.items.find((pair) =>
+    pair.left.id === selectedDuplicate.value?.left.id
+    && pair.right.id === selectedDuplicate.value?.right.id);
+  selectedDuplicate.value = selected || data.items[0] || null;
+}
+
+function newestCard(pair) {
+  return [pair.left, pair.right].sort((a, b) =>
+    new Date(b.collected_at) - new Date(a.collected_at) || b.id - a.id)[0];
+}
+
+async function decideDuplicate(decision) {
+  const pair = selectedDuplicate.value;
+  if (!pair || duplicateSaving.value) return;
+  const ids = [pair.left.id, pair.right.id].sort((a, b) => a - b);
+  duplicateSaving.value = true;
+  try {
+    await api(`/api/admin/review/duplicates/${ids[0]}/${ids[1]}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision }),
+    });
+    notify(decision === "keep_latest"
+      ? `已保留最新采集卡片 #${newestCard(pair).id}，较早卡片已归档`
+      : "已记录为不同账号，保留两张卡片");
+    await loadDuplicatePairs();
+    await loadQueue();
+  } catch (e) {
+    notify(`处理失败：${e.message}`);
+  } finally {
+    duplicateSaving.value = false;
   }
 }
 
@@ -289,6 +329,7 @@ onUnmounted(() => {
 
     <div class="flex gap-2">
       <button @click="activeWorkbench = 'review'" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'review' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">审核队列</button>
+      <button @click="activeWorkbench = 'duplicates'; loadDuplicatePairs()" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'duplicates' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">疑似重复</button>
       <button @click="activeWorkbench = 'duty'" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'duty' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">在岗补采（{{ dutyRecovery.length }}）</button>
     </div>
 
@@ -321,7 +362,9 @@ onUnmounted(() => {
           <label class="text-xs text-slate-400">Bot 联系地址（单独保存）<input v-model="recoveryForm.bot_url" class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm" /></label>
         </div>
         <button @click="saveRecoveryLinks" class="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-800">保存账号与链接</button>
-        <div class="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+        <details class="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+          <summary class="cursor-pointer text-sm text-slate-300">频道消息扫描 · {{ selectedRecovery.scanned_count }}/{{ selectedRecovery.scan_target }}</summary>
+          <div class="mt-3">
           <div class="flex flex-wrap items-center gap-2">
             <span class="mr-auto text-sm">频道消息扫描：{{ selectedRecovery.scanned_count }}/{{ selectedRecovery.scan_target }} · {{ selectedRecovery.recovery_scan_status }}</span>
             <button v-for="depth in [20, 50, 100]" :key="depth" @click="scanRecovery(depth)" :disabled="selectedRecovery.scanned_count >= depth || selectedRecovery.recovery_scan_status === 'processing' || !recoveryForm.channel_url" class="rounded border border-sky-800 px-2 py-1 text-xs text-sky-300 disabled:opacity-40">扫到 {{ depth }} 条</button>
@@ -335,9 +378,11 @@ onUnmounted(() => {
             </div>
           </div>
           <p v-else class="mt-2 text-xs text-slate-500">扫描结果只保存匹配账号的消息链接和文字；如需图片，请打开候选消息并由管理员上传确认后的图片。</p>
-        </div>
-        <div class="border-t border-slate-800 pt-3">
-          <h4 class="mb-2 font-medium">管理员手工补录（创建后进入待审核）</h4>
+          </div>
+        </details>
+        <details class="border-t border-slate-800 pt-3">
+          <summary class="cursor-pointer text-sm text-slate-300">管理员手工补录（创建后进入待审核）</summary>
+          <div class="mt-3">
           <div class="grid gap-2 sm:grid-cols-2">
             <input v-model="manualForm.nickname" placeholder="昵称" class="rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm" />
             <input v-model="manualForm.district" placeholder="位置" class="rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm" />
@@ -348,13 +393,14 @@ onUnmounted(() => {
             <input type="file" accept="image/jpeg,image/png,image/webp" @change="chooseRecoveryImage" class="text-sm text-slate-400 sm:col-span-2" />
           </div>
           <button @click="createManualDutyCard" class="mt-3 rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium hover:bg-sky-500">创建待审核卡片</button>
-        </div>
+          </div>
+        </details>
         </template>
       </div>
       <div v-else class="flex items-center justify-center rounded-xl border border-slate-800 text-sm text-slate-500 lg:col-span-8">选择一个未找到账号</div>
     </section>
 
-    <template v-else>
+    <template v-else-if="activeWorkbench === 'review'">
 
     <div class="flex flex-wrap items-center gap-2">
       <h2 class="text-lg font-semibold">审核工作台</h2>
@@ -394,7 +440,7 @@ onUnmounted(() => {
 
     <div class="grid grid-cols-1 gap-4 lg:h-[calc(100dvh-190px)] lg:grid-cols-12">
       <!-- left: queue -->
-      <aside class="lg:col-span-3 lg:overflow-y-auto lg:pr-1 space-y-2 max-h-48 overflow-y-auto lg:max-h-none">
+      <aside class="lg:col-span-4 lg:overflow-y-auto lg:pr-1 space-y-2 max-h-48 overflow-y-auto lg:max-h-none">
         <button
           v-for="item in queue" :key="item.id" @click="select(item)"
           class="w-full rounded-lg border p-3 text-left text-sm"
@@ -412,12 +458,9 @@ onUnmounted(() => {
           </div>
           <div class="mt-1 flex items-center gap-2 text-xs text-slate-500">
             <span v-if="item.district" class="rounded bg-slate-800 px-1.5 py-0.5">{{ item.district }}</span>
-            <span
-              class="rounded px-1.5 py-0.5"
-              :class="item.confidence < 1 ? 'bg-amber-600/20 text-amber-400' : 'bg-slate-800'">
-              {{ Math.round((item.confidence ?? 1) * 100) }}%
-            </span>
+            <span v-if="item.contact_username">@{{ item.contact_username }}</span>
           </div>
+          <div class="mt-1 text-[11px] text-slate-500">采集于 {{ new Date(item.created_at).toLocaleString('zh-CN') }}</div>
           <!-- 手机快捷审批：卡片上直接上架/驳回 -->
           <div v-if="statusTab === 'pending'" class="mt-2 flex gap-2 lg:hidden">
             <button @click.stop="decide('publish', item)"
@@ -435,75 +478,53 @@ onUnmounted(() => {
         </div>
       </aside>
 
-      <!-- middle: source message -->
-      <section v-if="current" class="lg:col-span-5 space-y-3 lg:overflow-y-auto rounded-xl border border-slate-800 bg-slate-900/50 p-4">
-        <div class="text-xs text-slate-500">
-          来源：{{ current.source_title || "未知" }}
-          <span v-if="current.source_posted_at"> · {{ new Date(current.source_posted_at).toLocaleString("zh-CN") }}</span>
+      <section v-if="current" class="flex flex-col gap-3 overflow-y-auto rounded-xl border border-slate-800 bg-slate-900/50 p-4 lg:col-span-8">
+        <div class="flex flex-wrap items-start justify-between gap-2">
+          <div><h3 class="font-semibold">{{ current.nickname || `卡片 #${current.id}` }}</h3><p class="mt-1 text-xs text-slate-400">{{ current.source_title || "未知来源" }}<span v-if="current.contact_username"> · @{{ current.contact_username }}</span></p></div>
+          <div class="text-right text-xs"><div class="text-sky-300">采集于 {{ new Date(current.created_at).toLocaleString('zh-CN') }}</div><div v-if="current.source_posted_at" class="mt-1 text-slate-500">原消息 {{ new Date(current.source_posted_at).toLocaleString('zh-CN') }}</div></div>
         </div>
-        <p class="whitespace-pre-wrap rounded-lg bg-slate-950 p-3 text-sm leading-relaxed text-slate-200">
-          {{ current.source_text || "（无正文）" }}
-        </p>
+        <div class="flex flex-wrap gap-2 text-sm text-slate-300"><span v-if="current.district" class="rounded bg-slate-800 px-2 py-1">{{ current.district }}</span><span class="rounded bg-slate-800 px-2 py-1">{{ current.price_amount ?? "价格待核" }} {{ current.price_currency || "" }}</span><span v-if="current.contact_peer_id" class="rounded bg-slate-800 px-2 py-1">TG ID {{ current.contact_peer_id }}</span></div>
         <MediaGallery :media="current.media" :admin-listing-id="current.id" @rotated="onMediaRotated" />
-      </section>
-      <section v-else class="lg:col-span-5 flex items-center justify-center rounded-xl border border-slate-800 text-slate-600">
-        选择左侧任务
-      </section>
-
-      <!-- right: fields + actions -->
-      <section v-if="current" class="lg:col-span-4 space-y-3 lg:overflow-y-auto rounded-xl border border-slate-800 bg-slate-900/50 p-4">
-        <div class="flex flex-wrap gap-1.5">
-          <span v-for="(ev, field) in current.evidence" :key="field"
-            class="rounded px-2 py-0.5 text-xs"
-            :class="ev.src === 'ocr' ? 'bg-amber-600/20 text-amber-300' : 'bg-slate-800 text-slate-400'">
-            {{ field }} · {{ ev.src }}
-          </span>
-        </div>
-        <div class="space-y-2 text-sm">
-          <label class="block">昵称
-            <input v-model="form.nickname" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
-          </label>
-          <label class="block">城区
-            <input v-model="form.district" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
-          </label>
-          <div class="flex gap-2">
-            <label class="flex-1">价格
-              <input v-model.number="form.price_amount" type="number" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
-            </label>
-            <label class="w-24">币种
-              <input v-model="form.price_currency" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
-            </label>
-          </div>
-          <label class="block">描述
-            <textarea v-model="form.description" rows="4" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
-          </label>
-        </div>
-        <div class="flex gap-2 pt-1">
-          <button @click="saveEdits"
-            class="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-slate-600 py-2 text-sm hover:bg-slate-800">
-            <Save class="size-4" />保存修订
-          </button>
-          <template v-if="statusTab === 'pending'">
-            <button @click="decide('reject')"
-              class="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-rose-700/60 py-2 text-sm text-rose-300 hover:bg-rose-900/30">
-              <XCircle class="size-4" />驳回
-            </button>
-            <button @click="decide('publish')"
-              class="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-emerald-600 py-2 text-sm font-medium hover:bg-emerald-500">
-              <CheckCircle2 class="size-4" />发布
-            </button>
-          </template>
-          <button v-else-if="statusTab === 'published'" @click="decide('withdraw')"
-            class="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-amber-600/60 py-2 text-sm text-amber-300 hover:bg-amber-900/30">
-            <ArchiveRestore class="size-4" />撤回下架
-          </button>
-          <button @click="deleteCurrent"
-            class="flex items-center justify-center gap-1.5 rounded-lg border border-rose-700/60 px-3 py-2 text-sm text-rose-300 hover:bg-rose-900/30">
-            <Trash2 class="size-4" />删除
-          </button>
+        <details class="rounded-lg border border-slate-800 bg-slate-950/60 p-3"><summary class="cursor-pointer text-sm text-slate-300">查看原始消息</summary><p class="mt-3 whitespace-pre-wrap text-sm leading-relaxed text-slate-400">{{ current.source_text || "（无正文）" }}</p></details>
+        <details class="rounded-lg border border-slate-800 bg-slate-950/60 p-3"><summary class="cursor-pointer text-sm text-slate-300">修订卡片字段</summary>
+          <div class="mt-3 flex flex-wrap gap-1.5"><span v-for="(ev, field) in current.evidence" :key="field" class="rounded px-2 py-0.5 text-xs" :class="ev.src === 'ocr' ? 'bg-amber-600/20 text-amber-300' : 'bg-slate-800 text-slate-400'">{{ field }} · {{ ev.src }}</span></div>
+          <div class="mt-3 grid gap-2 text-sm sm:grid-cols-2"><label>昵称<input v-model="form.nickname" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" /></label><label>城区<input v-model="form.district" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" /></label><label>价格<input v-model.number="form.price_amount" type="number" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" /></label><label>币种<input v-model="form.price_currency" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" /></label><label class="sm:col-span-2">描述<textarea v-model="form.description" rows="4" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" /></label></div>
+        </details>
+        <div class="sticky bottom-0 flex gap-2 border-t border-slate-800 bg-slate-950/95 py-3 backdrop-blur">
+          <button @click="saveEdits" class="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-slate-600 py-2 text-sm hover:bg-slate-800"><Save class="size-4" />保存修订</button>
+          <template v-if="statusTab === 'pending'"><button @click="decide('reject')" class="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-rose-700/60 py-2 text-sm text-rose-300 hover:bg-rose-900/30"><XCircle class="size-4" />驳回</button><button @click="decide('publish')" class="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-emerald-600 py-2 text-sm font-medium hover:bg-emerald-500"><CheckCircle2 class="size-4" />发布</button></template>
+          <button v-else-if="statusTab === 'published'" @click="decide('withdraw')" class="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-amber-600/60 py-2 text-sm text-amber-300 hover:bg-amber-900/30"><ArchiveRestore class="size-4" />撤回下架</button><button @click="deleteCurrent" class="flex items-center justify-center gap-1.5 rounded-lg border border-rose-700/60 px-3 py-2 text-sm text-rose-300 hover:bg-rose-900/30"><Trash2 class="size-4" />删除</button>
         </div>
       </section>
+      <section v-else class="flex items-center justify-center rounded-xl border border-slate-800 text-slate-600 lg:col-span-8">选择左侧任务</section>
     </div>
     </template>
+    <section v-else class="grid grid-cols-1 gap-4 lg:h-[calc(100dvh-190px)] lg:grid-cols-12">
+      <aside class="max-h-48 space-y-2 overflow-y-auto lg:col-span-4 lg:max-h-none lg:pr-1">
+        <button v-for="pair in duplicatePairs" :key="`${pair.left.id}-${pair.right.id}`" @click="selectedDuplicate = pair"
+          class="w-full rounded-lg border p-3 text-left" :class="selectedDuplicate?.left.id === pair.left.id && selectedDuplicate?.right.id === pair.right.id ? 'border-sky-500 bg-sky-600/10' : 'border-slate-800 bg-slate-900 hover:border-slate-600'">
+          <div class="flex items-center justify-between gap-2"><span class="font-medium">{{ pair.left.nickname || pair.right.nickname || '疑似重复资料' }}</span><span class="rounded bg-amber-500/15 px-2 py-0.5 text-[11px] text-amber-300">待人工核对</span></div>
+          <div class="mt-1 truncate text-xs text-slate-400">@{{ pair.left.contact_username || '未记录' }} / @{{ pair.right.contact_username || '未记录' }}</div>
+          <div class="mt-1 text-xs text-sky-300">最新采集 {{ new Date(newestCard(pair).collected_at).toLocaleString('zh-CN') }}</div>
+        </button>
+        <div v-if="!duplicatePairs.length" class="py-16 text-center text-sm text-slate-500">暂无待人工核对的疑似重复卡片</div>
+      </aside>
+      <section v-if="selectedDuplicate" class="space-y-4 overflow-y-auto rounded-xl border border-slate-800 bg-slate-900/50 p-4 lg:col-span-8">
+        <div class="rounded-lg border border-amber-700/40 bg-amber-950/20 p-3 text-sm text-amber-200">非 TG 资料文本及关键字段相同。请核对两组图片和账号；系统只提供线索，不会自动合并。</div>
+        <div class="grid gap-4 md:grid-cols-2">
+          <article v-for="card in [selectedDuplicate.left, selectedDuplicate.right]" :key="card.id" class="min-w-0 space-y-3 rounded-lg border border-slate-800 bg-slate-950/50 p-3">
+            <div class="flex flex-wrap items-start justify-between gap-2"><div><h3 class="font-semibold">{{ card.nickname }} · #{{ card.id }}</h3><p class="mt-1 text-xs text-slate-400">{{ card.source_title || '来源未知' }} · {{ card.status === 'published' ? '已发布' : '待审核' }}</p></div><span v-if="card.id === newestCard(selectedDuplicate).id" class="rounded bg-sky-500/15 px-2 py-1 text-xs text-sky-300">最新采集 · 优先建议</span></div>
+            <div class="space-y-1 text-xs"><p class="text-sky-300">采集于 {{ new Date(card.collected_at).toLocaleString('zh-CN') }}</p><p class="text-slate-500">原消息 {{ card.posted_at ? new Date(card.posted_at).toLocaleString('zh-CN') : '时间未知' }}</p><p class="text-slate-300">TG：@{{ card.contact_username || '未记录' }}<span v-if="card.contact_peer_id"> · ID {{ card.contact_peer_id }}</span></p><p class="text-slate-400">{{ card.district || '位置未知' }} · {{ card.price_amount ?? '价格未知' }} {{ card.price_currency || '' }}</p></div>
+            <MediaGallery :media="card.media" :fixed-mobile-frame="true" />
+            <details class="rounded border border-slate-800 p-2"><summary class="cursor-pointer text-xs text-slate-400">查看原始消息</summary><p class="mt-2 whitespace-pre-wrap text-xs leading-relaxed text-slate-500">{{ card.source_text || card.description || '（无正文）' }}</p></details>
+          </article>
+        </div>
+        <div class="sticky bottom-0 flex flex-col gap-2 border-t border-slate-800 bg-slate-950/95 py-3 backdrop-blur sm:flex-row">
+          <button @click="decideDuplicate('keep_latest')" :disabled="duplicateSaving" class="flex-1 rounded-lg bg-sky-600 px-3 py-2.5 text-sm font-medium hover:bg-sky-500 disabled:opacity-50">确认重复，保留最新并归档较早卡片</button>
+          <button @click="decideDuplicate('keep_both')" :disabled="duplicateSaving" class="flex-1 rounded-lg border border-slate-600 px-3 py-2.5 text-sm text-slate-200 hover:bg-slate-800 disabled:opacity-50">不同账号，保留两张</button>
+        </div>
+      </section>
+      <section v-else class="flex items-center justify-center rounded-xl border border-slate-800 text-slate-600 lg:col-span-8">选择一组疑似重复卡片</section>
+    </section>
   </div>
 </template>

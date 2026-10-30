@@ -5,6 +5,7 @@ import json
 import re
 import uuid
 from pathlib import Path
+from typing import Literal
 from PIL import Image
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -20,6 +21,7 @@ router = APIRouter(
 )
 
 SQL_QUEUE = sqlres.load("review_queue.sql")
+SQL_DUPLICATE_CANDIDATES = sqlres.load("duplicate_candidates.sql")
 SQL_PUBLISH = sqlres.load("publish.sql")
 SQL_REJECT = sqlres.load("reject.sql")
 SQL_UPDATE = sqlres.load("update_fields.sql")
@@ -69,6 +71,7 @@ async def queue(
             "evidence": _decode(r["evidence_json"], {}),
             "confidence": float(r["confidence"]) if r["confidence"] is not None else None,
             "status": r["status"],
+            "contact_peer_id": r["contact_peer_id"],
             "contact_username": r["contact_username"],
             "created_at": r["created_at"].isoformat(),
             "source_text": r["raw_text"],
@@ -76,6 +79,119 @@ async def queue(
             "source_posted_at": r["raw_posted_at"].isoformat() if r["raw_posted_at"] else None,
         })
     return {"items": items}
+
+
+@router.get("/duplicates")
+async def duplicate_candidates() -> dict:
+    """List active cards with matching non-Telegram profile content."""
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    rows = await pool.fetch(SQL_DUPLICATE_CANDIDATES)
+
+    def card(row, prefix: str) -> dict:
+        return {
+            "id": row[f"{prefix}_id"],
+            "status": row[f"{prefix}_status"],
+            "contact_peer_id": row[f"{prefix}_peer_id"],
+            "contact_username": row[f"{prefix}_username"],
+            "nickname": row[f"{prefix}_nickname"],
+            "district": row[f"{prefix}_district"],
+            "price_amount": float(row[f"{prefix}_price"])
+                if row[f"{prefix}_price"] is not None else None,
+            "price_currency": row[f"{prefix}_currency"],
+            "description": row[f"{prefix}_description"],
+            "media": _decode(row[f"{prefix}_media"], []),
+            "source_text": row[f"{prefix}_source_text"],
+            "source_title": row[f"{prefix}_source_title"],
+            "collected_at": row[f"{prefix}_collected_at"].isoformat(),
+            "posted_at": row[f"{prefix}_posted_at"].isoformat()
+                if row[f"{prefix}_posted_at"] else None,
+        }
+
+    return {"items": [{"left": card(row, "left"), "right": card(row, "right")}
+                       for row in rows]}
+
+
+class DuplicateDecision(BaseModel):
+    decision: Literal["keep_latest", "keep_both"]
+
+
+@router.post("/duplicates/{first_id}/{second_id}")
+async def decide_duplicate(
+    first_id: int, second_id: int, body: DuplicateDecision,
+    authorization: str = Header(default=""),
+) -> dict:
+    """Record an admin decision; retaining the latest archives the older card."""
+    if first_id == second_id:
+        raise HTTPException(status_code=400, detail="two different cards are required")
+    left_id, right_id = sorted((first_id, second_id))
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            rows = await conn.fetch(
+                "SELECT l.id, l.status, l.created_at, l.nickname, l.district, "
+                "l.price_amount, l.price_currency, l.contact_peer_id, "
+                "l.contact_username, COALESCE(NULLIF(rm.raw_text, ''), l.description, '') AS source_text "
+                "FROM listings l LEFT JOIN raw_messages rm ON rm.id=l.source_msg_id "
+                "WHERE l.id = ANY($1::bigint[]) ORDER BY l.id FOR UPDATE OF l",
+                [left_id, right_id],
+            )
+            if len(rows) != 2:
+                raise HTTPException(status_code=404, detail="card not found")
+            if any(row["status"] not in {"published", "pending"} for row in rows):
+                raise HTTPException(status_code=409, detail="cards are no longer active")
+
+            def signature(value: str) -> str:
+                value = re.sub(r"https?://\S+|@[A-Za-z0-9_]+", " ", value, flags=re.I)
+                return re.sub(r"\s+", "", value.casefold())
+
+            first, second = rows
+            same_identity = (
+                first["contact_peer_id"] is not None
+                and first["contact_peer_id"] == second["contact_peer_id"]
+            ) or (
+                (first["contact_peer_id"] is None or second["contact_peer_id"] is None)
+                and (first["contact_username"] or "").casefold()
+                    == (second["contact_username"] or "").casefold()
+            )
+            same_profile = (
+                first["nickname"] is not None
+                and second["nickname"] is not None
+                and first["nickname"].strip().casefold() == second["nickname"].strip().casefold()
+                and first["district"] == second["district"]
+                and first["price_amount"] == second["price_amount"]
+                and first["price_currency"] == second["price_currency"]
+                and signature(first["source_text"]) == signature(second["source_text"])
+                and signature(first["source_text"]) != ""
+                and not same_identity
+            )
+            if not same_profile:
+                raise HTTPException(status_code=409, detail="cards are not a current duplicate candidate")
+
+            latest = max(rows, key=lambda row: (row["created_at"], row["id"]))
+            archived_id = None
+            if body.decision == "keep_latest":
+                archived_id = next(row["id"] for row in rows if row["id"] != latest["id"])
+                await conn.execute(
+                    "UPDATE listings SET status='archived', updated_at=NOW() "
+                    "WHERE id=$1 AND status IN ('published', 'pending')",
+                    archived_id,
+                )
+            await conn.execute(
+                "INSERT INTO listing_duplicate_decisions "
+                "(left_listing_id, right_listing_id, decision, decided_by) "
+                "VALUES ($1, $2, $3, $4) "
+                "ON CONFLICT (left_listing_id, right_listing_id) DO UPDATE SET "
+                "decision=EXCLUDED.decision, decided_by=EXCLUDED.decided_by, "
+                "decided_at=NOW()",
+                left_id, right_id, body.decision, current_user_id(authorization),
+            )
+    return {"ok": True, "decision": body.decision,
+            "preferred_id": latest["id"], "archived_id": archived_id}
 
 
 class FieldEdits(BaseModel):

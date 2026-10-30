@@ -171,6 +171,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_listings_duty_collection_job
 CREATE INDEX IF NOT EXISTS idx_listings_search
     ON listings(status, district, published_at DESC);
 
+CREATE TABLE IF NOT EXISTS listing_duplicate_decisions (
+    left_listing_id BIGINT NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+    right_listing_id BIGINT NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+    decision VARCHAR(16) NOT NULL CHECK (decision IN ('keep_latest', 'keep_both')),
+    decided_by BIGINT,
+    decided_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (left_listing_id, right_listing_id),
+    CHECK (left_listing_id < right_listing_id)
+);
+
 -- Admin-triggered Telegram refreshes for selected listing source messages.
 CREATE TABLE IF NOT EXISTS listing_recollect_jobs (
     id BIGSERIAL PRIMARY KEY,
