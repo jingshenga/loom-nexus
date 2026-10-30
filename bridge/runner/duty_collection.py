@@ -128,6 +128,30 @@ def _flood_wait_seconds(exc: Exception) -> int:
 
 TG_PROFILE_LINK_RE = re.compile(r"https?://t\.me/([A-Za-z0-9_]+)(?:/(\d+))?", re.I)
 TG_MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])@([A-Za-z][A-Za-z0-9_]{3,31})\b", re.I)
+PROMO_MARKER_RE = re.compile(
+    r"博彩|彩票|贷款|返利|刷单|高回报|招商|加盟|优惠券|代购|推广|扫码|兼职日结"
+)
+PROMO_URL_RE = re.compile(r"(?:https?://|www\.|t\.me/)", re.I)
+MAX_PINNED_MESSAGES = 3
+MAX_PROFILE_PHOTOS = 4
+MAX_PROFILE_VIDEOS = 2
+
+
+def _is_obvious_promo(text: str) -> bool:
+    """Reject only clear ad/scam text; ordinary contact links remain eligible."""
+    normalized = (text or "").strip()
+    markers = PROMO_MARKER_RE.findall(normalized)
+    urls = PROMO_URL_RE.findall(normalized)
+    return bool(re.search(r"博彩|彩票|贷款|返利|刷单|高回报", normalized)) or (
+        len(markers) >= 2 and len(urls) >= 2
+    )
+
+
+def _has_profile_content(message) -> bool:
+    text = (message.raw_text or "").strip()
+    if text and _is_obvious_promo(text):
+        return False
+    return bool(text or message.photo or message.video or message.video_note)
 
 
 def _profile_links(text: str) -> list[tuple[str, str | None]]:
@@ -220,7 +244,6 @@ async def _profile_channel(pool, client, job, full, user, about, saved_channel_u
 
 async def _collect_profile_listing(pool, client, job) -> tuple[str, int | None, str | None]:
     """Collect exact Telegram profile information, linked channel pin, and authored posts."""
-    from telethon.tl.functions.channels import GetFullChannelRequest
     from telethon.tl.functions.users import GetFullUserRequest
 
     user = await _rate_limited_entity(pool, client, job["account_id"], job["contact_username"])
@@ -238,16 +261,24 @@ async def _collect_profile_listing(pool, client, job) -> tuple[str, int | None, 
 
     messages = []
     pinned_id = None
+    pinned_ids = set()
+    selected_id = getattr(full_user, "personal_channel_message", None)
     if channel is not None:
         try:
-            channel_full = await client(GetFullChannelRequest(channel))
-            pinned_id = getattr(channel_full.full_chat, "pinned_msg_id", None)
+            from telethon.tl.types import InputMessagesFilterPinned
+
+            async for msg in client.iter_messages(
+                channel, filter=InputMessagesFilterPinned, limit=MAX_PINNED_MESSAGES,
+            ):
+                messages.append(msg)
+                pinned_ids.add(int(msg.id))
+            if messages:
+                pinned_id = messages[0].id
         except Exception as exc:
             if _is_flood_wait(exc):
                 raise
             logger.info("linked channel pin lookup failed (user=%s): %s", user.id, exc)
-        selected_id = getattr(full_user, "personal_channel_message", None)
-        for msg_id in dict.fromkeys(x for x in (pinned_id, selected_id) if x):
+        for msg_id in dict.fromkeys(x for x in (selected_id,) if x):
             try:
                 msg = await client.get_messages(channel, ids=msg_id)
             except Exception as exc:
@@ -259,14 +290,10 @@ async def _collect_profile_listing(pool, client, job) -> tuple[str, int | None, 
 
     # Only if the profile-linked pin/spotlight has no usable content, search
     # the last ten channel messages authored by this exact Telegram user ID.
-    if channel is not None and not any(
-        (m.raw_text or "").strip() or m.photo or m.video or m.video_note for m in messages
-    ):
+    if channel is not None and not any(_has_profile_content(m) for m in messages):
         try:
             async for msg in client.iter_messages(channel, from_user=user, limit=10):
-                if int(msg.sender_id or 0) == int(user.id) and (
-                    (msg.raw_text or "").strip() or msg.photo or msg.video or msg.video_note
-                ):
+                if int(msg.sender_id or 0) == int(user.id) and _has_profile_content(msg):
                     messages.append(msg)
         except Exception as exc:
             if _is_flood_wait(exc):
@@ -276,22 +303,40 @@ async def _collect_profile_listing(pool, client, job) -> tuple[str, int | None, 
     texts = []
     media = []
     sources = []
+    filtered_count = 0
     seen_ids = set()
     for msg in messages:
         if msg.id in seen_ids:
             continue
+        if not _has_profile_content(msg):
+            filtered_count += 1
+            continue
         parts = await _fetch_album(client, channel, msg) if channel is not None else [msg]
         anchor = next((part for part in parts if (part.raw_text or "").strip()), msg)
         if (anchor.raw_text or "").strip():
-            label = "频道置顶消息" if msg.id == pinned_id else "关联频道消息"
+            label = "频道置顶消息" if msg.id in pinned_ids else "关联频道消息"
             texts.append(f"{label}：\n{anchor.raw_text.strip()}")
         channel_username = getattr(channel, "username", None) if channel is not None else None
         if channel_username:
-            sources.append(f"https://t.me/{channel_username}/{msg.id}")
+            sources.append({
+                "url": f"https://t.me/{channel_username}/{msg.id}",
+                "message_id": int(msg.id),
+                "posted_at": msg.date.isoformat() if msg.date else None,
+                "matched_by": "exact_sender_user_id" if int(msg.sender_id or 0) == int(user.id)
+                else "pinned_or_profile_linked_channel",
+            })
         for part in parts:
             if part.id in seen_ids:
                 continue
             seen_ids.add(part.id)
+            is_photo = bool(part.photo)
+            is_video = bool(part.video or part.video_note)
+            if not (is_photo or is_video):
+                continue
+            media_kind = "photo" if is_photo else "video"
+            media_limit = MAX_PROFILE_PHOTOS if is_photo else MAX_PROFILE_VIDEOS
+            if sum(item.get("kind") == media_kind for item in media) >= media_limit:
+                continue
             media.extend(await backfill.save_media(
                 part, job["source_id"], stable_prefix=f"profile_{job['job_id']}_{part.id}",
             ))
@@ -330,7 +375,10 @@ async def _collect_profile_listing(pool, client, job) -> tuple[str, int | None, 
     description = "\n\n".join(description_parts).strip()
     media = backfill.order_media(media)
     if not description and not media:
-        return "not_found", None, "profile checked; no usable bio, pin, or exact-user message was found"
+        reason = "profile checked; no usable bio, pin, or exact-user message was found"
+        if filtered_count:
+            reason += f"; filtered {filtered_count} obvious promotional message(s)"
+        return "not_found", None, reason
 
     profile_url = f"https://t.me/{user.username or job['contact_username']}"
     evidence = {
@@ -340,6 +388,16 @@ async def _collect_profile_listing(pool, client, job) -> tuple[str, int | None, 
         "bot_url": {"value": bot_url or "", "src": "telegram_profile"},
         "profile_about": {"value": about, "src": "telegram_profile"},
         "source_messages": {"value": sources, "src": "telegram_channel"},
+        "profile_scan": {
+            "value": {
+                "pinned_limit": MAX_PINNED_MESSAGES,
+                "authored_fallback_limit": 10,
+                "filtered_obvious_promo_count": filtered_count,
+                "photo_limit": MAX_PROFILE_PHOTOS,
+                "video_limit": MAX_PROFILE_VIDEOS,
+            },
+            "src": "collection_policy",
+        },
         "avatar_used": {"value": False, "src": "collection_policy"},
     }
     display_name = " ".join(x for x in (getattr(user, "first_name", None), getattr(user, "last_name", None)) if x)

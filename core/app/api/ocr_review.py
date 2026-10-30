@@ -42,13 +42,16 @@ async def queue(status: str = "pending", limit: int = 40, offset: int = 0) -> di
         "SELECT o.id, o.raw_id, o.listing_id, o.media_path, o.status, "
         "o.classification, o.review_status, o.raw_text, o.normalized_text, "
         "o.fields_json, o.evidence_json, o.confidence, o.engine_version, "
-        "o.error_text, rm.raw_text AS message_text, rm.posted_at, "
-        "s.title AS source_title, l.nickname "
+        "o.error_text, COALESCE(rm.raw_text, l.description) AS message_text, "
+        "COALESCE(rm.posted_at, l.created_at) AS posted_at, "
+        "COALESCE(s.title, CASE WHEN l.duty_collection_job_id IS NOT NULL "
+        "THEN '在岗资料自动采集' END) AS source_title, l.nickname "
         "FROM listing_media_ocr o "
-        "JOIN raw_messages rm ON rm.id=o.raw_id "
+        "LEFT JOIN raw_messages rm ON rm.id=o.raw_id "
         "LEFT JOIN ingest_sources s ON s.id=rm.source_id "
-        "LEFT JOIN LATERAL (SELECT id, nickname FROM listings "
-        " WHERE source_msg_id=o.raw_id ORDER BY id DESC LIMIT 1) l ON TRUE "
+        "LEFT JOIN LATERAL (SELECT id, nickname, description, created_at, duty_collection_job_id "
+        " FROM listings WHERE id=o.listing_id OR source_msg_id=o.raw_id "
+        " ORDER BY CASE WHEN id=o.listing_id THEN 0 ELSE 1 END, id DESC LIMIT 1) l ON TRUE "
         "WHERE CASE WHEN $1='pending' THEN o.review_status='pending' "
         " WHEN $1='confirmed' THEN o.review_status='confirmed' "
         " WHEN $1='not_card' THEN o.review_status='not_card' "
@@ -116,7 +119,8 @@ async def decide(
     if pool is None:
         raise HTTPException(status_code=503, detail="database unavailable")
     row = await pool.fetchrow(
-        "SELECT raw_id, media_path FROM listing_media_ocr WHERE id=$1",
+        "SELECT raw_id, listing_id, media_path, normalized_text "
+        "FROM listing_media_ocr WHERE id=$1",
         asset_id,
     )
     if row is None:
@@ -128,14 +132,24 @@ async def decide(
             "error_text=NULL, updated_at=NOW() WHERE id=$1",
             asset_id,
         )
-        await pool.fetch(
-            "SELECT media_ocr_set_flags($1,$2,'pending','pending','uncertain')",
-            row["raw_id"], row["media_path"],
-        )
+        if row["raw_id"] is not None:
+            await pool.fetch(
+                "SELECT media_ocr_set_flags($1,$2,'pending','pending','uncertain')",
+                row["raw_id"], row["media_path"],
+            )
         return {"ok": True}
 
     if body.decision == "confirm":
         classification, review_status, visibility = "info_card", "confirmed", "admin"
+        normalized_text = (row["normalized_text"] or "").strip()
+        if row["listing_id"] is not None and normalized_text:
+            await pool.execute(
+                "UPDATE listings SET description = CASE "
+                "WHEN POSITION($2 IN COALESCE(description, '')) > 0 THEN description "
+                "ELSE concat_ws(E'\\n\\n', NULLIF(description, ''), '图片识别内容：' || $2) "
+                "END, updated_at=NOW() WHERE id=$1",
+                row["listing_id"], normalized_text,
+            )
     else:
         classification, review_status, visibility = "other", "not_card", "public"
     identity = bearer_identity(authorization)
@@ -144,8 +158,9 @@ async def decide(
         "reviewed_by=$4, reviewed_at=NOW(), updated_at=NOW() WHERE id=$1",
         asset_id, classification, review_status, identity[0] if identity else None,
     )
-    await pool.fetch(
-        "SELECT media_ocr_set_flags($1,$2,$3,'done',$4)",
-        row["raw_id"], row["media_path"], visibility, classification,
-    )
+    if row["raw_id"] is not None:
+        await pool.fetch(
+            "SELECT media_ocr_set_flags($1,$2,$3,'done',$4)",
+            row["raw_id"], row["media_path"], visibility, classification,
+        )
     return {"ok": True}

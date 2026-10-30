@@ -287,14 +287,23 @@ class MediaOcrProcessor:
             lines = document.get("lines", [])
             raw_text = "\n".join(str(item.get("text") or "").strip() for item in lines if item.get("text"))
             normalized = normalize_ocr_text(raw_text)
-            media = await self._pool.fetchrow(
-                "SELECT media_json FROM raw_messages WHERE id=$1", row["raw_id"],
-            )
+            if row["raw_id"] is not None:
+                media = await self._pool.fetchrow(
+                    "SELECT media_json FROM raw_messages WHERE id=$1", row["raw_id"],
+                )
+            else:
+                media = await self._pool.fetchrow(
+                    "SELECT media_json FROM listings WHERE id=$1", row["listing_id"],
+                )
             items = media["media_json"] if media else []
             if isinstance(items, str):
                 import json
                 items = json.loads(items)
-            entry = next((item for item in items if item.get("path") == row["media_path"]), {})
+            entry = next((
+                item for item in items
+                if item.get("path") == row["media_path"]
+                or item.get("poster") == row["media_path"]
+            ), {})
             face_score = entry.get("score")
             uniformity, dimensions = image_signals(str(media_path))
             classification, confidence = classify_image(lines, face_score, uniformity, dimensions)

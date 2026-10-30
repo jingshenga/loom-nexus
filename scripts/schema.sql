@@ -2810,7 +2810,7 @@ ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS media_b64 TEXT;
 -- Local OCR results and moderation state for image-based listing cards.
 CREATE TABLE IF NOT EXISTS listing_media_ocr (
     id BIGSERIAL PRIMARY KEY,
-    raw_id BIGINT NOT NULL REFERENCES raw_messages(id) ON DELETE CASCADE,
+    raw_id BIGINT REFERENCES raw_messages(id) ON DELETE CASCADE,
     listing_id BIGINT REFERENCES listings(id) ON DELETE SET NULL,
     media_path VARCHAR(512) NOT NULL,
     status VARCHAR(16) NOT NULL DEFAULT 'pending',
@@ -2834,6 +2834,9 @@ CREATE INDEX IF NOT EXISTS idx_listing_media_ocr_queue
     ON listing_media_ocr(review_status, status, id);
 CREATE INDEX IF NOT EXISTS idx_listing_media_ocr_listing
     ON listing_media_ocr(listing_id, review_status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_listing_media_ocr_profile_media
+    ON listing_media_ocr(listing_id, media_path)
+    WHERE raw_id IS NULL AND listing_id IS NOT NULL;
 
 CREATE OR REPLACE FUNCTION media_ocr_set_flags(
     p_raw_id BIGINT,

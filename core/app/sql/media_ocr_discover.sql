@@ -9,3 +9,15 @@ WHERE item->>'kind' = 'photo'
   AND COALESCE(item->>'ocr_status', 'pending') = 'pending'
   AND COALESCE(item->>'path', '') <> ''
 ON CONFLICT (raw_id, media_path) DO NOTHING;
+
+INSERT INTO listing_media_ocr (raw_id, listing_id, media_path)
+SELECT NULL, l.id,
+       CASE WHEN item->>'kind' = 'video' THEN item->>'poster' ELSE item->>'path' END
+FROM listings l
+CROSS JOIN LATERAL jsonb_array_elements(l.media_json) item
+WHERE l.duty_collection_job_id IS NOT NULL
+  AND (
+      (item->>'kind' = 'photo' AND COALESCE(item->>'path', '') <> '')
+      OR (item->>'kind' = 'video' AND COALESCE(item->>'poster', '') <> '')
+  )
+ON CONFLICT DO NOTHING;

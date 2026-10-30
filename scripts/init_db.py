@@ -36,6 +36,7 @@ EXPECTED_TABLES = (
 EXPECTED_INDEXES = (
     "idx_chat_single_active_session",
     "idx_listings_search",
+    "idx_listing_media_ocr_profile_media",
     "idx_outbox_queue",
 )
 EXPECTED_SEED_RULE = "default-rule"
