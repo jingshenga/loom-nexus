@@ -34,6 +34,13 @@ SQL_PROFILE_FINISH = sqlres.load("profile_collection_finish.sql")
 SQL_PROFILE_DEFER = sqlres.load("profile_collection_defer.sql")
 SQL_PROFILE_RESULT = sqlres.load("profile_collection_result.sql")
 SQL_PROFILE_OCR_ENQUEUE = sqlres.load("profile_collection_ocr_enqueue.sql")
+SQL_PROFILE_PROGRESS = sqlres.load("profile_collection_progress.sql")
+
+
+async def _profile_progress(pool, job, stage, current=None, total=None, note=""):
+    await pool.execute(
+        SQL_PROFILE_PROGRESS, job["job_id"], stage, current, total, str(note)[:240],
+    )
 
 
 def _matches_username(message, username: str) -> bool:
@@ -450,14 +457,21 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
     """Collect a V2 result into its isolated trial table; never writes a listing."""
     from telethon.tl.functions.users import GetFullUserRequest
 
+    await _profile_progress(pool, job, "resolve_profile", 0, 1, "解析 Telegram 用户名")
     user = await _rate_limited_entity(pool, client, job["account_id"], job["contact_username"])
     if not getattr(user, "id", None) or not hasattr(user, "first_name"):
         raise RuntimeError("Telegram username did not resolve to a user profile")
     full = await client(GetFullUserRequest(user))
+    await _profile_progress(pool, job, "resolve_profile", 1, 1, "已读取个人资料")
     full_user = full.full_user
     about = (getattr(full_user, "about", None) or "").strip()
+    await _profile_progress(pool, job, "resolve_channel", 0, 1, "解析个人简介中的关联频道")
     channel, channel_url, bot_url, _, full_user = await _profile_channel(
         pool, client, job, full, user, about, "", "",
+    )
+    await _profile_progress(
+        pool, job, "resolve_channel", 1, 1,
+        f"关联频道：{channel_url or '未找到，使用个人公开资料'}",
     )
     cfg = job["config_json"]
     if isinstance(cfg, str):
@@ -480,6 +494,7 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
     if channel is not None:
         channel_name = (getattr(channel, "username", None) or "").lower()
         channel_label = channel_url or _entity_url(channel) or "关联频道"
+        await _profile_progress(pool, job, "check_source", 0, 1, f"检查频道更新：{channel_label}")
         latest = None
         try:
             async for latest in client.iter_messages(channel, limit=1):
@@ -499,6 +514,7 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
                     f"频道最近消息早于 {stale_days} 天，按规则跳过：{channel_label} "
                     f"（最近更新 {latest_at.date().isoformat()}）"
                 )
+        await _profile_progress(pool, job, "check_source", 1, 1, "频道可采，继续读取资料")
         for link_name, message_id in _profile_links(about):
             if message_id and link_name.lower() == channel_name:
                 try:
@@ -511,10 +527,12 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
                         raise
         try:
             from telethon.tl.types import InputMessagesFilterPinned
+            await _profile_progress(pool, job, "read_pins", 0, 3, "读取频道置顶消息")
             async for msg in client.iter_messages(channel, filter=InputMessagesFilterPinned, limit=3):
                 messages.append(msg)
                 pinned_ids.add(int(msg.id))
                 scanned += 1
+            await _profile_progress(pool, job, "read_pins", len(pinned_ids), 3, f"已读取置顶消息 {len(pinned_ids)}/3")
         except Exception as exc:
             if _is_flood_wait(exc):
                 raise
@@ -522,6 +540,7 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
         if pinned_ids:
             anchor_id = max(pinned_ids)
             try:
+                await _profile_progress(pool, job, "read_followup", 0, followup_limit, "补读置顶消息后续内容")
                 async for msg in client.iter_messages(
                     channel, min_id=anchor_id, limit=min(followup_limit, max(0, scan_limit - scanned)),
                 ):
@@ -529,6 +548,10 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
                         messages.append(msg)
                         pinned_followup_ids.add(int(msg.id))
                         scanned += 1
+                await _profile_progress(
+                    pool, job, "read_followup", len(pinned_followup_ids), followup_limit,
+                    f"已补读置顶后续 {len(pinned_followup_ids)} 条",
+                )
             except Exception as exc:
                 if _is_flood_wait(exc):
                     raise
@@ -547,6 +570,7 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
         if len(re.sub(r"\s+", "", intro)) < min_chars or pinned_photos < min(photo_limit, 6):
             recent = []
             try:
+                await _profile_progress(pool, job, "scan_recent", 0, recent_window, "资料不足，扫描最近消息")
                 async for msg in client.iter_messages(
                     channel, limit=min(recent_window, max(0, scan_limit - scanned)),
                 ):
@@ -556,15 +580,25 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
                     raise
                 logger.info("V2 recent channel scan unavailable (user=%s): %s", user.id, exc)
             scanned += len(recent)
+            await _profile_progress(
+                pool, job, "scan_recent", len(recent), recent_window,
+                f"最近消息已读 {len(recent)} 条",
+            )
             messages.extend(recent)
             intro = about or "\n".join((m.raw_text or "").strip() for m in messages if _has_profile_content(m))
             recent_photos = sum(bool(msg.photo) for msg in messages)
             if (len(re.sub(r"\s+", "", intro)) < min_chars or recent_photos < min(photo_limit, 6)) and scanned < scan_limit and recent:
                 remaining = scan_limit - scanned
                 try:
+                    await _profile_progress(pool, job, "scan_archive", scanned, scan_limit, f"补扫历史消息，当前累计 {scanned}/{scan_limit} 条")
                     async for msg in client.iter_messages(channel, limit=remaining, offset_id=min(m.id for m in recent)):
                         messages.append(msg)
                         scanned += 1
+                        if scanned % 10 == 0 or scanned >= scan_limit:
+                            await _profile_progress(
+                                pool, job, "scan_archive", scanned, scan_limit,
+                                f"历史消息已读 {scanned}/{scan_limit} 条",
+                            )
                 except Exception as exc:
                     if _is_flood_wait(exc):
                         raise
@@ -586,7 +620,7 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
     text_parts = [f"个人简介：\n{about}"] if about else []
     media, video_candidates, sources = [], [], []
     channel_username = getattr(channel, "username", None) if channel is not None else None
-    for msg in unique:
+    for message_index, msg in enumerate(unique, start=1):
         parts = await _fetch_album(client, channel, msg) if channel is not None else [msg]
         anchor = next((part for part in parts if (part.raw_text or "").strip()), msg)
         raw_text = (anchor.raw_text or "").strip()
@@ -615,6 +649,11 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
                 media.extend({**item, "message_id": int(part.id)} for item in entries if item.get("kind") == "photo")
             elif media_kind == "video":
                 video_candidates.append(part)
+        if message_index % 5 == 0 or message_index == len(unique):
+            await _profile_progress(
+                pool, job, "collect_media", message_index, len(unique),
+                f"整理关联消息与媒体 {message_index}/{len(unique)} 条",
+            )
 
     if not any(item["kind"] == "photo" for item in media):
         for part in video_candidates[:video_limit]:
@@ -644,6 +683,7 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
         "intro_min_lines": min_lines,
         "any_sender_in_linked_channel": True,
     }
+    await _profile_progress(pool, job, "save_result", 0, 1, "写入 V2 资料结果并排入 OCR")
     rows = await pool.fetch(
         SQL_PROFILE_RESULT, job["job_id"], int(user.id), job["contact_username"],
         evidence["profile_url"], channel_url or "", bot_url or "", description,

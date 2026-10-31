@@ -1,6 +1,9 @@
 WITH requeued AS (
     UPDATE profile_collection_jobs j
-    SET status = 'pending', next_attempt_at = NULL, error = NULL, updated_at = NOW()
+    SET status = 'pending', next_attempt_at = NULL, error = NULL,
+        stage = 'queued', progress_current = 0, progress_total = NULL,
+        progress_note = '管理员重新排队', started_at = NULL,
+        heartbeat_at = NULL, updated_at = NOW()
     WHERE j.rule_id = $1::bigint
       AND EXISTS (
           SELECT 1 FROM ingest_rules rule

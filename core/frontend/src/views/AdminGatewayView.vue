@@ -1,6 +1,6 @@
 <script setup>
 import AdminTabs from "../components/AdminTabs.vue";
-import { onMounted, ref } from "vue";
+import { onMounted, onUnmounted, ref } from "vue";
 import { api } from "../api/client";
 
 const data = ref(null);
@@ -9,6 +9,7 @@ const dialogs = ref([]);
 const flash = ref("");
 const backupSelections = ref({});
 const primarySelections = ref({});
+let statusTimer;
 
 function notify(msg) {
   flash.value = msg;
@@ -25,6 +26,66 @@ async function loadAll() {
     sources.value.map((s) => [s.id, String(s.account_id || "")]),
   );
   dialogs.value = (await api("/api/admin/sources/dialogs")).items;
+}
+
+async function refreshOverview() {
+  try {
+    data.value = await api("/api/admin/gateway/overview");
+  } catch (e) {
+    // Keep the last usable snapshot visible during a temporary refresh error.
+  }
+}
+
+const STAGE_LABELS = {
+  queued: "等待领取",
+  resolve_profile: "解析个人资料",
+  resolve_channel: "查找关联频道",
+  check_source: "检查频道更新",
+  read_pins: "读取置顶消息",
+  read_followup: "补读置顶后续",
+  scan_recent: "扫描最近消息",
+  scan_archive: "扫描更多历史",
+  collect_media: "整理消息与媒体",
+  save_result: "保存结果 / 排 OCR",
+  cooldown: "Telegram 冷却",
+  completed: "已完成",
+  checked: "检查完成",
+  failed: "失败",
+  in_progress: "执行中",
+};
+
+function stageLabel(stage) {
+  return STAGE_LABELS[stage] || stage || "执行中";
+}
+
+function ageLabel(seconds) {
+  const age = Math.max(0, Number(seconds) || 0);
+  if (age < 60) return `${age} 秒前`;
+  if (age < 3600) return `${Math.floor(age / 60)} 分钟前`;
+  return `${Math.floor(age / 3600)} 小时 ${Math.floor((age % 3600) / 60)} 分钟前`;
+}
+
+function localTime(value) {
+  return value ? new Date(value).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "—";
+}
+
+function jobProgress(job) {
+  if (!job.progress_total) return 0;
+  return Math.max(0, Math.min(100, Math.round(job.progress_current * 100 / job.progress_total)));
+}
+
+async function requeueIneffective() {
+  const ruleId = data.value?.collection?.rule_id;
+  if (!ruleId) return notify("未找到启用的 V2 规则");
+  try {
+    const result = await api(`/api/admin/rules/${ruleId}/profile-collection/requeue-ineffective`, {
+      method: "POST",
+    });
+    notify(`已将 ${result.requeued} 个无有效结果任务重新排队`);
+    await refreshOverview();
+  } catch (e) {
+    notify(`重采排队失败: ${String(e.message).slice(0, 60)}`);
+  }
 }
 
 const boundPeerIds = () => new Set(sources.value.map((s) => s.peer_id));
@@ -124,7 +185,11 @@ async function backfillMedia() {
   }
 }
 
-onMounted(loadAll);
+onMounted(async () => {
+  await loadAll();
+  statusTimer = window.setInterval(refreshOverview, 30000);
+});
+onUnmounted(() => window.clearInterval(statusTimer));
 </script>
 
 <template>
@@ -148,6 +213,113 @@ onMounted(loadAll);
         <div class="text-xs text-slate-500">发信队列 · {{ state }}</div>
       </div>
     </div>
+
+    <section class="space-y-4 rounded-xl border border-violet-800/60 bg-slate-950/60 p-4">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h3 class="font-semibold text-violet-200">资料深采 V2 · 运行监控</h3>
+          <p class="mt-1 text-xs text-slate-500">
+            队列状态每 30 秒刷新；进度更新时间 {{ localTime(data.collection?.last_updated) }}
+          </p>
+        </div>
+        <div class="flex gap-2">
+          <button @click="refreshOverview" class="rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300">立即刷新</button>
+          <button @click="requeueIneffective" class="rounded-lg border border-amber-700/60 px-3 py-1.5 text-xs text-amber-300">
+            重采无有效资料
+          </button>
+          <RouterLink to="/admin/rules" class="rounded-lg border border-violet-700/60 px-3 py-1.5 text-xs text-violet-300">打开 V2 规则 / 复核结果</RouterLink>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-2 gap-2 sm:grid-cols-4 xl:grid-cols-7">
+        <div v-for="item in [
+          ['待领取', data.collection.summary.pending, 'text-slate-200'],
+          ['处理中', data.collection.summary.processing, 'text-sky-300'],
+          ['等待冷却', data.collection.summary.deferred, 'text-amber-300'],
+          ['已采集', data.collection.summary.fetched, 'text-emerald-300'],
+          ['无可用资料', data.collection.summary.no_usable, 'text-slate-300'],
+          ['失败', data.collection.summary.failed, 'text-rose-300'],
+          ['疑似停滞', data.collection.summary.stale_processing, 'text-red-300'],
+        ]" :key="item[0]" class="rounded-lg border border-slate-800 bg-slate-900 p-3">
+          <div class="text-xl font-bold" :class="item[2]">{{ item[1] }}</div>
+          <div class="mt-1 text-xs text-slate-500">{{ item[0] }}</div>
+        </div>
+      </div>
+
+      <div class="grid gap-3 md:grid-cols-3">
+        <article v-for="a in data.collection.accounts" :key="a.id" class="rounded-lg border border-slate-800 bg-slate-900 p-3">
+          <div class="flex items-center justify-between gap-2">
+            <div class="font-medium">{{ a.display_name || a.username || `账号#${a.id}` }}</div>
+            <span class="rounded px-2 py-0.5 text-xs"
+              :class="a.status === 'active' ? 'bg-emerald-600/20 text-emerald-300' : 'bg-slate-800 text-slate-400'">{{ a.status }}</span>
+          </div>
+          <div class="mt-2 grid grid-cols-2 gap-y-1 text-xs text-slate-400">
+            <span>V2 正在执行</span><b class="text-sky-300">{{ a.processing_jobs }}</b>
+            <span>24 小时已采集</span><b class="text-emerald-300">{{ a.fetched_24h }}</b>
+            <span>可采来源</span><b>{{ a.eligible_sources }}</b>
+            <span>最近完成</span><b class="font-normal">{{ localTime(a.last_finished_at) }}</b>
+            <span>冷却截至</span><b class="font-normal text-amber-300">{{ a.cooldown_until ? localTime(a.cooldown_until) : '当前无冷却' }}</b>
+          </div>
+        </article>
+        <div v-if="!data.collection.accounts.length" class="rounded-lg border border-slate-800 p-4 text-sm text-slate-500">暂无账号或资料深采任务</div>
+      </div>
+
+      <div>
+        <h4 class="mb-2 text-sm font-medium text-slate-300">正在执行的任务</h4>
+        <div v-if="data.collection.current_jobs.length" class="grid gap-3 lg:grid-cols-2">
+          <article v-for="job in data.collection.current_jobs" :key="job.job_id" class="rounded-lg border p-3"
+            :class="job.stale ? 'border-rose-700/70 bg-rose-950/20' : 'border-slate-800 bg-slate-900'">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div class="font-medium">@{{ job.contact_username }} <span class="text-xs text-slate-500">任务 #{{ job.job_id }}</span></div>
+              <span v-if="job.stale" class="rounded bg-rose-600/20 px-2 py-1 text-xs text-rose-300">心跳超 5 分钟，疑似停滞</span>
+              <span v-else class="rounded bg-sky-600/20 px-2 py-1 text-xs text-sky-300">{{ stageLabel(job.stage) }}</span>
+            </div>
+            <div class="mt-1 text-xs text-slate-500">来源 {{ job.source_title || `#${job.source_id}` }} · 账号 {{ job.account_name }} · 开始 {{ localTime(job.started_at) }}</div>
+            <div class="mt-3 h-2 overflow-hidden rounded-full bg-slate-800">
+              <div class="h-full rounded-full bg-sky-500 transition-all" :style="{ width: `${jobProgress(job)}%` }"></div>
+            </div>
+            <div class="mt-1 flex justify-between gap-2 text-xs text-slate-400">
+              <span>{{ job.progress_note || stageLabel(job.stage) }}</span>
+              <span class="shrink-0">心跳 {{ ageLabel(job.heartbeat_age_seconds) }}</span>
+            </div>
+          </article>
+        </div>
+        <div v-else class="rounded-lg border border-slate-800 bg-slate-900 p-4 text-sm text-slate-500">当前没有正在执行的 V2 任务</div>
+      </div>
+
+      <div class="grid gap-4 lg:grid-cols-2">
+        <div>
+          <h4 class="mb-2 text-sm font-medium text-slate-300">来源队列</h4>
+          <div class="space-y-2">
+            <div v-for="s in data.collection.sources" :key="s.id" class="rounded-lg border border-slate-800 bg-slate-900 p-3">
+              <div class="font-medium">{{ s.title || `来源#${s.id}` }}</div>
+              <div class="mt-1 text-xs text-slate-500">主账号 {{ s.primary_account }} · 备用 {{ (s.backup_accounts || []).map((a) => `${a.name}(${a.status})`).join('、') || '无' }}</div>
+              <div class="mt-2 flex flex-wrap gap-2 text-xs">
+                <span class="text-slate-300">待领取 {{ s.pending }}</span><span class="text-sky-300">处理中 {{ s.processing }}</span>
+                <span class="text-amber-300">冷却 {{ s.deferred }}</span><span class="text-emerald-300">已采 {{ s.fetched }}</span>
+                <span class="text-rose-300">需复核 {{ s.needs_attention }}</span>
+              </div>
+            </div>
+            <div v-if="!data.collection.sources.length" class="text-sm text-slate-500">V2 尚未绑定采集来源</div>
+          </div>
+        </div>
+        <div>
+          <h4 class="mb-2 text-sm font-medium text-slate-300">待复核 / 可重采任务</h4>
+          <div v-if="data.collection.attention.length" class="max-h-72 space-y-2 overflow-y-auto">
+            <div v-for="job in data.collection.attention" :key="job.job_id" class="rounded-lg border border-slate-800 bg-slate-900 p-3">
+              <div class="flex justify-between gap-2 text-sm">
+                <span>@{{ job.contact_username }} · {{ job.source_title || `来源#${job.source_id}` }}</span>
+                <span class="shrink-0 text-amber-300">{{ job.status }}</span>
+              </div>
+              <div class="mt-1 text-xs text-slate-500">账号 {{ job.account_name }} · 重试 {{ job.retry_count }} 次 · 更新 {{ localTime(job.updated_at) }}</div>
+              <div v-if="job.error || job.progress_note" class="mt-1 line-clamp-2 text-xs text-slate-400">{{ job.error || job.progress_note }}</div>
+              <div v-if="job.next_attempt_at" class="mt-1 text-xs text-amber-400">自动重试 {{ localTime(job.next_attempt_at) }}</div>
+            </div>
+          </div>
+          <div v-else class="rounded-lg border border-slate-800 bg-slate-900 p-4 text-sm text-emerald-300">暂无待复核或可重采任务</div>
+        </div>
+      </div>
+    </section>
 
     <div class="overflow-x-auto rounded-xl border border-slate-800">
       <table class="w-full text-sm">

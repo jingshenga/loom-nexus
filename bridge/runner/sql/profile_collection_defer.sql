@@ -1,7 +1,9 @@
 WITH deferred AS (
     UPDATE profile_collection_jobs
     SET status = 'deferred', next_attempt_at = NOW() + make_interval(secs => $2::int),
-        retry_count = retry_count + 1, error = 'Telegram FloodWait', updated_at = NOW()
+        retry_count = retry_count + 1, error = 'Telegram FloodWait',
+        stage = 'cooldown', progress_note = 'Telegram FloodWait，等待冷却后重试',
+        heartbeat_at = NOW(), updated_at = NOW()
     WHERE id = $1::bigint
     RETURNING account_id
 )

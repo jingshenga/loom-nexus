@@ -34,7 +34,10 @@ WITH picked AS (
 )
 UPDATE profile_collection_jobs j
 SET account_id = p.account_id, status = 'processing', error = NULL,
-    next_attempt_at = NULL, updated_at = NOW()
+    next_attempt_at = NULL, stage = 'resolve_profile',
+    progress_current = 0, progress_total = NULL,
+    progress_note = '解析 Telegram 用户资料',
+    started_at = NOW(), heartbeat_at = NOW(), updated_at = NOW()
 FROM picked p
 WHERE j.id = p.id
 RETURNING j.id AS job_id, j.rule_id, j.duty_date, j.source_id, j.account_id,
