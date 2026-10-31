@@ -123,6 +123,8 @@ async def list_rules() -> dict:
                     if statuses.get(r["rule_id"]) and statuses[r["rule_id"]]["observed_at"]
                     else None,
                     "matched": statuses[r["rule_id"]]["matched"],
+                    "green_blue": statuses[r["rule_id"]]["green_blue"],
+                    "green_only": statuses[r["rule_id"]]["green_only"],
                     "with_card": statuses[r["rule_id"]]["with_card"],
                     "queued": statuses[r["rule_id"]]["queued"],
                     "fetched": statuses[r["rule_id"]]["fetched"],
