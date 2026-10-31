@@ -164,12 +164,12 @@ onMounted(load);
       <section class="space-y-3 rounded-xl border border-slate-800 bg-slate-900/60 p-4">
         <div>
           <h2 class="font-medium">类别</h2>
-          <p class="mt-1 text-xs text-slate-500">人工标注作为训练依据。停用会保留旧标签和模型记录。</p>
+          <p class="mt-1 text-xs text-slate-500">旧版“已确认/非资料卡”映射为“资料卡/其他”；可在 OCR 页改成更细类别。停用会保留标签和模型记录。</p>
         </div>
         <div class="max-h-64 space-y-2 overflow-y-auto">
           <div v-for="category in categories" :key="category.code" class="flex flex-wrap items-center gap-2 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2">
             <span class="min-w-20 text-sm">{{ category.name }}</span>
-            <span class="text-[10px] text-slate-500">{{ category.code }} · {{ category.labeled_count }} 张标注</span>
+            <span class="text-[10px] text-slate-500">{{ category.code }} · {{ category.labeled_count }} 张（人工 {{ category.manual_label_count }} / 旧审核 {{ category.legacy_label_count }}）</span>
             <label class="ml-auto flex items-center gap-1 text-[10px] text-slate-400">
               <input type="checkbox" :checked="category.review_required" @change="updateCategory(category, { review_required: $event.target.checked })" />低置信度进入核对
             </label>

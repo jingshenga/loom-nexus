@@ -73,7 +73,11 @@ async def list_categories() -> dict:
     rows = await _pool().fetch(
         "SELECT c.code, c.name, c.is_active, c.is_trainable, c.review_required, c.is_builtin, "
         "(SELECT count(*) FROM ocr_classification_labels l "
-        " WHERE l.category_code=c.code AND l.superseded_at IS NULL) AS labeled_count "
+        " WHERE l.category_code=c.code AND l.superseded_at IS NULL) AS labeled_count, "
+        "(SELECT count(*) FROM ocr_classification_labels l "
+        " WHERE l.category_code=c.code AND l.superseded_at IS NULL AND l.label_source='manual') AS manual_label_count, "
+        "(SELECT count(*) FROM ocr_classification_labels l "
+        " WHERE l.category_code=c.code AND l.superseded_at IS NULL AND l.label_source='legacy_binary') AS legacy_label_count "
         "FROM ocr_classification_categories c ORDER BY c.is_builtin DESC, c.created_at, c.code"
     )
     return {"items": [dict(row) for row in rows]}
