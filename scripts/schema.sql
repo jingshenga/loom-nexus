@@ -31,6 +31,16 @@ CREATE TABLE IF NOT EXISTS ingest_sources (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Ordered failover accounts for a source. FloodWait does not activate these:
+-- the current request must wait for Telegram's returned cooldown.
+CREATE TABLE IF NOT EXISTS ingest_source_account_backups (
+    source_id BIGINT NOT NULL REFERENCES ingest_sources(id) ON DELETE CASCADE,
+    account_id BIGINT NOT NULL REFERENCES bridge_accounts(id) ON DELETE CASCADE,
+    priority INT NOT NULL DEFAULT 1 CHECK (priority > 0),
+    PRIMARY KEY (source_id, account_id),
+    UNIQUE (source_id, priority)
+);
+
 -- 3. raw message envelope + media metadata
 CREATE TABLE IF NOT EXISTS raw_messages (
     id BIGSERIAL PRIMARY KEY,

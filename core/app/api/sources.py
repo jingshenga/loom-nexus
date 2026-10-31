@@ -3,6 +3,8 @@
 Sources define which groups/channels the gateway accounts collect
 from; dialogs come from the bridge's dialog_cache refresh.
 """
+import json
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -24,6 +26,10 @@ SQL_BF_ENQUEUE = sqlres.load("backfill_enqueue.sql")
 SQL_BF_STATUS = sqlres.load("backfill_status.sql")
 SQL_BF_ALL = sqlres.load("backfill_all.sql")
 SQL_MEDIA_SOURCES = sqlres.load("media_backfill_sources.sql")
+SQL_BACKUP_DELETE = sqlres.load("source_backup_accounts.sql")
+SQL_BACKUP_INSERT = sqlres.load("source_backup_account_insert.sql")
+SQL_BACKUP_REMOVE_PRIMARY = sqlres.load("source_backup_remove_primary.sql")
+SQL_VISIBLE_DIALOG_ACCOUNTS = sqlres.load("source_dialog_accounts.sql")
 
 
 def _pool():
@@ -49,6 +55,11 @@ async def list_sources() -> dict:
                 "account_name": r["account_name"],
                 "last_msg_id": r["last_msg_id"],
                 "raw_count": r["raw_count"],
+                "backup_accounts": (
+                    json.loads(r["backup_accounts"])
+                    if isinstance(r["backup_accounts"], str)
+                    else r["backup_accounts"]
+                ),
             }
             for r in rows
         ]
@@ -89,11 +100,51 @@ async def bind_source(body: BindBody) -> dict:
     )
     source_id = rows[0]["source_id"]
     await pool.fetch(SQL_ASSIGN, source_id, body.account_id)
+    await pool.execute(SQL_BACKUP_REMOVE_PRIMARY, source_id, body.account_id)
     return {"source_id": source_id, "status": "bound"}
 
 
 class ActiveBody(BaseModel):
     is_active: bool
+
+
+class BackupAccountsBody(BaseModel):
+    account_ids: list[int]
+
+
+@router.put("/{source_id}/backup-accounts")
+async def set_backup_accounts(source_id: int, body: BackupAccountsBody) -> dict:
+    pool = _pool()
+    account_ids = list(dict.fromkeys(body.account_ids))
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            source = await conn.fetchrow(SQL_SOURCE_OF, source_id)
+            if not source:
+                raise HTTPException(status_code=404, detail="source not found")
+            primary_id = source["assigned_account_id"]
+            if primary_id in account_ids:
+                raise HTTPException(status_code=400, detail="primary account cannot also be a backup")
+            if account_ids:
+                rows = await conn.fetch(
+                    "SELECT id FROM bridge_accounts WHERE id = ANY($1::bigint[])",
+                    account_ids,
+                )
+                known_ids = {row["id"] for row in rows}
+                if known_ids != set(account_ids):
+                    raise HTTPException(status_code=400, detail="unknown gateway account")
+                visible_rows = await conn.fetch(
+                    SQL_VISIBLE_DIALOG_ACCOUNTS, source["peer_id"], account_ids,
+                )
+                visible_ids = {row["account_id"] for row in visible_rows}
+                if visible_ids != set(account_ids):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="backup account must first be confirmed in the source dialog list",
+                    )
+            await conn.execute(SQL_BACKUP_DELETE, source_id)
+            for priority, account_id in enumerate(account_ids, start=1):
+                await conn.execute(SQL_BACKUP_INSERT, source_id, account_id, priority)
+    return {"ok": True, "account_ids": account_ids}
 
 
 @router.post("/{source_id}/active")

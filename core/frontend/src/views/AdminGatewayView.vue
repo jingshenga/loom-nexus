@@ -7,6 +7,7 @@ const data = ref(null);
 const sources = ref([]);
 const dialogs = ref([]);
 const flash = ref("");
+const backupSelections = ref({});
 
 function notify(msg) {
   flash.value = msg;
@@ -16,10 +17,19 @@ function notify(msg) {
 async function loadAll() {
   data.value = await api("/api/admin/gateway/overview");
   sources.value = (await api("/api/admin/sources")).items;
+  backupSelections.value = Object.fromEntries(
+    sources.value.map((s) => [s.id, (s.backup_accounts || []).map((a) => String(a.id))]),
+  );
   dialogs.value = (await api("/api/admin/sources/dialogs")).items;
 }
 
 const boundPeerIds = () => new Set(sources.value.map((s) => s.peer_id));
+const backupCandidates = (s) => {
+  const visible = new Set(dialogs.value.filter((d) => d.peer_id === s.peer_id).map((d) => String(d.account_id)));
+  const selected = new Set(backupSelections.value[s.id] || []);
+  return data.value.accounts.filter((a) => a.id !== s.account_id
+    && (visible.has(String(a.id)) || selected.has(String(a.id))));
+};
 
 async function bindDialog(d) {
   try {
@@ -47,6 +57,20 @@ async function toggleSource(s) {
     body: JSON.stringify({ is_active: !s.is_active }),
   });
   await loadAll();
+}
+
+async function saveBackupAccounts(s) {
+  try {
+    await api(`/api/admin/sources/${s.id}/backup-accounts`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ account_ids: backupSelections.value[s.id].map(Number) }),
+    });
+    notify(`已保存 ${s.title || `来源#${s.id}`} 的备用账号`);
+    await loadAll();
+  } catch (e) {
+    notify(`保存失败: ${String(e.message).slice(0, 60)}`);
+  }
 }
 
 async function backfillAll() {
@@ -166,6 +190,18 @@ onMounted(loadAll);
                     {{ s.username ? "@" + s.username : s.peer_id }} · 账号 {{ s.account_name || s.account_id || "未分配" }}
                     · 已采集 {{ s.raw_count }} 条 · 游标 {{ s.last_msg_id }}
                   </div>
+                  <div class="mt-2 flex flex-wrap items-center gap-2">
+                    <span class="text-xs text-slate-500">备用账号</span>
+                    <label v-for="a in backupCandidates(s)" :key="a.id"
+                      class="flex items-center gap-1 text-xs text-slate-400">
+                      <input v-model="backupSelections[s.id]" type="checkbox" :value="String(a.id)"
+                        class="accent-sky-500" />
+                      {{ a.display_name || a.username || `账号#${a.id}` }} · {{ a.status }}
+                    </label>
+                    <span v-if="!backupCandidates(s).length" class="text-xs text-slate-600">暂无其他账号已确认可访问该来源</span>
+                    <button @click="saveBackupAccounts(s)"
+                      class="rounded border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800">保存</button>
+                  </div>
                 </td>
                 <td class="px-4 py-2.5 text-right">
                   <button @click="toggleSource(s)"
@@ -182,6 +218,7 @@ onMounted(loadAll);
           </table>
         </div>
       </div>
+      <p class="mt-2 text-xs text-slate-600">备用账号仅在主账号断连或未授权时按顺序接管来源；Telegram 返回 FloodWait 时会等待其指定时长，不会切换账号继续同一受限请求。</p>
     </div>
   </div>
 </template>

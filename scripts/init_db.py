@@ -26,6 +26,7 @@ EXPECTED_TABLES = (
     "chat_sessions",
     "ingest_rules",
     "ingest_sources",
+    "ingest_source_account_backups",
     "listings",
     "listing_duplicate_decisions",
     "outbox_jobs",

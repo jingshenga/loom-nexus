@@ -15,8 +15,9 @@ into open proxied chat sessions.
 import asyncio
 import logging
 import os
+import time
 
-from runner import accounts, duty, hub, sqlres
+from runner import accounts, duty, hub, source_routing, sqlres
 from runner.backfill import save_media
 from runner.listener import LINK_PATTERN, expand_embedded_links, order_media
 
@@ -146,6 +147,7 @@ async def run_protocol_intake(pipeline, pool, stop) -> None:
 
     handlers = {}            # routing key -> (client, [(handler, event), ...])
     session_by_account = {}  # account_id -> session_name (clients online)
+    source_flood_wait_until = {}  # account_id -> monotonic deadline
 
     async def disconnect_account(account_id) -> None:
         for key in [k for k in handlers if k[0] == account_id or k == ("dm", account_id)]:
@@ -163,11 +165,33 @@ async def run_protocol_intake(pipeline, pool, stop) -> None:
     async def reconcile():
         """Sync online clients, bound-source handlers and DM handlers."""
         client_by_account = {}
+        flood_wait_account_ids = set()
         account_rows = await accounts.load_active_accounts(pool)
         for acc in account_rows:
+            cooldown_until = source_flood_wait_until.get(acc["id"], 0)
+            if cooldown_until > time.monotonic():
+                flood_wait_account_ids.add(acc["id"])
+                continue
+            source_flood_wait_until.pop(acc["id"], None)
             session_name = str(acc["session_file"]).removesuffix(".session")
-            client = await hub.get_client(session_name)
+            try:
+                client = await hub.get_client(session_name)
+            except Exception as exc:
+                if source_routing.is_flood_wait_error(exc):
+                    flood_wait_account_ids.add(acc["id"])
+                    source_flood_wait_until[acc["id"]] = time.monotonic() + max(
+                        1, int(getattr(exc, "seconds", 1) or 1),
+                    )
+                    logger.warning(
+                        "account connection hit FloodWait; source failover disabled for account=%s (%ss)",
+                        acc["id"], max(1, int(getattr(exc, "seconds", 1) or 1)),
+                    )
+                else:
+                    logger.warning("account unavailable; source backup may take over (account=%s): %s",
+                                   acc["id"], exc)
+                continue
             if client is None:
+                await pool.fetch(sqlres.load("account_mark_needs_auth.sql"), acc["id"])
                 if session_by_account.get(acc["id"]) == session_name:
                     await disconnect_account(acc["id"])
                 continue
@@ -184,28 +208,39 @@ async def run_protocol_intake(pipeline, pool, stop) -> None:
             return
 
         wanted = {}
-        for account_id in client_by_account:
-            rows = await pool.fetch(
-                sqlres.load("sources_for_account.sql"), account_id,
-            )
-            for row in rows:
+        candidates = await pool.fetch(sqlres.load("source_account_candidates.sql"))
+        source_routes = source_routing.select_source_routes(
+            candidates, client_by_account, flood_wait_account_ids,
+        )
+        for source_id, row in source_routes.items():
+            if row["listen_source"]:
+                account_id = row["account_id"]
                 wanted[(account_id, "source", row["peer_id"])] = {
-                    "kind": "source", "source_id": row["id"],
+                    "kind": "source", "source_id": source_id,
                     "peer_id": row["peer_id"], "title": row["title"],
                 }
-            wanted[("dm", account_id)] = None
+
+        if source_routes:
             duty_rows = await pool.fetch(
-                sqlres.load("duty_rules_for_account.sql"), account_id,
+                sqlres.load("duty_rules_for_sources.sql"), list(source_routes),
             )
-            for row in duty_rows:
-                meta = dict(row)
-                config = duty.decode_config(row["config_json"])
-                if not config.get("sender_peer_id") or not config.get("match_prefix"):
-                    logger.warning("invalid duty rule skipped: %s", row["rule_id"])
-                    continue
-                wanted[(account_id, "duty-new", row["rule_id"], row["source_id"])] = meta
-                if config.get("update_mode") == "edited_snapshot":
-                    wanted[(account_id, "duty-edit", row["rule_id"], row["source_id"])] = meta
+        else:
+            duty_rows = []
+        source_accounts = {
+            source_id: row["account_id"] for source_id, row in source_routes.items()
+        }
+        for account_id in client_by_account:
+            wanted[("dm", account_id)] = None
+        for row in duty_rows:
+            account_id = source_accounts[row["source_id"]]
+            meta = dict(row)
+            config = duty.decode_config(row["config_json"])
+            if not config.get("sender_peer_id") or not config.get("match_prefix"):
+                logger.warning("invalid duty rule skipped: %s", row["rule_id"])
+                continue
+            wanted[(account_id, "duty-new", row["rule_id"], row["source_id"])] = meta
+            if config.get("update_mode") == "edited_snapshot":
+                wanted[(account_id, "duty-edit", row["rule_id"], row["source_id"])] = meta
 
         for key in [k for k in handlers if k not in wanted]:
             client, registrations = handlers.pop(key)
