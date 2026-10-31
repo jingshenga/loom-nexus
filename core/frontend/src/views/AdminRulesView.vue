@@ -26,6 +26,7 @@ const dutyDialogKey = ref("");
 const dutyForm = ref({});
 const profileForm = ref({});
 const profileResults = ref([]);
+const profileUsername = ref("");
 const filteredRules = computed(() => rules.value.filter((r) => (r.rule_type || "listing") === activeTab.value));
 
 const EMPTY_DUTY_CONFIG = {
@@ -53,6 +54,8 @@ const EMPTY_PROFILE_CONFIG = {
   channel_any_sender_matches: true,
   skip_video_when_photo_found: true,
   exclude_avatar: true,
+  stale_channel_days: 60,
+  pinned_followup_messages: 5,
 };
 
 const EMPTY_CONFIG = {
@@ -125,6 +128,27 @@ async function loadProfileResults(ruleId = current.value?.id) {
   if (!ruleId) return;
   const data = await api(`/api/admin/rules/${ruleId}/profile-collection`);
   profileResults.value = data.items || [];
+}
+
+async function enqueueProfileUsername() {
+  if (!current.value?.id || !profileUsername.value.trim()) return notify("请输入 Telegram 用户名");
+  const data = await api(`/api/admin/rules/${current.value.id}/profile-collection/enqueue`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ telegram_username: profileUsername.value.trim() }),
+  });
+  profileUsername.value = "";
+  await loadProfileResults();
+  notify(`@${data.username} 已加入采集队列（${data.status}）`);
+}
+
+async function requeueIneffectiveProfiles() {
+  if (!current.value?.id) return;
+  const data = await api(`/api/admin/rules/${current.value.id}/profile-collection/requeue-ineffective`, {
+    method: "POST",
+  });
+  await loadProfileResults();
+  notify(`已将 ${data.requeued} 个无有效资料任务重新排队`);
 }
 
 function newRule() {
@@ -756,7 +780,7 @@ onMounted(async () => {
         <div class="rounded-xl border border-violet-800/50 bg-violet-950/20 p-4">
           <h3 class="text-sm font-semibold">V2 试采策略</h3>
           <p class="mt-2 text-xs leading-relaxed text-slate-400">
-            先读个人简介关联消息和置顶；资料不足时查最近消息，再向前扩扫至总上限。对照片 OCR 统计文字量和行数；有照片不取视频。试采数据独立保存，不会直接覆盖 V1 卡片。
+            先读个人简介关联消息和置顶，并补读置顶后的 5 条；频道最近更新时间超过 60 天则跳过。资料不足时扫描频道最近消息，最多 100 条、最多保存 6 张照片；照片 OCR 按文字量识别简介。有照片不取视频。试采数据独立保存，不会覆盖 V1 卡片。
           </p>
         </div>
         <div v-if="current.id" class="flex flex-wrap gap-2 rounded-xl border border-slate-800 bg-slate-900/50 p-3">
@@ -771,13 +795,23 @@ onMounted(async () => {
             <RefreshCw class="size-3.5" />刷新试采结果
           </button>
         </div>
+        <div v-if="current.id" class="flex flex-wrap gap-2 rounded-xl border border-slate-800 bg-slate-900/50 p-3">
+          <input v-model="profileUsername" placeholder="输入 Telegram 用户名或 t.me 链接"
+            class="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs" />
+          <button @click="enqueueProfileUsername" class="rounded-lg bg-sky-600 px-3 py-2 text-xs font-medium hover:bg-sky-500">
+            加入采集队列
+          </button>
+          <button @click="requeueIneffectiveProfiles" class="rounded-lg border border-amber-700/60 px-3 py-2 text-xs text-amber-300 hover:bg-amber-900/30">
+            重采无有效资料
+          </button>
+        </div>
         <div v-if="boundGroups().length" class="flex flex-wrap gap-2 text-xs text-slate-400">
           <span>已绑定：</span><span v-for="b in boundGroups()" :key="b.source_id" class="rounded-full border border-slate-700 px-2 py-1">{{ b.title || `来源#${b.source_id}` }}</span>
         </div>
         <div class="space-y-3">
           <article v-for="item in profileResults" :key="item.job_id" class="rounded-xl border border-slate-800 bg-slate-900/50 p-3">
             <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
-              <div class="font-medium text-slate-200">@{{ item.contact_username }} <span class="ml-1 text-slate-500">{{ item.duty_date }}</span></div>
+              <div class="font-medium text-slate-200"><a :href="item.profile_url || `https://t.me/${item.contact_username}`" target="_blank" class="hover:text-sky-300">@{{ item.contact_username }}</a> <span class="ml-1 text-slate-500">{{ item.duty_date }}</span></div>
               <div class="flex gap-2 text-slate-400"><span>{{ item.status }}</span><span v-if="item.ocr_pending">OCR {{ item.ocr_pending }} 项待跑</span><span v-if="item.ocr_review">{{ item.ocr_review }} 张待看</span></div>
             </div>
             <div v-if="item.error" class="mt-2 text-xs text-rose-300">{{ item.error }}</div>
@@ -800,7 +834,7 @@ onMounted(async () => {
             </div>
           </article>
           <div v-if="!profileResults.length" class="rounded-xl border border-slate-800 bg-slate-900/50 p-4 text-xs text-slate-500">
-            暂无试采任务。新任务由已绑定来源的在岗采集流程自动产生；结果先独立保存，不会覆盖旧卡片。
+            暂无试采任务。可输入 Telegram 用户名手动入队，系统会从已绑定来源选择当前可用账号；worker 按账号冷却自动执行。结果先独立保存，不会覆盖旧卡片。
           </div>
         </div>
       </section>

@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import re
+from datetime import datetime, timedelta, timezone
 
 from runner import backfill, hub, sqlres
 from runner.duty import entity_urls, listing_contact_username, profile_usernames
@@ -459,14 +460,38 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
     scan_limit = max(recent_window, min(100, int(cfg.get("max_scan_messages", 100))))
     photo_limit = max(1, min(MAX_PROFILE_V2_PHOTOS, int(cfg.get("max_photos", 6))))
     video_limit = max(0, min(MAX_PROFILE_VIDEOS, int(cfg.get("max_videos", 2))))
+    stale_days = max(1, min(180, int(cfg.get("stale_channel_days", 60))))
+    followup_limit = max(1, min(5, int(cfg.get("pinned_followup_messages", 5))))
     min_chars = max(1, int(cfg.get("intro_min_chars", 30)))
     min_lines = max(1, int(cfg.get("intro_min_lines", 3)))
     spotlight_id = getattr(full_user, "personal_channel_message", None)
     messages, pinned_ids = [], set()
+    pinned_followup_ids = set()
     profile_link_ids = set()
     scanned = 0
+    channel_last_message_at = None
     if channel is not None:
         channel_name = (getattr(channel, "username", None) or "").lower()
+        channel_label = channel_url or _entity_url(channel) or "关联频道"
+        latest = None
+        try:
+            async for latest in client.iter_messages(channel, limit=1):
+                break
+        except Exception as exc:
+            if _is_flood_wait(exc):
+                raise
+            logger.info("V2 latest-message check unavailable (user=%s): %s", user.id, exc)
+            return "source_unavailable", f"无法确认频道最近更新时间，已跳过：{channel_label}"
+        if latest is not None and latest.date:
+            latest_at = latest.date
+            if latest_at.tzinfo is None:
+                latest_at = latest_at.replace(tzinfo=timezone.utc)
+            channel_last_message_at = latest_at
+            if latest_at < datetime.now(timezone.utc) - timedelta(days=stale_days):
+                return "stale_source", (
+                    f"频道最近消息早于 {stale_days} 天，按规则跳过：{channel_label} "
+                    f"（最近更新 {latest_at.date().isoformat()}）"
+                )
         for link_name, message_id in _profile_links(about):
             if message_id and link_name.lower() == channel_name:
                 try:
@@ -482,10 +507,25 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
             async for msg in client.iter_messages(channel, filter=InputMessagesFilterPinned, limit=3):
                 messages.append(msg)
                 pinned_ids.add(int(msg.id))
+                scanned += 1
         except Exception as exc:
             if _is_flood_wait(exc):
                 raise
             logger.info("V2 linked-channel pins unavailable (user=%s): %s", user.id, exc)
+        if pinned_ids:
+            anchor_id = max(pinned_ids)
+            try:
+                async for msg in client.iter_messages(
+                    channel, min_id=anchor_id, limit=min(followup_limit, max(0, scan_limit - scanned)),
+                ):
+                    if int(msg.id) not in {int(item.id) for item in messages}:
+                        messages.append(msg)
+                        pinned_followup_ids.add(int(msg.id))
+                        scanned += 1
+            except Exception as exc:
+                if _is_flood_wait(exc):
+                    raise
+                logger.info("V2 pinned follow-up scan unavailable (user=%s): %s", user.id, exc)
         if spotlight_id:
             try:
                 msg = await client.get_messages(channel, ids=spotlight_id)
@@ -496,11 +536,13 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
                     raise
         usable = [m for m in messages if _has_profile_content(m)]
         intro = about or "\n".join((m.raw_text or "").strip() for m in usable)
-        pinned_photos = sum(bool(part.photo) for msg in usable for part in [msg])
-        if len(re.sub(r"\s+", "", intro)) < min_chars or pinned_photos < 3:
+        pinned_photos = sum(_profile_media_kind(msg) == "photo" for msg in usable)
+        if len(re.sub(r"\s+", "", intro)) < min_chars or pinned_photos < min(photo_limit, 6):
             recent = []
             try:
-                async for msg in client.iter_messages(channel, limit=recent_window):
+                async for msg in client.iter_messages(
+                    channel, limit=min(recent_window, max(0, scan_limit - scanned)),
+                ):
                     recent.append(msg)
             except Exception as exc:
                 if _is_flood_wait(exc):
@@ -510,7 +552,7 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
             messages.extend(recent)
             intro = about or "\n".join((m.raw_text or "").strip() for m in messages if _has_profile_content(m))
             recent_photos = sum(bool(msg.photo) for msg in messages)
-            if (len(re.sub(r"\s+", "", intro)) < min_chars or recent_photos < 3) and scanned < scan_limit and recent:
+            if (len(re.sub(r"\s+", "", intro)) < min_chars or recent_photos < min(photo_limit, 6)) and scanned < scan_limit and recent:
                 remaining = scan_limit - scanned
                 try:
                     async for msg in client.iter_messages(channel, limit=remaining, offset_id=min(m.id for m in recent)):
@@ -550,6 +592,7 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
                     "message_id": int(msg.id),
                     "posted_at": msg.date.isoformat() if msg.date else None,
                     "pinned": int(msg.id) in pinned_ids,
+                    "pinned_followup": int(msg.id) in pinned_followup_ids,
                     "profile_linked": int(msg.id) in profile_link_ids,
                     "matched_by": "profile_link" if int(msg.id) in profile_link_ids else "linked_channel_any_sender",
                 })
@@ -578,11 +621,14 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
         return "not_found", "No usable profile, linked-channel, or media content found"
 
     evidence = {
-        "collection_method": "profile -> linked channel pins/spotlight -> recent 10 -> older messages",
+        "collection_method": "profile -> linked channel pins and next 5 -> recent 10 -> older/gallery messages",
         "profile_url": f"https://t.me/{user.username or job['contact_username']}",
         "source_messages": sources,
         "scan_count": scanned,
         "scan_limit": scan_limit,
+        "stale_channel_days": stale_days,
+        "channel_last_message_at": channel_last_message_at.isoformat() if channel_last_message_at else None,
+        "pinned_followup_message_ids": sorted(pinned_followup_ids),
         "filtered_promo_count": filtered_count,
         "photo_limit": photo_limit,
         "video_limit_when_no_photos": video_limit,

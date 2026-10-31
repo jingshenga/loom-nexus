@@ -2824,6 +2824,7 @@ CREATE TABLE IF NOT EXISTS profile_collection_jobs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE profile_collection_jobs ALTER COLUMN target_peer_id DROP NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_collection_jobs_identity
     ON profile_collection_jobs(rule_id, duty_date, lower(contact_username));
 CREATE INDEX IF NOT EXISTS idx_profile_collection_jobs_due
@@ -2844,11 +2845,15 @@ CREATE TABLE IF NOT EXISTS profile_collection_results (
 );
 INSERT INTO ingest_rules (rule_name, rule_type, version, config_json, is_active)
 SELECT '关联群组资料深采 V2', 'profile_collection', 1,
-       '{"recent_window":10,"max_scan_messages":100,"max_photos":6,"max_videos":2,"intro_min_chars":30,"intro_min_lines":3,"channel_any_sender_matches":true,"skip_video_when_photo_found":true,"exclude_avatar":true}'::jsonb,
+       '{"recent_window":10,"max_scan_messages":100,"max_photos":6,"max_videos":2,"intro_min_chars":30,"intro_min_lines":3,"channel_any_sender_matches":true,"skip_video_when_photo_found":true,"exclude_avatar":true,"stale_channel_days":60,"pinned_followup_messages":5}'::jsonb,
        TRUE
 WHERE NOT EXISTS (
     SELECT 1 FROM ingest_rules WHERE rule_name = '关联群组资料深采 V2'
 );
+
+UPDATE ingest_rules
+SET config_json = config_json || '{"stale_channel_days":60,"pinned_followup_messages":5}'::jsonb
+WHERE rule_type = 'profile_collection';
 
 CREATE TABLE IF NOT EXISTS listing_media_ocr (
     id BIGSERIAL PRIMARY KEY,

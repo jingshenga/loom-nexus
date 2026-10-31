@@ -32,6 +32,8 @@ SQL_DUTY_STATUS = sqlres.load("duty_rule_status.sql")
 SQL_DUTY_COLLECTION_SOURCES = sqlres.load("duty_collection_sources.sql")
 SQL_DUTY_COLLECTION_SOURCE_VALIDATE = sqlres.load("duty_collection_source_validate.sql")
 SQL_PROFILE_COLLECTION_RESULTS = sqlres.load("profile_collection_results.sql")
+SQL_PROFILE_COLLECTION_ENQUEUE = sqlres.load("profile_collection_enqueue_manual.sql")
+SQL_PROFILE_COLLECTION_REQUEUE = sqlres.load("profile_collection_requeue_ineffective.sql")
 
 LLM_SYSTEM_PROMPT = (
     "你是消息抽取规则生成器。根据用户给出的样本消息，产出一个 JSON 规则对象，"
@@ -72,6 +74,10 @@ class GenerateBody(BaseModel):
 
 class CopyBody(BaseModel):
     rule_name: str
+
+
+class ProfileCollectionEnqueueBody(BaseModel):
+    telegram_username: str
 
 
 def _pool():
@@ -137,6 +143,8 @@ async def list_rules() -> dict:
 async def upsert_rule(body: RuleBody) -> dict:
     pool = _pool()
     if body.rule_type == "profile_collection":
+        body.config.setdefault("stale_channel_days", 60)
+        body.config.setdefault("pinned_followup_messages", 5)
         limits = {
             "recent_window": (1, 10),
             "max_scan_messages": (10, 100),
@@ -144,6 +152,8 @@ async def upsert_rule(body: RuleBody) -> dict:
             "max_videos": (0, 2),
             "intro_min_chars": (1, 500),
             "intro_min_lines": (1, 30),
+            "stale_channel_days": (1, 180),
+            "pinned_followup_messages": (1, 5),
         }
         for key, (minimum, maximum) in limits.items():
             value = body.config.get(key)
@@ -229,6 +239,29 @@ async def profile_collection_results(rule_id: int, limit: int = 50) -> dict:
             "ocr_pending": row["ocr_pending"], "ocr_review": row["ocr_review"],
         } for row in rows
     ]}
+
+
+@router.post("/{rule_id}/profile-collection/enqueue")
+async def enqueue_profile_collection(rule_id: int, body: ProfileCollectionEnqueueBody) -> dict:
+    raw = body.telegram_username.strip()
+    match = re.fullmatch(
+        r"(?:https?://)?(?:www\.)?t\.me/([A-Za-z0-9_]{5,32})/?|@?([A-Za-z0-9_]{5,32})",
+        raw, re.IGNORECASE,
+    )
+    if not match:
+        raise HTTPException(status_code=422, detail="请输入 Telegram 用户名（@username 或 t.me/username）")
+    username = (match.group(1) or match.group(2)).lower()
+    rows = await _pool().fetch(SQL_PROFILE_COLLECTION_ENQUEUE, rule_id, username)
+    if not rows:
+        raise HTTPException(status_code=409, detail="该规则没有已启用并绑定的采集来源/账号")
+    row = rows[0]
+    return {"job_id": row["job_id"], "username": username, "status": row["status"]}
+
+
+@router.post("/{rule_id}/profile-collection/requeue-ineffective")
+async def requeue_ineffective_profile_collection(rule_id: int) -> dict:
+    rows = await _pool().fetch(SQL_PROFILE_COLLECTION_REQUEUE, rule_id)
+    return {"requeued": rows[0]["requeued"] if rows else 0}
 
 
 @router.post("/{rule_id}/unbind")
