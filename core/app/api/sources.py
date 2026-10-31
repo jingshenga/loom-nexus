@@ -108,6 +108,39 @@ class ActiveBody(BaseModel):
     is_active: bool
 
 
+class PrimaryAccountBody(BaseModel):
+    account_id: int
+
+
+@router.put("/{source_id}/primary-account")
+async def set_primary_account(source_id: int, body: PrimaryAccountBody) -> dict:
+    pool = _pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            source = await conn.fetchrow(SQL_SOURCE_OF, source_id)
+            if not source:
+                raise HTTPException(status_code=404, detail="source not found")
+            account = await conn.fetchrow(
+                "SELECT id FROM bridge_accounts WHERE id = $1::bigint AND status = 'active'",
+                body.account_id,
+            )
+            if not account:
+                raise HTTPException(status_code=409, detail="primary account must be active")
+            visible = await conn.fetch(
+                SQL_VISIBLE_DIALOG_ACCOUNTS, source["peer_id"], [body.account_id],
+            )
+            if not visible:
+                raise HTTPException(
+                    status_code=409,
+                    detail="primary account must first be confirmed in the source dialog list",
+                )
+            assigned = await conn.fetch(SQL_ASSIGN, source_id, body.account_id)
+            if not assigned or not assigned[0]["ok"]:
+                raise HTTPException(status_code=404, detail="source not found")
+            await conn.execute(SQL_BACKUP_REMOVE_PRIMARY, source_id, body.account_id)
+    return {"ok": True, "account_id": body.account_id}
+
+
 class BackupAccountsBody(BaseModel):
     account_ids: list[int]
 

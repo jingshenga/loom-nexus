@@ -8,6 +8,7 @@ const sources = ref([]);
 const dialogs = ref([]);
 const flash = ref("");
 const backupSelections = ref({});
+const primarySelections = ref({});
 
 function notify(msg) {
   flash.value = msg;
@@ -20,6 +21,9 @@ async function loadAll() {
   backupSelections.value = Object.fromEntries(
     sources.value.map((s) => [s.id, (s.backup_accounts || []).map((a) => String(a.id))]),
   );
+  primarySelections.value = Object.fromEntries(
+    sources.value.map((s) => [s.id, String(s.account_id || "")]),
+  );
   dialogs.value = (await api("/api/admin/sources/dialogs")).items;
 }
 
@@ -29,6 +33,11 @@ const backupCandidates = (s) => {
   const selected = new Set(backupSelections.value[s.id] || []);
   return data.value.accounts.filter((a) => a.id !== s.account_id
     && (visible.has(String(a.id)) || selected.has(String(a.id))));
+};
+const primaryCandidates = (s) => {
+  const visible = new Set(dialogs.value.filter((d) => d.peer_id === s.peer_id).map((d) => String(d.account_id)));
+  return data.value.accounts.filter((a) => a.status === "active"
+    && (visible.has(String(a.id)) || String(a.id) === String(s.account_id)));
 };
 
 async function bindDialog(d) {
@@ -70,6 +79,21 @@ async function saveBackupAccounts(s) {
     await loadAll();
   } catch (e) {
     notify(`保存失败: ${String(e.message).slice(0, 60)}`);
+  }
+}
+
+async function savePrimaryAccount(s) {
+  try {
+    const accountId = Number(primarySelections.value[s.id]);
+    await api(`/api/admin/sources/${s.id}/primary-account`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ account_id: accountId }),
+    });
+    notify(`已更新 ${s.title || `来源#${s.id}`} 的主账号`);
+    await loadAll();
+  } catch (e) {
+    notify(`主账号保存失败: ${String(e.message).slice(0, 60)}`);
   }
 }
 
@@ -191,6 +215,18 @@ onMounted(loadAll);
                     · 已采集 {{ s.raw_count }} 条 · 游标 {{ s.last_msg_id }}
                   </div>
                   <div class="mt-2 flex flex-wrap items-center gap-2">
+                    <span class="text-xs text-slate-500">主账号</span>
+                    <select v-model="primarySelections[s.id]"
+                      class="rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-300">
+                      <option v-for="a in primaryCandidates(s)" :key="a.id" :value="String(a.id)">
+                        {{ a.display_name || a.username || `账号#${a.id}` }} · {{ a.status }}
+                      </option>
+                    </select>
+                    <button v-if="String(primarySelections[s.id]) !== String(s.account_id)"
+                      @click="savePrimaryAccount(s)"
+                      class="rounded border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800">保存主账号</button>
+                  </div>
+                  <div class="mt-2 flex flex-wrap items-center gap-2">
                     <span class="text-xs text-slate-500">备用账号</span>
                     <label v-for="a in backupCandidates(s)" :key="a.id"
                       class="flex items-center gap-1 text-xs text-slate-400">
@@ -218,7 +254,7 @@ onMounted(loadAll);
           </table>
         </div>
       </div>
-      <p class="mt-2 text-xs text-slate-600">备用账号仅在主账号断连或未授权时按顺序接管来源；Telegram 返回 FloodWait 时会等待其指定时长，不会切换账号继续同一受限请求。</p>
+      <p class="mt-2 text-xs text-slate-600">来源监听在主账号断连或未授权时按备用顺序接管；资料深采 V2 会在该来源的主、备用账号中轮询已授权且未冷却的账号。触发 FloodWait 的任务保留冷却，其他独立任务继续分给可用账号。聊天会话按账号负载分配，建立后固定账号。</p>
     </div>
   </div>
 </template>
