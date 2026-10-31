@@ -1,6 +1,7 @@
 """Admin review workbench APIs (token-protected)."""
 import base64
 import binascii
+import io
 import json
 import re
 import uuid
@@ -49,15 +50,48 @@ def _decode(value, fallback):
         return fallback
 
 
+def _save_uploaded_photo(image_data: str, image_mime: str) -> dict:
+    if len(image_data) > 14_000_000 or image_mime not in {"image/jpeg", "image/png", "image/webp"}:
+        raise HTTPException(status_code=400, detail="image must be JPEG, PNG or WebP under 10 MB")
+    try:
+        raw = base64.b64decode(image_data, validate=True)
+        if len(raw) > 10 * 1024 * 1024:
+            raise ValueError("image too large")
+        image = Image.open(io.BytesIO(raw))
+        if image.width * image.height > 40_000_000:
+            raise ValueError("image dimensions are too large")
+        image.verify()
+        formats = {"image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP"}
+        if image.format != formats[image_mime]:
+            raise ValueError("image type does not match content")
+    except (ValueError, binascii.Error, OSError, Image.DecompressionBombError) as exc:
+        raise HTTPException(status_code=400, detail="invalid image") from exc
+    target_dir = Path(get_settings().media_dir) / "manual"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    extension = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}[image_mime]
+    filename = f"admin_{uuid.uuid4().hex}{extension}"
+    (target_dir / filename).write_bytes(raw)
+    return {
+        "kind": "photo", "path": f"manual/{filename}", "visibility": "admin",
+        "visibility_override": True,
+    }
+
+
 @router.get("/queue")
 async def queue(
     status: str = "pending", limit: int = 30, offset: int = 0,
-    nickname: str = None,
+    nickname: str = None, source: str = None, media: str = None,
+    sort: Literal["newest", "oldest"] = "newest",
 ) -> dict:
     pool = db.get_pool()
     if pool is None:
         raise HTTPException(status_code=503, detail="database unavailable")
-    rows = await pool.fetch(SQL_QUEUE, status, limit, offset, nickname or None)
+    if media not in {None, "photo", "video"}:
+        raise HTTPException(status_code=400, detail="invalid media filter")
+    rows = await pool.fetch(
+        SQL_QUEUE, status, limit, offset, nickname or None,
+        source or None, media, sort,
+    )
     items = []
     for r in rows:
         items.append({
@@ -359,6 +393,7 @@ class ManualDutyListing(BaseModel):
     description: str = ""
     source_url: str = ""
     bot_url: str = ""
+    media: list[dict] | None = None
     image_data: str = ""
     image_mime: str = ""
 
@@ -377,32 +412,10 @@ async def create_manual_duty_card(job_id: int, body: ManualDutyListing) -> dict:
         raise HTTPException(status_code=404, detail="recovery job not found")
     if recovery["status"] not in {"not_found", "failed"}:
         raise HTTPException(status_code=409, detail="this recovery item has already been resolved")
-    media = []
+    media = [_save_uploaded_photo(item.get("image_data", ""), item.get("image_mime", ""))
+             for item in (body.media or []) if item.get("image_data")]
     if body.image_data:
-        if len(body.image_data) > 14_000_000 or body.image_mime not in {"image/jpeg", "image/png", "image/webp"}:
-            raise HTTPException(status_code=400, detail="image must be JPEG, PNG or WebP under 10 MB")
-        try:
-            import io
-
-            raw = base64.b64decode(body.image_data, validate=True)
-            if len(raw) > 10 * 1024 * 1024:
-                raise ValueError("image too large")
-            image = Image.open(io.BytesIO(raw))
-            if image.width * image.height > 40_000_000:
-                raise ValueError("image dimensions are too large")
-            image.verify()
-            formats = {"image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP"}
-            if image.format != formats[body.image_mime]:
-                raise ValueError("image type does not match content")
-        except (ValueError, binascii.Error, OSError, Image.DecompressionBombError) as exc:
-            raise HTTPException(status_code=400, detail="invalid image") from exc
-        media_dir = Path(get_settings().media_dir)
-        target_dir = media_dir / "manual"
-        target_dir.mkdir(parents=True, exist_ok=True)
-        extension = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}[body.image_mime]
-        filename = f"duty_{job_id}_{uuid.uuid4().hex}{extension}"
-        (target_dir / filename).write_bytes(raw)
-        media = [{"kind": "photo", "path": f"manual/{filename}"}]
+        media.append(_save_uploaded_photo(body.image_data, body.image_mime))
 
     source_url = body.source_url.strip()
     bot_url = body.bot_url.strip() or recovery["bot_url"] or ""
@@ -476,16 +489,22 @@ async def edit_content(
                 raise HTTPException(status_code=404, detail="listing not found")
             old_media = _decode(row["media_json"], [])
             old_by_path = {entry.get("path"): entry for entry in old_media}
-            paths = [entry.get("path") for entry in body.media]
-            if (len(paths) != len(old_media) or len(set(paths)) != len(paths)
-                    or set(paths) != set(old_by_path)):
-                raise HTTPException(status_code=400, detail="media items cannot be added or removed here")
+            paths = [entry.get("path") for entry in body.media if entry.get("path")]
+            if len(set(paths)) != len(paths) or any(path not in old_by_path for path in paths):
+                raise HTTPException(status_code=400, detail="invalid media path")
 
             updated_media = []
             for index, submitted in enumerate(body.media):
-                entry = dict(old_by_path[submitted["path"]])
+                if submitted.get("path") in old_by_path:
+                    entry = dict(old_by_path[submitted["path"]])
+                elif submitted.get("image_data"):
+                    entry = _save_uploaded_photo(
+                        submitted.get("image_data", ""), submitted.get("image_mime", ""),
+                    )
+                else:
+                    raise HTTPException(status_code=400, detail="new media must be an uploaded image")
                 if entry.get("kind") == "photo":
-                    visibility = submitted.get("visibility", entry.get("visibility"))
+                    visibility = submitted.get("visibility", entry.get("visibility", "admin"))
                     if visibility not in {"public", "admin", "pending"}:
                         raise HTTPException(status_code=400, detail="invalid media visibility")
                     entry["visibility"] = visibility

@@ -1,27 +1,35 @@
 <script setup>
 import AdminTabs from "../components/AdminTabs.vue";
-import { onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { CheckCircle2, XCircle, Save, Inbox, ArchiveRestore, Trash2 } from "lucide-vue-next";
-import { api } from "../api/client";
-import MediaGallery from "../components/MediaGallery.vue";
+import { api, mediaUrl } from "../api/client";
+import AdminMediaGrid from "../components/AdminMediaGrid.vue";
 
 const queue = ref([]);
 const duplicatePairs = ref([]);
 const selectedDuplicate = ref(null);
 const duplicateSaving = ref(false);
+const duplicateMediaSaving = ref(false);
+const duplicateOrderIds = ref(new Set());
 const current = ref(null);
 const form = ref({ nickname: "", district: "", price_amount: null, price_currency: "", description: "" });
+const mediaManualOrder = ref(false);
+const createdManualCardId = ref(null);
 const flash = ref("");
 const statusTab = ref("pending");
 const selectedIds = ref([]);
 const nicknameFilter = ref("");
 const appliedNickname = ref("");
+const sourceFilter = ref("");
+const appliedSource = ref("");
+const mediaFilter = ref("");
+const sortOrder = ref("newest");
 const recollectStatus = ref("");
 const activeWorkbench = ref("review");
 const dutyRecovery = ref([]);
 const selectedRecovery = ref(null);
 const recoveryForm = ref({ contact_peer_id: "", profile_url: "", channel_url: "", bot_url: "" });
-const manualForm = ref({ nickname: "", district: "", price_amount: "", price_currency: "CNY", description: "", source_url: "", image_data: "", image_mime: "" });
+const manualForm = ref({ nickname: "", district: "", price_amount: "", price_currency: "CNY", description: "", source_url: "", media: [] });
 let timer = null;
 let recollectTimer = null;
 let recollectJobIds = [];
@@ -47,6 +55,7 @@ function toggleSelectAll() {
 
 async function batchRemove() {
   if (!selectedIds.value.length) return;
+  if (!window.confirm(`删除选中的 ${selectedIds.value.length} 张卡片？原始 Telegram 消息会保留。`)) return;
   await removeCards(selectedIds.value);
 }
 
@@ -70,27 +79,28 @@ async function deleteCurrent() {
 
 function select(item) {
   current.value = item;
+  mediaManualOrder.value = (item.media || []).some((media) => Number.isInteger(media.manual_order));
   form.value = {
     nickname: item.nickname || "",
     district: item.district || "",
     price_amount: item.price_amount,
     price_currency: item.price_currency || "",
     description: item.description || "",
+    media: JSON.parse(JSON.stringify(item.media || [])),
   };
-}
-
-function onMediaRotated(media) {
-  if (current.value) current.value.media = media;
-  notify("照片已旋转，正在重新计算人脸焦点");
 }
 
 async function loadQueue() {
   const params = new URLSearchParams({ status: statusTab.value });
   if (appliedNickname.value) params.set("nickname", appliedNickname.value);
+  if (appliedSource.value) params.set("source", appliedSource.value);
+  if (mediaFilter.value) params.set("media", mediaFilter.value);
+  params.set("sort", sortOrder.value);
   const data = await api(`/api/admin/review/queue?${params}`);
   queue.value = data.items;
-  if (!data.items.some((x) => x.id === (current.value && current.value.id))) {
-    select(data.items[0] || null);
+  if (current.value) {
+    const refreshed = data.items.find((x) => x.id === current.value.id);
+    current.value = refreshed || null;
   }
 }
 
@@ -131,6 +141,37 @@ async function decideDuplicate(decision) {
   }
 }
 
+function markDuplicateOrder(card) {
+  duplicateOrderIds.value = new Set([...duplicateOrderIds.value, card.id]);
+}
+
+async function saveDuplicateMedia(card) {
+  if (duplicateMediaSaving.value) return;
+  duplicateMediaSaving.value = true;
+  try {
+    await api(`/api/admin/review/${card.id}/content`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        nickname: card.nickname || "", district: card.district || "",
+        price_amount: card.price_amount, price_currency: card.price_currency || "",
+        description: card.description || "", manual_order: duplicateOrderIds.value.has(card.id),
+        media: (card.media || []).map((media) => ({
+          path: media.path, visibility: media.visibility,
+          visibility_override: media.visibility_override === true,
+          image_data: media.image_data, image_mime: media.image_mime,
+        })),
+      }),
+    });
+    notify(`卡片 #${card.id} 的图片已保存`);
+    duplicateOrderIds.value = new Set([...duplicateOrderIds.value].filter((id) => id !== card.id));
+    await loadDuplicatePairs();
+  } catch (e) {
+    notify(`图片保存失败：${e.message}`);
+  } finally {
+    duplicateMediaSaving.value = false;
+  }
+}
+
 async function loadDutyRecovery() {
   const data = await api("/api/admin/review/duty-recovery");
   dutyRecovery.value = data.items;
@@ -143,6 +184,7 @@ async function loadDutyRecovery() {
 }
 
 function selectRecovery(item) {
+  const changed = item?.id !== selectedRecovery.value?.id;
   selectedRecovery.value = item;
   recoveryForm.value = item ? {
     contact_peer_id: item.contact_peer_id || "",
@@ -151,10 +193,11 @@ function selectRecovery(item) {
     bot_url: item.bot_url || "",
   } : { contact_peer_id: "", profile_url: "", channel_url: "", bot_url: "" };
   manualForm.value = {
-    ...manualForm.value,
+    ...(changed ? { nickname: "", district: "", price_amount: "", price_currency: "CNY", description: "", source_url: "", media: [] } : manualForm.value),
     contact_username: item?.contact_username || "",
     bot_url: item?.bot_url || "",
   };
+  if (changed) createdManualCardId.value = null;
 }
 
 async function saveRecoveryLinks() {
@@ -181,24 +224,6 @@ async function scanRecovery(target) {
   }
 }
 
-async function chooseRecoveryImage(event) {
-  const file = event.target.files?.[0];
-  if (!file) return;
-  if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || file.size > 10 * 1024 * 1024) {
-    notify("请选择 10 MB 以内的 JPEG、PNG 或 WebP 图片");
-    event.target.value = "";
-    return;
-  }
-  const dataUrl = await new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
-  manualForm.value.image_data = String(dataUrl).split(",", 2)[1];
-  manualForm.value.image_mime = file.type;
-}
-
 async function createManualDutyCard() {
   if (!selectedRecovery.value) return;
   const body = { ...manualForm.value, contact_peer_id: recoveryForm.value.contact_peer_id || null,
@@ -208,15 +233,37 @@ async function createManualDutyCard() {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   });
   notify(`已创建待审核卡片 #${result.id}`);
-  manualForm.value = { nickname: "", district: "", price_amount: "", price_currency: "CNY", description: "", source_url: "", image_data: "", image_mime: "", contact_username: selectedRecovery.value.contact_username, bot_url: recoveryForm.value.bot_url || "" };
+  createdManualCardId.value = result.id;
+  manualForm.value = { nickname: "", district: "", price_amount: "", price_currency: "CNY", description: "", source_url: "", media: [], contact_username: selectedRecovery.value.contact_username, bot_url: recoveryForm.value.bot_url || "" };
   await loadQueue();
   await loadDutyRecovery();
 }
 
 async function applyNicknameFilter() {
   appliedNickname.value = nicknameFilter.value.trim();
+  appliedSource.value = sourceFilter.value.trim();
   selectedIds.value = [];
   await loadQueue();
+}
+
+async function applyMediaFilters() {
+  selectedIds.value = [];
+  await loadQueue();
+}
+
+async function batchPublish() {
+  if (!selectedIds.value.length || statusTab.value !== "pending") return;
+  if (!window.confirm(`将选中的 ${selectedIds.value.length} 张卡片上架到广场？`)) return;
+  const ids = [...selectedIds.value];
+  try {
+    await Promise.all(ids.map((id) => api(`/api/admin/review/${id}/publish`, { method: "POST" })));
+    notify(`已上架 ${ids.length} 张卡片`);
+    selectedIds.value = [];
+    await loadQueue();
+  } catch (e) {
+    notify(`批量上架未全部完成：${e.message}`);
+    await loadQueue();
+  }
 }
 
 async function pollRecollect() {
@@ -274,12 +321,23 @@ async function saveEdits() {
   if (!current.value) return;
   const body = { ...form.value };
   if (body.price_amount === "") body.price_amount = null;
-  await api(`/api/admin/review/${current.value.id}`, {
+  await api(`/api/admin/review/${current.value.id}/content`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      ...body,
+      manual_order: mediaManualOrder.value,
+      media: body.media.map((media) => ({
+        path: media.path,
+        visibility: media.visibility,
+        visibility_override: media.visibility_override === true,
+        image_data: media.image_data,
+        image_mime: media.image_mime,
+      })),
+    }),
   });
-  notify("字段已保存");
+  notify("卡片与图片修改已保存");
+  await loadQueue();
 }
 
 async function decide(action, target) {
@@ -300,6 +358,33 @@ async function decide(action, target) {
 function onKey(e) {
   if ((e.ctrlKey || e.metaKey) && e.key === "Enter") decide("publish");
 }
+
+const filteredDuplicatePairs = computed(() => duplicatePairs.value
+  .filter((pair) => {
+    const cards = [pair.left, pair.right];
+    if (appliedNickname.value && !cards.some((card) => (card.nickname || "").toLowerCase().includes(appliedNickname.value.toLowerCase()))) return false;
+    if (appliedSource.value && !cards.some((card) => (card.source_title || "").toLowerCase().includes(appliedSource.value.toLowerCase()))) return false;
+    if (mediaFilter.value && !cards.some((card) => (card.media || []).some((entry) => entry.kind === mediaFilter.value))) return false;
+    return true;
+  })
+  .sort((a, b) => {
+    const aDate = new Date(newestCard(a).collected_at).getTime();
+    const bDate = new Date(newestCard(b).collected_at).getTime();
+    return sortOrder.value === "oldest" ? aDate - bDate : bDate - aDate;
+  }));
+
+const filteredDutyRecovery = computed(() => dutyRecovery.value
+  .filter((item) => {
+    const name = `${item.profile_name || ""} ${item.contact_username || ""}`.toLowerCase();
+    if (appliedNickname.value && !name.includes(appliedNickname.value.toLowerCase())) return false;
+    if (appliedSource.value && !(item.source_title || "").toLowerCase().includes(appliedSource.value.toLowerCase())) return false;
+    return true;
+  })
+  .sort((a, b) => {
+    const aDate = new Date(a.created_at || 0).getTime();
+    const bDate = new Date(b.created_at || 0).getTime();
+    return sortOrder.value === "oldest" ? aDate - bDate : bDate - aDate;
+  }));
 
 onMounted(async () => {
   await loadQueue();
@@ -333,15 +418,28 @@ onUnmounted(() => {
       <button @click="activeWorkbench = 'duty'" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'duty' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">签到补采（{{ dutyRecovery.length }}）</button>
     </div>
 
+    <div v-if="activeWorkbench !== 'review'" class="flex flex-wrap items-center gap-2 rounded-lg border border-slate-800 bg-slate-900/60 p-2">
+      <input v-model="nicknameFilter" placeholder="按昵称筛选" class="min-w-28 rounded-lg border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm" />
+      <input v-model="sourceFilter" placeholder="按来源筛选" class="min-w-28 rounded-lg border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm" />
+      <select v-if="activeWorkbench === 'duplicates'" v-model="mediaFilter" class="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm">
+        <option value="">全部媒体</option><option value="photo">有图片</option><option value="video">有视频</option>
+      </select>
+      <select v-model="sortOrder" class="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm">
+        <option value="newest">最新优先</option><option value="oldest">最早优先</option>
+      </select>
+      <button @click="applyNicknameFilter" class="rounded-lg border border-slate-700 px-3 py-1.5 text-xs text-slate-300">筛选</button>
+      <button @click="nicknameFilter = ''; sourceFilter = ''; appliedNickname = ''; appliedSource = ''; mediaFilter = ''; applyMediaFilters()" class="rounded-lg px-2 py-1.5 text-xs text-slate-500">清除</button>
+    </div>
+
     <section v-if="activeWorkbench === 'duty'" class="grid gap-4 lg:grid-cols-12">
       <aside class="max-h-56 space-y-2 overflow-y-auto lg:col-span-4 lg:max-h-[calc(100dvh-210px)]">
-        <button v-for="item in dutyRecovery" :key="item.id" @click="selectRecovery(item)" class="w-full rounded-lg border p-3 text-left" :class="selectedRecovery?.id === item.id ? 'border-sky-500 bg-sky-600/10' : 'border-slate-800 bg-slate-900'">
+        <button v-for="item in filteredDutyRecovery" :key="item.id" @click="selectRecovery(item)" class="w-full rounded-lg border p-3 text-left" :class="selectedRecovery?.id === item.id ? 'border-sky-500 bg-sky-600/10' : 'border-slate-800 bg-slate-900'">
           <div class="font-medium">{{ item.profile_name || `@${item.contact_username}` }}</div>
           <div v-if="item.profile_name" class="text-xs text-slate-400">@{{ item.contact_username }}</div>
           <div class="mt-1 text-xs text-slate-400">{{ item.source_title || '来源群组' }} · {{ item.duty_date }} · {{ item.status === 'deferred' ? 'Telegram 冷却，自动重试' : item.status }}</div>
           <div v-if="item.error" class="mt-1 line-clamp-2 text-xs text-amber-300">{{ item.error }}</div>
         </button>
-        <div v-if="!dutyRecovery.length" class="py-10 text-center text-sm text-slate-500">暂无未找到或失败的签到账号</div>
+        <div v-if="!filteredDutyRecovery.length" class="py-10 text-center text-sm text-slate-500">暂无符合筛选条件的签到账号</div>
       </aside>
       <div v-if="selectedRecovery" class="space-y-4 rounded-xl border border-slate-800 bg-slate-900/50 p-4 lg:col-span-8">
         <div>
@@ -390,9 +488,13 @@ onUnmounted(() => {
             <input v-model="manualForm.price_currency" placeholder="币种" class="rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm" />
             <input v-model="manualForm.source_url" placeholder="Telegram 消息/来源链接" class="rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm sm:col-span-2" />
             <textarea v-model="manualForm.description" rows="3" placeholder="文字介绍" class="rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm sm:col-span-2" />
-            <input type="file" accept="image/jpeg,image/png,image/webp" @change="chooseRecoveryImage" class="text-sm text-slate-400 sm:col-span-2" />
+            <div class="sm:col-span-2">
+              <p class="mb-2 text-xs text-slate-400">补录图片（新增后默认仅管理员可见）</p>
+              <AdminMediaGrid v-model:media="manualForm.media" editable />
+            </div>
           </div>
           <button @click="createManualDutyCard" class="mt-3 rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium hover:bg-sky-500">创建待审核卡片</button>
+          <RouterLink v-if="createdManualCardId" :to="`/explore/${createdManualCardId}`" class="ml-3 text-sm text-sky-300 hover:text-sky-200">打开卡片图片审核 ↗</RouterLink>
           </div>
         </details>
         </template>
@@ -415,19 +517,30 @@ onUnmounted(() => {
         <input v-model="nicknameFilter" @keyup.enter="applyNicknameFilter"
           placeholder="按昵称筛选"
           class="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm sm:w-36 sm:flex-none" />
+        <input v-model="sourceFilter" @keyup.enter="applyNicknameFilter"
+          placeholder="按来源筛选"
+          class="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm sm:w-36 sm:flex-none" />
         <button @click="applyNicknameFilter"
           class="rounded-lg border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800">筛选</button>
-        <button v-if="appliedNickname" @click="nicknameFilter = ''; applyNicknameFilter()"
-          class="rounded-lg px-2 py-1 text-xs text-slate-500 hover:text-slate-300">清除</button>
       </div>
+      <select v-model="mediaFilter" @change="applyMediaFilters" class="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm">
+        <option value="">全部媒体</option><option value="photo">有图片</option><option value="video">有视频</option>
+      </select>
+      <select v-model="sortOrder" @change="applyMediaFilters" class="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm">
+        <option value="newest">最新优先</option><option value="oldest">最早优先</option>
+      </select>
+      <button v-if="appliedNickname || appliedSource || mediaFilter" @click="nicknameFilter = ''; sourceFilter = ''; appliedNickname = ''; appliedSource = ''; mediaFilter = ''; applyMediaFilters()"
+        class="rounded-lg px-2 py-1 text-xs text-slate-500 hover:text-slate-300">清除筛选</button>
       <label class="flex items-center gap-1.5 text-xs text-slate-400">
         <input type="checkbox" :checked="allSelected()" @change="toggleSelectAll" class="size-4 accent-sky-500" />
-        全选
+        本页全选
       </label>
       <button v-if="selectedIds.length" @click="batchRemove"
         class="flex items-center gap-1 rounded-lg border border-rose-700/60 px-3 py-1 text-xs text-rose-300 hover:bg-rose-900/30">
         <Trash2 class="size-3.5" />批量删除（{{ selectedIds.length }}）
       </button>
+      <button v-if="selectedIds.length && statusTab === 'pending'" @click="batchPublish"
+        class="rounded-lg border border-emerald-700/60 px-3 py-1 text-xs text-emerald-300 hover:bg-emerald-900/30">批量上架（{{ selectedIds.length }}）</button>
       <button v-if="selectedIds.length" @click="recollectSelected"
         :disabled="selectedIds.length > 20 || recollectJobIds.length > 0"
         class="rounded-lg border border-sky-700/60 px-3 py-1 text-xs text-sky-300 hover:bg-sky-900/30 disabled:opacity-40">
@@ -440,51 +553,38 @@ onUnmounted(() => {
 
     <div class="grid grid-cols-1 gap-4 lg:h-[calc(100dvh-190px)] lg:grid-cols-12">
       <!-- left: queue -->
-      <aside class="lg:col-span-4 lg:overflow-y-auto lg:pr-1 space-y-2 max-h-48 overflow-y-auto lg:max-h-none">
-        <button
-          v-for="item in queue" :key="item.id" @click="select(item)"
-          class="w-full rounded-lg border p-3 text-left text-sm"
-          :class="current && current.id === item.id
-            ? 'border-sky-500 bg-sky-600/10'
-            : 'border-slate-800 bg-slate-900 hover:border-slate-600'"
-        >
-          <div class="flex items-center justify-between gap-2">
-            <span class="flex min-w-0 items-center gap-2">
-              <input type="checkbox" :checked="isSelected(item.id)"
-                @click.stop="toggleSelect(item.id)" class="size-4 shrink-0 accent-sky-500" />
-              <span class="truncate font-medium">{{ item.nickname || `#${item.id}` }}</span>
-            </span>
-            <span class="shrink-0 text-sky-400">{{ item.price_amount ?? "?" }}</span>
-          </div>
-          <div class="mt-1 flex items-center gap-2 text-xs text-slate-500">
-            <span v-if="item.district" class="rounded bg-slate-800 px-1.5 py-0.5">{{ item.district }}</span>
-            <span v-if="item.contact_username">@{{ item.contact_username }}</span>
-          </div>
-          <div class="mt-1 text-[11px] text-slate-500">采集于 {{ new Date(item.created_at).toLocaleString('zh-CN') }}</div>
-          <!-- 手机快捷审批：卡片上直接上架/驳回 -->
-          <div v-if="statusTab === 'pending'" class="mt-2 flex gap-2 lg:hidden">
-            <button @click.stop="decide('publish', item)"
-              class="flex flex-1 items-center justify-center gap-1 rounded-lg border border-emerald-600/40 bg-emerald-600/10 py-1.5 text-xs text-emerald-300">
-              <CheckCircle2 class="size-3.5" />上架
-            </button>
-            <button @click.stop="decide('reject', item)"
-              class="flex flex-1 items-center justify-center gap-1 rounded-lg border border-rose-600/40 bg-rose-600/10 py-1.5 text-xs text-rose-300">
-              <XCircle class="size-3.5" />驳回
-            </button>
-          </div>
-        </button>
-        <div v-if="!queue.length" class="flex flex-col items-center gap-2 py-16 text-slate-600">
+      <div class="grid grid-cols-3 gap-2 sm:grid-cols-4 lg:col-span-12 lg:grid-cols-6 2xl:grid-cols-8">
+        <article v-for="item in queue" :key="item.id" class="relative min-w-0 overflow-hidden rounded-lg border border-slate-800 bg-slate-900 hover:border-slate-600">
+          <button @click="select(item)" class="block w-full text-left">
+            <div class="relative aspect-[3/4] bg-black">
+              <img v-if="item.media?.length" :src="mediaUrl(item.media.find((m) => m.kind === 'photo')?.path || item.media[0].poster || item.media[0].path)" class="size-full object-contain" loading="lazy" />
+              <span v-else class="flex size-full items-center justify-center text-xs text-slate-600">无图片</span>
+            </div>
+            <div class="space-y-1 p-2">
+              <div class="truncate text-xs font-medium">{{ item.nickname || `#${item.id}` }}</div>
+              <div class="truncate text-[10px] text-slate-400">{{ item.source_title || '来源未知' }}</div>
+              <div class="truncate text-[10px] text-slate-500">{{ new Date(item.created_at).toLocaleString('zh-CN') }}</div>
+            </div>
+          </button>
+          <input type="checkbox" :checked="isSelected(item.id)" @change="toggleSelect(item.id)"
+            class="absolute left-2 top-2 size-5 cursor-pointer accent-sky-500" :aria-label="`选择 ${item.nickname || item.id}`" />
+          <button v-if="statusTab === 'pending'" @click="decide('publish', item)"
+            class="absolute bottom-14 right-2 rounded bg-emerald-600/90 px-2 py-1 text-[10px] text-white">上架</button>
+        </article>
+        <div v-if="!queue.length" class="col-span-full flex flex-col items-center gap-2 py-16 text-slate-600">
           <Inbox class="size-8" />队列已清空
         </div>
-      </aside>
+      </div>
 
-      <section v-if="current" class="flex flex-col gap-3 overflow-y-auto rounded-xl border border-slate-800 bg-slate-900/50 p-4 lg:col-span-8">
+      <div v-if="current" class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-2 sm:p-5" @click.self="current = null">
+      <section class="flex max-h-[96dvh] w-full max-w-6xl flex-col gap-3 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950 p-4 shadow-2xl">
+        <button @click="current = null" class="ml-auto rounded border border-slate-700 px-2 py-1 text-xs text-slate-400">关闭</button>
         <div class="flex flex-wrap items-start justify-between gap-2">
           <div><h3 class="font-semibold">{{ current.nickname || `卡片 #${current.id}` }}</h3><p class="mt-1 text-xs text-slate-400">{{ current.source_title || "未知来源" }}<span v-if="current.contact_username"> · @{{ current.contact_username }}</span></p></div>
           <div class="text-right text-xs"><div class="text-sky-300">采集于 {{ new Date(current.created_at).toLocaleString('zh-CN') }}</div><div v-if="current.source_posted_at" class="mt-1 text-slate-500">原消息 {{ new Date(current.source_posted_at).toLocaleString('zh-CN') }}</div></div>
         </div>
         <div class="flex flex-wrap gap-2 text-sm text-slate-300"><span v-if="current.district" class="rounded bg-slate-800 px-2 py-1">{{ current.district }}</span><span class="rounded bg-slate-800 px-2 py-1">{{ current.price_amount ?? "价格待核" }} {{ current.price_currency || "" }}</span><span v-if="current.contact_peer_id" class="rounded bg-slate-800 px-2 py-1">TG ID {{ current.contact_peer_id }}</span></div>
-        <MediaGallery :media="current.media" :admin-listing-id="current.id" @rotated="onMediaRotated" />
+        <AdminMediaGrid v-model:media="form.media" editable @order-change="mediaManualOrder = true" />
         <details class="rounded-lg border border-slate-800 bg-slate-950/60 p-3"><summary class="cursor-pointer text-sm text-slate-300">查看原始消息</summary><p class="mt-3 whitespace-pre-wrap text-sm leading-relaxed text-slate-400">{{ current.source_text || "（无正文）" }}</p></details>
         <details class="rounded-lg border border-slate-800 bg-slate-950/60 p-3"><summary class="cursor-pointer text-sm text-slate-300">修订卡片字段</summary>
           <div class="mt-3 flex flex-wrap gap-1.5"><span v-for="(ev, field) in current.evidence" :key="field" class="rounded px-2 py-0.5 text-xs" :class="ev.src === 'ocr' ? 'bg-amber-600/20 text-amber-300' : 'bg-slate-800 text-slate-400'">{{ field }} · {{ ev.src }}</span></div>
@@ -496,18 +596,18 @@ onUnmounted(() => {
           <button v-else-if="statusTab === 'published'" @click="decide('withdraw')" class="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-amber-600/60 py-2 text-sm text-amber-300 hover:bg-amber-900/30"><ArchiveRestore class="size-4" />撤回下架</button><button @click="deleteCurrent" class="flex items-center justify-center gap-1.5 rounded-lg border border-rose-700/60 px-3 py-2 text-sm text-rose-300 hover:bg-rose-900/30"><Trash2 class="size-4" />删除</button>
         </div>
       </section>
-      <section v-else class="flex items-center justify-center rounded-xl border border-slate-800 text-slate-600 lg:col-span-8">选择左侧任务</section>
+      </div>
     </div>
     </template>
     <section v-else class="grid grid-cols-1 gap-4 lg:h-[calc(100dvh-190px)] lg:grid-cols-12">
       <aside class="max-h-48 space-y-2 overflow-y-auto lg:col-span-4 lg:max-h-none lg:pr-1">
-        <button v-for="pair in duplicatePairs" :key="`${pair.left.id}-${pair.right.id}`" @click="selectedDuplicate = pair"
+        <button v-for="pair in filteredDuplicatePairs" :key="`${pair.left.id}-${pair.right.id}`" @click="selectedDuplicate = pair"
           class="w-full rounded-lg border p-3 text-left" :class="selectedDuplicate?.left.id === pair.left.id && selectedDuplicate?.right.id === pair.right.id ? 'border-sky-500 bg-sky-600/10' : 'border-slate-800 bg-slate-900 hover:border-slate-600'">
           <div class="flex items-center justify-between gap-2"><span class="font-medium">{{ pair.left.nickname || pair.right.nickname || '疑似重复资料' }}</span><span class="rounded bg-amber-500/15 px-2 py-0.5 text-[11px] text-amber-300">待人工核对</span></div>
           <div class="mt-1 truncate text-xs text-slate-400">@{{ pair.left.contact_username || '未记录' }} / @{{ pair.right.contact_username || '未记录' }}</div>
           <div class="mt-1 text-xs text-sky-300">最新采集 {{ new Date(newestCard(pair).collected_at).toLocaleString('zh-CN') }}</div>
         </button>
-        <div v-if="!duplicatePairs.length" class="py-16 text-center text-sm text-slate-500">暂无待人工核对的疑似重复卡片</div>
+        <div v-if="!filteredDuplicatePairs.length" class="py-16 text-center text-sm text-slate-500">暂无符合筛选条件的疑似重复卡片</div>
       </aside>
       <section v-if="selectedDuplicate" class="space-y-4 overflow-y-auto rounded-xl border border-slate-800 bg-slate-900/50 p-4 lg:col-span-8">
         <div class="rounded-lg border border-amber-700/40 bg-amber-950/20 p-3 text-sm text-amber-200">非 TG 资料文本及关键字段相同。请核对两组图片和账号；系统只提供线索，不会自动合并。</div>
@@ -515,7 +615,9 @@ onUnmounted(() => {
           <article v-for="card in [selectedDuplicate.left, selectedDuplicate.right]" :key="card.id" class="min-w-0 space-y-3 rounded-lg border border-slate-800 bg-slate-950/50 p-3">
             <div class="flex flex-wrap items-start justify-between gap-2"><div><h3 class="font-semibold">{{ card.nickname }} · #{{ card.id }}</h3><p class="mt-1 text-xs text-slate-400">{{ card.source_title || '来源未知' }} · {{ card.status === 'published' ? '已发布' : '待审核' }}</p></div><span v-if="card.id === newestCard(selectedDuplicate).id" class="rounded bg-sky-500/15 px-2 py-1 text-xs text-sky-300">最新采集 · 优先建议</span></div>
             <div class="space-y-1 text-xs"><p class="text-sky-300">采集于 {{ new Date(card.collected_at).toLocaleString('zh-CN') }}</p><p class="text-slate-500">原消息 {{ card.posted_at ? new Date(card.posted_at).toLocaleString('zh-CN') : '时间未知' }}</p><p class="text-slate-300">TG：@{{ card.contact_username || '未记录' }}<span v-if="card.contact_peer_id"> · ID {{ card.contact_peer_id }}</span></p><p class="text-slate-400">{{ card.district || '位置未知' }} · {{ card.price_amount ?? '价格未知' }} {{ card.price_currency || '' }}</p></div>
-            <MediaGallery :media="card.media" :fixed-mobile-frame="true" />
+            <AdminMediaGrid v-model:media="card.media" editable @order-change="markDuplicateOrder(card)" />
+            <button @click="saveDuplicateMedia(card)" :disabled="duplicateMediaSaving" class="rounded-lg border border-emerald-800 px-3 py-1.5 text-xs text-emerald-300 disabled:opacity-50">保存图片修改</button>
+            <RouterLink :to="`/explore/${card.id}`" class="inline-block text-xs text-sky-300 hover:text-sky-200">编辑此卡片和图片 ↗</RouterLink>
             <details class="rounded border border-slate-800 p-2"><summary class="cursor-pointer text-xs text-slate-400">查看原始消息</summary><p class="mt-2 whitespace-pre-wrap text-xs leading-relaxed text-slate-500">{{ card.source_text || card.description || '（无正文）' }}</p></details>
           </article>
         </div>

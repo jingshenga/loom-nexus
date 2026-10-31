@@ -10,5 +10,12 @@ LEFT JOIN raw_messages rm ON rm.id = l.source_msg_id
 LEFT JOIN ingest_sources s ON s.id = rm.source_id
 WHERE l.status = $1::text
   AND ($4::text IS NULL OR l.nickname ILIKE '%' || $4::text || '%')
-ORDER BY l.id DESC
+  AND ($5::text IS NULL OR COALESCE(s.title, CASE WHEN l.duty_collection_job_id IS NOT NULL THEN 'Telegram 个人资料/关联频道' END, '') ILIKE '%' || $5::text || '%')
+  AND ($6::text IS NULL OR EXISTS (
+      SELECT 1 FROM jsonb_array_elements(COALESCE(l.media_json, '[]'::jsonb)) m
+      WHERE m->>'kind' = $6::text
+  ))
+ORDER BY CASE WHEN $7::text = 'oldest' THEN l.created_at END ASC,
+         CASE WHEN $7::text <> 'oldest' THEN l.created_at END DESC,
+         l.id DESC
 LIMIT GREATEST(1, $2::int) OFFSET GREATEST(0, $3::int);
