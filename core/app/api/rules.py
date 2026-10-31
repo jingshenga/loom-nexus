@@ -32,6 +32,7 @@ SQL_DUTY_STATUS = sqlres.load("duty_rule_status.sql")
 SQL_DUTY_COLLECTION_SOURCES = sqlres.load("duty_collection_sources.sql")
 SQL_DUTY_COLLECTION_SOURCE_VALIDATE = sqlres.load("duty_collection_source_validate.sql")
 SQL_PROFILE_COLLECTION_RESULTS = sqlres.load("profile_collection_results.sql")
+SQL_PROFILE_COLLECTION_SUMMARY = sqlres.load("profile_collection_summary.sql")
 SQL_PROFILE_COLLECTION_ENQUEUE = sqlres.load("profile_collection_enqueue_manual.sql")
 SQL_PROFILE_COLLECTION_REQUEUE = sqlres.load("profile_collection_requeue_ineffective.sql")
 
@@ -223,7 +224,19 @@ async def bind_rule(rule_id: int, body: BindBody) -> dict:
 async def profile_collection_results(rule_id: int, limit: int = 50) -> dict:
     pool = _pool()
     rows = await pool.fetch(SQL_PROFILE_COLLECTION_RESULTS, rule_id, max(1, min(limit, 100)))
-    return {"items": [
+    summary_row = await pool.fetchrow(SQL_PROFILE_COLLECTION_SUMMARY, rule_id)
+    summary = {
+        key: int(summary_row[key])
+        for key in (
+            "total", "pending", "processing", "deferred", "fetched",
+            "skipped", "not_found", "failed", "completed",
+        )
+    }
+    summary["cooldown_until"] = (
+        summary_row["cooldown_until"].isoformat()
+        if summary_row["cooldown_until"] else None
+    )
+    return {"summary": summary, "items": [
         {
             "job_id": row["job_id"], "duty_date": str(row["duty_date"]),
             "contact_username": row["contact_username"], "status": row["status"],

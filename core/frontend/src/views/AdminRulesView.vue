@@ -1,6 +1,6 @@
 <script setup>
 import AdminTabs from "../components/AdminTabs.vue";
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { Save, FlaskConical, Sparkles, Trash2, Link2, Settings2, PlugZap, RefreshCw, Copy } from "lucide-vue-next";
 import { api, mediaUrl } from "../api/client";
 
@@ -26,7 +26,10 @@ const dutyDialogKey = ref("");
 const dutyForm = ref({});
 const profileForm = ref({});
 const profileResults = ref([]);
+const profileSummary = ref(null);
+const profileUpdatedAt = ref(null);
 const profileUsername = ref("");
+let profileRefreshTimer;
 const filteredRules = computed(() => rules.value.filter((r) => (r.rule_type || "listing") === activeTab.value));
 
 const EMPTY_DUTY_CONFIG = {
@@ -128,6 +131,28 @@ async function loadProfileResults(ruleId = current.value?.id) {
   if (!ruleId) return;
   const data = await api(`/api/admin/rules/${ruleId}/profile-collection`);
   profileResults.value = data.items || [];
+  profileSummary.value = data.summary || null;
+  profileUpdatedAt.value = new Date();
+}
+
+function profileProgress() {
+  if (!profileSummary.value?.total) return 0;
+  return Math.round(profileSummary.value.completed * 100 / profileSummary.value.total);
+}
+
+function profileCooldownText(value) {
+  if (!value) return "";
+  const seconds = Math.max(0, Math.floor((Date.parse(value) - Date.now()) / 1000));
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days) return `${days}天${hours}小时`;
+  if (hours) return `${hours}小时${minutes}分钟`;
+  return `${minutes}分钟`;
+}
+
+function profileCooldownDeadline(value) {
+  return value ? new Date(value).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }) : "";
 }
 
 async function enqueueProfileUsername() {
@@ -159,6 +184,7 @@ function newRule() {
   dutyForm.value = { ...EMPTY_DUTY_CONFIG };
   profileForm.value = { ...EMPTY_PROFILE_CONFIG };
   profileResults.value = [];
+  profileSummary.value = null;
   dryrun.value = null;
 }
 
@@ -404,7 +430,14 @@ onMounted(async () => {
   llm.value = await api("/api/admin/rules/llm-status");
   sources.value = (await api("/api/admin/sources")).items;
   dialogs.value = (await api("/api/admin/sources/dialogs")).items;
+  profileRefreshTimer = setInterval(() => {
+    if (activeTab.value === "profile_collection" && current.value?.id) {
+      loadProfileResults(current.value.id);
+    }
+  }, 30000);
 });
+
+onUnmounted(() => clearInterval(profileRefreshTimer));
 </script>
 
 <template>
@@ -804,6 +837,27 @@ onMounted(async () => {
           <button @click="requeueIneffectiveProfiles" class="rounded-lg border border-amber-700/60 px-3 py-2 text-xs text-amber-300 hover:bg-amber-900/30">
             重采无有效资料
           </button>
+        </div>
+        <div v-if="current.id && profileSummary" class="space-y-3 rounded-xl border border-violet-800/50 bg-violet-950/20 p-3">
+          <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
+            <span class="font-semibold text-violet-200">V2 处理进度：{{ profileSummary.completed }} / {{ profileSummary.total }}（{{ profileProgress() }}%）</span>
+            <span class="text-slate-500">每 30 秒自动刷新<span v-if="profileUpdatedAt"> · 更新于 {{ profileUpdatedAt.toLocaleTimeString("zh-CN") }}</span></span>
+          </div>
+          <div class="h-2 overflow-hidden rounded-full bg-slate-800">
+            <div class="h-full rounded-full bg-violet-500 transition-all" :style="{ width: `${profileProgress()}%` }"></div>
+          </div>
+          <div class="flex flex-wrap gap-2 text-[11px]">
+            <span class="rounded bg-slate-800 px-2 py-1 text-slate-300">待采 {{ profileSummary.pending }}</span>
+            <span class="rounded bg-sky-950 px-2 py-1 text-sky-300">采集中 {{ profileSummary.processing }}</span>
+            <span class="rounded bg-amber-950 px-2 py-1 text-amber-300">等待重试 {{ profileSummary.deferred }}</span>
+            <span class="rounded bg-emerald-950 px-2 py-1 text-emerald-300">已采集 {{ profileSummary.fetched }}</span>
+            <span class="rounded bg-slate-800 px-2 py-1 text-slate-300">无可用资料 {{ profileSummary.not_found + profileSummary.skipped }}</span>
+            <span class="rounded bg-rose-950 px-2 py-1 text-rose-300">失败 {{ profileSummary.failed }}</span>
+          </div>
+          <p v-if="profileSummary.cooldown_until" class="text-xs text-amber-200">
+            Telegram 账号冷却中：约 {{ profileCooldownText(profileSummary.cooldown_until) }} 后自动恢复采集（{{ profileCooldownDeadline(profileSummary.cooldown_until) }}）
+          </p>
+          <p v-else class="text-xs text-emerald-300">账号当前可采集；待采任务由 V2 worker 自动处理。</p>
         </div>
         <div v-if="boundGroups().length" class="flex flex-wrap gap-2 text-xs text-slate-400">
           <span>已绑定：</span><span v-for="b in boundGroups()" :key="b.source_id" class="rounded-full border border-slate-700 px-2 py-1">{{ b.title || `来源#${b.source_id}` }}</span>
