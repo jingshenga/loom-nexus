@@ -11,9 +11,9 @@ BEGIN
         RAISE EXCEPTION 'a login request is already in progress';
     END IF;
     v_name := COALESCE(NULLIF(p_session_name, ''), 'gw');
-    INSERT INTO login_requests (phone, session_name)
+    INSERT INTO login_requests AS lr (phone, session_name)
     VALUES (p_phone, v_name)
-    RETURNING id, session_name INTO v_id, v_name;
+    RETURNING lr.id, lr.session_name INTO v_id, v_name;
     RETURN QUERY SELECT v_id, v_name, 'pending'::VARCHAR(24);
 END
 $fn$;
