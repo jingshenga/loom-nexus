@@ -141,6 +141,7 @@ MAX_PINNED_MESSAGES = 3
 MAX_PROFILE_PHOTOS = 4
 MAX_PROFILE_VIDEOS = 2
 MAX_PROFILE_V2_PHOTOS = 6
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
 
 
 def _is_obvious_promo(text: str) -> bool:
@@ -151,6 +152,26 @@ def _is_obvious_promo(text: str) -> bool:
     return bool(re.search(r"博彩|彩票|贷款|返利|刷单|高回报", normalized)) or (
         len(markers) >= 2 and len(urls) >= 2
     )
+
+
+def _profile_media_kind(message) -> str | None:
+    file = getattr(message, "file", None)
+    mime_type = str(getattr(file, "mime_type", "") or "").lower()
+    extension = str(getattr(file, "ext", "") or "").lower()
+    media = getattr(message, "media", None)
+    document = getattr(message, "document", None) or getattr(media, "document", None)
+    document_mime = str(getattr(document, "mime_type", "") or "").lower()
+    document_attributes = getattr(document, "attributes", ()) or ()
+    photo = getattr(message, "photo", None)
+    if (getattr(message, "video", None) or getattr(message, "video_note", None)
+            or mime_type.startswith("video/") or extension in VIDEO_EXTENSIONS
+            or document_mime.startswith("video/")
+            or any(type(attr).__name__ == "DocumentAttributeVideo" for attr in document_attributes)
+            or bool(getattr(photo, "video_sizes", None))):
+        return "video"
+    if photo:
+        return "photo"
+    return None
 
 
 def _has_profile_content(message) -> bool:
@@ -535,18 +556,21 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
         for part in parts:
             if any(item.get("message_id") == int(part.id) for item in media):
                 continue
-            if part.photo and sum(item["kind"] == "photo" for item in media) < photo_limit:
+            media_kind = _profile_media_kind(part)
+            if media_kind == "photo" and sum(item["kind"] == "photo" for item in media) < photo_limit:
                 entries = await backfill.save_media(
                     part, job["source_id"], stable_prefix=f"profile_v2_{job['job_id']}_{part.id}",
+                    force_kind="photo",
                 )
                 media.extend({**item, "message_id": int(part.id)} for item in entries if item.get("kind") == "photo")
-            elif part.video or part.video_note:
+            elif media_kind == "video":
                 video_candidates.append(part)
 
     if not any(item["kind"] == "photo" for item in media):
         for part in video_candidates[:video_limit]:
             entries = await backfill.save_media(
                 part, job["source_id"], stable_prefix=f"profile_v2_{job['job_id']}_{part.id}",
+                force_kind="video",
             )
             media.extend({**item, "message_id": int(part.id)} for item in entries if item.get("kind") == "video")
     description = "\n\n".join(dict.fromkeys(text_parts)).strip()
@@ -574,7 +598,7 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
         json.dumps(evidence, ensure_ascii=False), json.dumps(cfg, ensure_ascii=False),
     )
     result_id = rows[0]["id"]
-    await pool.fetch(SQL_PROFILE_OCR_ENQUEUE, result_id, json.dumps(media, ensure_ascii=False))
+    await pool.execute(SQL_PROFILE_OCR_ENQUEUE, result_id, json.dumps(media, ensure_ascii=False))
     return "fetched", None
 
 

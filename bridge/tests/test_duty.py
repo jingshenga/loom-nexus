@@ -10,7 +10,9 @@ from runner.duty import (
     message_matches,
     profile_usernames,
 )
-from runner.duty_collection import _flood_wait_seconds, _is_flood_wait
+from runner.duty_collection import (
+    _flood_wait_seconds, _is_flood_wait, _profile_media_kind,
+)
 
 
 class FakeMessage:
@@ -74,6 +76,29 @@ class DutyRuleTests(unittest.TestCase):
         self.assertTrue(_is_flood_wait(flood_wait))
         self.assertEqual(_flood_wait_seconds(flood_wait), 4120)
         self.assertFalse(_is_flood_wait(other_error))
+
+    def test_video_mime_wins_over_photo_attribute_for_profile_trial(self):
+        message = SimpleNamespace(
+            photo=object(), video=None, video_note=None,
+            file=SimpleNamespace(mime_type="video/mp4", ext=".mp4"),
+        )
+        self.assertEqual(_profile_media_kind(message), "video")
+
+    def test_video_document_wins_over_photo_file_metadata(self):
+        message = SimpleNamespace(
+            photo=object(), video=None, video_note=None, media=None,
+            document=SimpleNamespace(mime_type="video/mp4", attributes=[]),
+            file=SimpleNamespace(mime_type="image/jpeg", ext=".jpg"),
+        )
+        self.assertEqual(_profile_media_kind(message), "video")
+
+    def test_photo_with_video_sizes_is_classified_as_video(self):
+        message = SimpleNamespace(
+            photo=SimpleNamespace(video_sizes=[object()]),
+            video=None, video_note=None, media=None, document=None,
+            file=SimpleNamespace(mime_type="image/jpeg", ext=".jpg"),
+        )
+        self.assertEqual(_profile_media_kind(message), "video")
 
 
 if __name__ == "__main__":
