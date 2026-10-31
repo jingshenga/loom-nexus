@@ -279,6 +279,11 @@ async def run_sender(pool: asyncpg.Pool, stop: asyncio.Event) -> None:
     )
     while not stop.is_set():
         try:
+            if not sim:
+                # Chat sessions are assigned to currently active accounts by
+                # chat_open_session; refresh the sender pool so a newly
+                # authorized account can receive its already-routed sessions.
+                account_ids = await _real_account_ids(pool)
             for account_id in account_ids:
                 jobs = await pool.fetch(SQL_CLAIM, account_id)
                 for job in jobs:

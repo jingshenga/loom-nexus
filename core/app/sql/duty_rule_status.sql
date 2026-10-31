@@ -22,6 +22,10 @@ WITH clock AS (
     FROM duty_snapshots ds CROSS JOIN clock c
     CROSS JOIN LATERAL jsonb_array_elements_text(ds.green_blue_usernames) AS u(username)
     WHERE ds.duty_date = c.duty_date
+), profile_jobs AS (
+    SELECT j.source_id, j.duty_date, lower(j.contact_username) AS username, j.status
+    FROM profile_collection_jobs j CROSS JOIN clock c
+    WHERE j.duty_date = c.duty_date
 )
 SELECT ir.id AS rule_id,
        reports.observed_at,
@@ -32,28 +36,28 @@ SELECT ir.id AS rule_id,
            SELECT 1 FROM listings l WHERE lower(l.contact_username) = c.username
        ))::bigint AS with_card,
        COUNT(DISTINCT c.username) FILTER (WHERE EXISTS (
-           SELECT 1 FROM duty_collection_jobs j CROSS JOIN clock d
-           WHERE j.duty_date = d.duty_date AND lower(j.contact_username) = c.username
-             AND j.status IN ('pending', 'processing')
+           SELECT 1 FROM profile_jobs j
+           WHERE j.source_id = NULLIF(ir.config_json->>'collection_source_id', '')::bigint
+             AND j.username = c.username
+             AND j.status IN ('pending', 'processing', 'deferred')
        ))::bigint AS queued,
        COUNT(DISTINCT c.username) FILTER (WHERE EXISTS (
-           SELECT 1 FROM duty_collection_jobs j CROSS JOIN clock d
-           WHERE j.duty_date = d.duty_date AND lower(j.contact_username) = c.username
-             AND j.status IN ('fetched', 'skipped')
-       ) AND NOT EXISTS (
-           SELECT 1 FROM listings l WHERE lower(l.contact_username) = c.username
+           SELECT 1 FROM profile_jobs j
+           WHERE j.source_id = NULLIF(ir.config_json->>'collection_source_id', '')::bigint
+             AND j.username = c.username AND j.status = 'fetched'
        ))::bigint AS fetched,
        COUNT(DISTINCT c.username) FILTER (WHERE EXISTS (
-           SELECT 1 FROM duty_collection_jobs j CROSS JOIN clock d
-           WHERE j.duty_date = d.duty_date AND lower(j.contact_username) = c.username
-             AND j.status IN ('failed', 'not_found')
+           SELECT 1 FROM profile_jobs j
+           WHERE j.source_id = NULLIF(ir.config_json->>'collection_source_id', '')::bigint
+             AND j.username = c.username
+             AND j.status IN ('failed', 'not_found', 'stale_source', 'source_unavailable')
        ))::bigint AS failed,
        COUNT(DISTINCT c.username) FILTER (WHERE NOT EXISTS (
            SELECT 1 FROM listings l WHERE lower(l.contact_username) = c.username
        ) AND NOT EXISTS (
-           SELECT 1 FROM duty_collection_jobs j CROSS JOIN clock d
-           WHERE j.duty_date = d.duty_date AND lower(j.contact_username) = c.username
-             AND j.status <> 'cancelled'
+           SELECT 1 FROM profile_jobs j
+           WHERE j.source_id = NULLIF(ir.config_json->>'collection_source_id', '')::bigint
+             AND j.username = c.username
        ))::bigint AS unqueued,
        COALESCE(reports.unresolved, 0)::bigint AS unresolved
 FROM ingest_rules ir
