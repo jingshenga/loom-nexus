@@ -2903,6 +2903,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_collection_jobs_identity
     ON profile_collection_jobs(rule_id, duty_date, lower(contact_username));
 CREATE INDEX IF NOT EXISTS idx_profile_collection_jobs_due
     ON profile_collection_jobs(status, next_attempt_at, id);
+ALTER TABLE listings ADD COLUMN IF NOT EXISTS profile_collection_job_id BIGINT
+    REFERENCES profile_collection_jobs(id) ON DELETE SET NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_listings_profile_collection_job
+    ON listings(profile_collection_job_id)
+    WHERE profile_collection_job_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS profile_collection_results (
     id BIGSERIAL PRIMARY KEY,
     job_id BIGINT NOT NULL UNIQUE REFERENCES profile_collection_jobs(id) ON DELETE CASCADE,

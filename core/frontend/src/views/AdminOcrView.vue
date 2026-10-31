@@ -137,7 +137,7 @@ onMounted(load);
           :class="current?.id === item.id ? 'border-sky-500 bg-sky-600/10' : 'border-slate-800 bg-slate-900 hover:border-slate-600'">
           <div class="flex items-center gap-2 text-sm font-medium">
             <ImageIcon class="size-4 shrink-0 text-sky-400" />
-            <span class="truncate">{{ item.nickname || item.source_title || `消息 #${item.raw_id}` }}</span>
+            <span class="truncate">{{ item.nickname || item.source_title || `消息 #${item.raw_id ?? item.id}` }}</span>
           </div>
           <div class="mt-1 flex flex-wrap gap-2 text-xs text-slate-500">
             <span>{{ item.classification }}</span>
@@ -154,6 +154,11 @@ onMounted(load);
           <div class="text-xs text-slate-500">
             来源：{{ current.source_title || "未知" }}
             <span v-if="current.posted_at"> · {{ new Date(current.posted_at).toLocaleString("zh-CN") }}</span>
+          </div>
+          <div v-if="current.profile_peer_id || current.profile_username" class="text-xs text-sky-300">
+            采集对象：<a v-if="current.profile_url" :href="current.profile_url" target="_blank" rel="noreferrer" class="underline">{{ current.profile_username ? `@${current.profile_username}` : `TG ID ${current.profile_peer_id}` }}</a>
+            <span v-else>{{ current.profile_username ? `@${current.profile_username}` : `TG ID ${current.profile_peer_id}` }}</span>
+            <span v-if="current.profile_peer_id"> · TG ID {{ current.profile_peer_id }}</span>
           </div>
           <div class="overflow-hidden rounded-lg border border-slate-800 bg-black">
             <img :src="mediaUrl(current.media_path)" class="max-h-[68vh] w-full object-contain" alt="待核对的资料卡" />

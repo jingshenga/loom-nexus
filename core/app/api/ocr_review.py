@@ -4,13 +4,14 @@ import json
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
-from app import db
+from app import db, sqlres
 from app.api.auth import bearer_identity, require_admin
 
 router = APIRouter(
     prefix="/api/admin/ocr", tags=["admin-ocr"],
     dependencies=[Depends(require_admin)],
 )
+SQL_PROFILE_FLAGS = sqlres.load("profile_collection_ocr_flags.sql")
 
 
 class EditOcrBody(BaseModel):
@@ -43,12 +44,21 @@ async def queue(status: str = "pending", limit: int = 40, offset: int = 0) -> di
         "o.classification, o.review_status, o.raw_text, o.normalized_text, "
         "o.fields_json, o.evidence_json, o.confidence, o.engine_version, "
         "o.error_text, COALESCE(rm.raw_text, l.description) AS message_text, "
-        "COALESCE(rm.posted_at, l.created_at) AS posted_at, "
-        "COALESCE(s.title, CASE WHEN l.duty_collection_job_id IS NOT NULL "
-        "THEN '签到资料自动采集' END) AS source_title, l.nickname "
+        "COALESCE(rm.posted_at, pr.collected_at, l.created_at) AS posted_at, "
+        "COALESCE(s.title, ps.title, CASE WHEN l.duty_collection_job_id IS NOT NULL "
+        "THEN '签到资料自动采集' END) AS source_title, "
+        "COALESCE(l.nickname, CASE WHEN pr.contact_username <> '' "
+        "THEN '@' || pr.contact_username END, "
+        "CASE WHEN pr.contact_peer_id IS NOT NULL "
+        "THEN 'TG ID ' || pr.contact_peer_id::text END) AS nickname, "
+        "pr.contact_username AS profile_username, "
+        "pr.contact_peer_id AS profile_peer_id, pr.profile_url "
         "FROM listing_media_ocr o "
         "LEFT JOIN raw_messages rm ON rm.id=o.raw_id "
         "LEFT JOIN ingest_sources s ON s.id=rm.source_id "
+        "LEFT JOIN profile_collection_results pr ON pr.id=o.profile_result_id "
+        "LEFT JOIN profile_collection_jobs pj ON pj.id=pr.job_id "
+        "LEFT JOIN ingest_sources ps ON ps.id=pj.source_id "
         "LEFT JOIN LATERAL (SELECT id, nickname, description, created_at, duty_collection_job_id "
         " FROM listings WHERE id=o.listing_id OR source_msg_id=o.raw_id "
         " ORDER BY CASE WHEN id=o.listing_id THEN 0 ELSE 1 END, id DESC LIMIT 1) l ON TRUE "
@@ -89,6 +99,9 @@ async def queue(status: str = "pending", limit: int = 40, offset: int = 0) -> di
             "posted_at": row["posted_at"].isoformat() if row["posted_at"] else None,
             "source_title": row["source_title"],
             "nickname": row["nickname"],
+            "profile_username": row["profile_username"],
+            "profile_peer_id": row["profile_peer_id"],
+            "profile_url": row["profile_url"],
         })
     return {"items": items, "total": total}
 
@@ -119,7 +132,8 @@ async def decide(
     if pool is None:
         raise HTTPException(status_code=503, detail="database unavailable")
     row = await pool.fetchrow(
-        "SELECT raw_id, listing_id, media_path, normalized_text "
+        "SELECT raw_id, listing_id, profile_result_id, media_path, "
+        "normalized_text, raw_text, confidence "
         "FROM listing_media_ocr WHERE id=$1",
         asset_id,
     )
@@ -136,6 +150,11 @@ async def decide(
             await pool.fetch(
                 "SELECT media_ocr_set_flags($1,$2,'pending','pending','uncertain')",
                 row["raw_id"], row["media_path"],
+            )
+        elif row["profile_result_id"] is not None:
+            await pool.fetch(
+                SQL_PROFILE_FLAGS, row["profile_result_id"], row["media_path"],
+                "pending", "uncertain", "pending", row["raw_text"], row["confidence"],
             )
         return {"ok": True}
 
@@ -162,5 +181,10 @@ async def decide(
         await pool.fetch(
             "SELECT media_ocr_set_flags($1,$2,$3,'done',$4)",
             row["raw_id"], row["media_path"], visibility, classification,
+        )
+    elif row["profile_result_id"] is not None:
+        await pool.fetch(
+            SQL_PROFILE_FLAGS, row["profile_result_id"], row["media_path"],
+            "done", classification, review_status, row["raw_text"], row["confidence"],
         )
     return {"ok": True}
