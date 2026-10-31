@@ -16,6 +16,15 @@ const statusTab = ref("pending");
 const selectedIds = ref([]);
 const nicknameFilter = ref("");
 const appliedNickname = ref("");
+const sourceFilter = ref("");
+const mediaFilter = ref("all");
+const ocrPendingOnly = ref(false);
+const queueOrder = ref("oldest");
+const queueTotal = ref(0);
+const queueOffset = ref(0);
+const queuePageSize = 30;
+const queueSources = ref([]);
+const mediaDraft = ref([]);
 const recollectStatus = ref("");
 const activeWorkbench = ref("review");
 const dutyRecovery = ref([]);
@@ -70,6 +79,7 @@ async function deleteCurrent() {
 
 function select(item) {
   current.value = item;
+  mediaDraft.value = (item?.media || []).map((entry) => ({ ...entry }));
   form.value = {
     nickname: item.nickname || "",
     district: item.district || "",
@@ -80,17 +90,79 @@ function select(item) {
 }
 
 function onMediaRotated(media) {
-  if (current.value) current.value.media = media;
+  if (current.value) {
+    current.value.media = media;
+    mediaDraft.value = media.map((entry) => ({ ...entry }));
+  }
   notify("照片已旋转，正在重新计算人脸焦点");
 }
 
 async function loadQueue() {
-  const params = new URLSearchParams({ status: statusTab.value });
+  const params = new URLSearchParams({
+    status: statusTab.value,
+    limit: String(queuePageSize),
+    offset: String(queueOffset.value),
+    media: mediaFilter.value,
+    ocr_pending: String(ocrPendingOnly.value),
+    order: queueOrder.value,
+  });
   if (appliedNickname.value) params.set("nickname", appliedNickname.value);
+  if (sourceFilter.value) params.set("source_id", sourceFilter.value);
   const data = await api(`/api/admin/review/queue?${params}`);
   queue.value = data.items;
+  queueTotal.value = data.total;
   if (!data.items.some((x) => x.id === (current.value && current.value.id))) {
     select(data.items[0] || null);
+  }
+}
+
+async function loadQueueSources() {
+  const data = await api(`/api/admin/review/queue-sources?status=${statusTab.value}`);
+  queueSources.value = data.items;
+}
+
+function resetQueuePage() {
+  queueOffset.value = 0;
+  selectedIds.value = [];
+  loadQueue();
+}
+
+function shiftMedia(index, delta) {
+  const target = index + delta;
+  if (target < 0 || target >= mediaDraft.value.length) return;
+  const items = [...mediaDraft.value];
+  [items[index], items[target]] = [items[target], items[index]];
+  mediaDraft.value = items;
+}
+
+function removeMedia(path) {
+  mediaDraft.value = mediaDraft.value.filter((entry) => entry.path !== path);
+}
+
+async function uploadReviewPhoto(event) {
+  const file = event.target.files?.[0];
+  event.target.value = "";
+  if (!file || !current.value) return;
+  if (!["image/jpeg", "image/png", "image/webp"].includes(file.type) || file.size > 10 * 1024 * 1024) {
+    notify("请选择 10 MB 以内的 JPEG、PNG 或 WebP 图片");
+    return;
+  }
+  const imageData = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",", 2)[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+  try {
+    const result = await api(`/api/admin/review/${current.value.id}/upload-photo`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image_data: imageData, image_mime: file.type }),
+    });
+    current.value.media = result.media;
+    mediaDraft.value = result.media.map((entry) => ({ ...entry }));
+    notify("图片已加入名片，当前仅管理员可见");
+  } catch (e) {
+    notify(`上传失败：${e.message}`);
   }
 }
 
@@ -274,11 +346,16 @@ async function saveEdits() {
   if (!current.value) return;
   const body = { ...form.value };
   if (body.price_amount === "") body.price_amount = null;
-  await api(`/api/admin/review/${current.value.id}`, {
+  const media = mediaDraft.value.map((entry, index) => ({
+    ...entry,
+    manual_order: index,
+  }));
+  await api(`/api/admin/review/${current.value.id}/content`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ ...body, media, manual_order: true }),
   });
+  current.value.media = media;
   notify("字段已保存");
 }
 
@@ -289,8 +366,10 @@ async function decide(action, target) {
     await api(`/api/admin/review/${card.id}/${action}`, { method: "POST" });
     notify(
       action === "publish" ? "已发布到广场" :
-      action === "withdraw" ? "已撤回下架" : "已驳回",
+      action === "withdraw" ? "已撤回下架" :
+      action === "restore" ? "已恢复到待审核" : "已驳回",
     );
+    if (action === "restore") queueOffset.value = 0;
     await loadQueue();
   } catch (e) {
     notify(`操作失败: ${e.message}`);
@@ -302,10 +381,11 @@ function onKey(e) {
 }
 
 onMounted(async () => {
+  await loadQueueSources();
   await loadQueue();
   await loadDutyRecovery();
   window.addEventListener("keydown", onKey);
-  timer = setInterval(() => { loadQueue(); loadDutyRecovery(); }, 15000);
+  timer = setInterval(() => { loadQueue(); loadQueueSources(); loadDutyRecovery(); }, 15000);
   try {
     recollectJobIds = JSON.parse(sessionStorage.getItem(RECOLLECT_STORAGE_KEY) || "[]");
     if (recollectJobIds.length) {
@@ -404,7 +484,7 @@ onUnmounted(() => {
 
     <div class="flex flex-wrap items-center gap-2">
       <h2 class="text-lg font-semibold">审核工作台</h2>
-      <select v-model="statusTab" @change="selectedIds = []; loadQueue()"
+      <select v-model="statusTab" @change="queueOffset = 0; selectedIds = []; loadQueueSources(); loadQueue()"
         class="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm">
         <option value="pending">待审核</option>
         <option value="published">已发布</option>
@@ -420,6 +500,17 @@ onUnmounted(() => {
         <button v-if="appliedNickname" @click="nicknameFilter = ''; applyNicknameFilter()"
           class="rounded-lg px-2 py-1 text-xs text-slate-500 hover:text-slate-300">清除</button>
       </div>
+      <select v-model="sourceFilter" @change="resetQueuePage" class="max-w-44 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm">
+        <option value="">全部来源</option>
+        <option v-for="source in queueSources" :key="source.id" :value="String(source.id)">{{ source.title }}</option>
+      </select>
+      <select v-model="mediaFilter" @change="resetQueuePage" class="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm">
+        <option value="all">全部媒体</option><option value="with_media">有图片/视频</option><option value="no_media">无媒体</option>
+      </select>
+      <select v-model="queueOrder" @change="resetQueuePage" class="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm">
+        <option value="oldest">最早优先</option><option value="newest">最新优先</option>
+      </select>
+      <label class="flex items-center gap-1.5 text-xs text-slate-400"><input v-model="ocrPendingOnly" @change="resetQueuePage" type="checkbox" class="size-4 accent-sky-500" />OCR待核对</label>
       <label class="flex items-center gap-1.5 text-xs text-slate-400">
         <input type="checkbox" :checked="allSelected()" @change="toggleSelectAll" class="size-4 accent-sky-500" />
         全选
@@ -434,6 +525,9 @@ onUnmounted(() => {
         重新采集（{{ selectedIds.length }}）
       </button>
       <span v-if="recollectStatus" class="text-xs text-sky-300">{{ recollectStatus }}</span>
+      <span class="text-xs text-slate-500">{{ queueTotal ? queueOffset + 1 : 0 }}–{{ Math.min(queueOffset + queue.length, queueTotal) }} / {{ queueTotal }}</span>
+      <button @click="queueOffset = Math.max(0, queueOffset - queuePageSize); loadQueue()" :disabled="queueOffset === 0" class="rounded border border-slate-700 px-2 py-1 text-xs disabled:opacity-40">上一页</button>
+      <button @click="queueOffset += queuePageSize; loadQueue()" :disabled="queueOffset + queuePageSize >= queueTotal" class="rounded border border-slate-700 px-2 py-1 text-xs disabled:opacity-40">下一页</button>
       <span class="text-xs text-slate-500">Ctrl+Enter 快捷发布</span>
       <span v-if="flash" class="ml-auto rounded bg-emerald-600/20 px-3 py-1 text-xs text-emerald-300">{{ flash }}</span>
     </div>
@@ -485,6 +579,18 @@ onUnmounted(() => {
         </div>
         <div class="flex flex-wrap gap-2 text-sm text-slate-300"><span v-if="current.district" class="rounded bg-slate-800 px-2 py-1">{{ current.district }}</span><span class="rounded bg-slate-800 px-2 py-1">{{ current.price_amount ?? "价格待核" }} {{ current.price_currency || "" }}</span><span v-if="current.contact_peer_id" class="rounded bg-slate-800 px-2 py-1">TG ID {{ current.contact_peer_id }}</span></div>
         <MediaGallery :media="current.media" :admin-listing-id="current.id" @rotated="onMediaRotated" />
+        <details class="rounded-lg border border-slate-800 bg-slate-950/60 p-3"><summary class="cursor-pointer text-sm text-slate-300">管理图片与顺序（{{ mediaDraft.length }}）</summary>
+          <div class="mt-3 space-y-2">
+            <div v-for="(entry, index) in mediaDraft" :key="entry.path" class="flex items-center gap-2 rounded bg-slate-900 p-2 text-xs">
+              <span class="min-w-0 flex-1 truncate">{{ index + 1 }}. {{ entry.path }}</span>
+              <select v-if="entry.kind === 'photo'" v-model="entry.visibility" class="rounded border border-slate-700 bg-slate-950 px-1.5 py-1"><option value="pending">仅管理员</option><option value="public">普通用户可见</option><option value="admin">管理员专用</option></select>
+              <button @click="shiftMedia(index, -1)" :disabled="index === 0" class="rounded border border-slate-700 px-2 py-1 disabled:opacity-30" title="上移">↑</button>
+              <button @click="shiftMedia(index, 1)" :disabled="index === mediaDraft.length - 1" class="rounded border border-slate-700 px-2 py-1 disabled:opacity-30" title="下移">↓</button>
+              <button @click="removeMedia(entry.path)" class="rounded border border-rose-800 px-2 py-1 text-rose-300" title="从名片移除">移除</button>
+            </div>
+            <label class="inline-flex cursor-pointer rounded border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800">上传图片（默认仅管理员可见）<input type="file" accept="image/jpeg,image/png,image/webp" @change="uploadReviewPhoto" class="hidden" /></label>
+          </div>
+        </details>
         <details class="rounded-lg border border-slate-800 bg-slate-950/60 p-3"><summary class="cursor-pointer text-sm text-slate-300">查看原始消息</summary><p class="mt-3 whitespace-pre-wrap text-sm leading-relaxed text-slate-400">{{ current.source_text || "（无正文）" }}</p></details>
         <details class="rounded-lg border border-slate-800 bg-slate-950/60 p-3"><summary class="cursor-pointer text-sm text-slate-300">修订卡片字段</summary>
           <div class="mt-3 flex flex-wrap gap-1.5"><span v-for="(ev, field) in current.evidence" :key="field" class="rounded px-2 py-0.5 text-xs" :class="ev.src === 'ocr' ? 'bg-amber-600/20 text-amber-300' : 'bg-slate-800 text-slate-400'">{{ field }} · {{ ev.src }}</span></div>
@@ -494,6 +600,7 @@ onUnmounted(() => {
           <button @click="saveEdits" class="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-slate-600 py-2 text-sm hover:bg-slate-800"><Save class="size-4" />保存修订</button>
           <template v-if="statusTab === 'pending'"><button @click="decide('reject')" class="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-rose-700/60 py-2 text-sm text-rose-300 hover:bg-rose-900/30"><XCircle class="size-4" />驳回</button><button @click="decide('publish')" class="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-emerald-600 py-2 text-sm font-medium hover:bg-emerald-500"><CheckCircle2 class="size-4" />发布</button></template>
           <button v-else-if="statusTab === 'published'" @click="decide('withdraw')" class="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-amber-600/60 py-2 text-sm text-amber-300 hover:bg-amber-900/30"><ArchiveRestore class="size-4" />撤回下架</button><button @click="deleteCurrent" class="flex items-center justify-center gap-1.5 rounded-lg border border-rose-700/60 px-3 py-2 text-sm text-rose-300 hover:bg-rose-900/30"><Trash2 class="size-4" />删除</button>
+          <button v-if="statusTab === 'rejected' || statusTab === 'archived'" @click="decide('restore')" class="flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-sky-700/60 py-2 text-sm text-sky-300 hover:bg-sky-900/30"><ArchiveRestore class="size-4" />恢复到待审核</button>
         </div>
       </section>
       <section v-else class="flex items-center justify-center rounded-xl border border-slate-800 text-slate-600 lg:col-span-8">选择左侧任务</section>

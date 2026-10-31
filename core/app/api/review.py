@@ -1,6 +1,7 @@
 """Admin review workbench APIs (token-protected)."""
 import base64
 import binascii
+import io
 import json
 import re
 import uuid
@@ -21,6 +22,8 @@ router = APIRouter(
 )
 
 SQL_QUEUE = sqlres.load("review_queue.sql")
+SQL_QUEUE_COUNT = sqlres.load("review_queue_count.sql")
+SQL_QUEUE_SOURCES = sqlres.load("review_queue_sources.sql")
 SQL_DUPLICATE_CANDIDATES = sqlres.load("duplicate_candidates.sql")
 SQL_PUBLISH = sqlres.load("publish.sql")
 SQL_REJECT = sqlres.load("reject.sql")
@@ -52,12 +55,30 @@ def _decode(value, fallback):
 @router.get("/queue")
 async def queue(
     status: str = "pending", limit: int = 30, offset: int = 0,
-    nickname: str = None,
+    nickname: str = None, source_id: int | None = None,
+    media: str = "all", ocr_pending: bool = False,
+    order: str = "oldest",
 ) -> dict:
     pool = db.get_pool()
     if pool is None:
         raise HTTPException(status_code=503, detail="database unavailable")
-    rows = await pool.fetch(SQL_QUEUE, status, limit, offset, nickname or None)
+    if status not in {"pending", "published", "rejected", "archived"}:
+        raise HTTPException(status_code=400, detail="invalid listing status")
+    if media not in {"all", "with_media", "no_media"} or order not in {"oldest", "newest"}:
+        raise HTTPException(status_code=400, detail="invalid queue filter")
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+    nickname = nickname.strip() if nickname else None
+    rows = await pool.fetch(
+        SQL_QUEUE, status, limit, offset, nickname, source_id,
+        media, ocr_pending, order,
+    )
+    total = await pool.fetchval(
+        SQL_QUEUE_COUNT, status, nickname, source_id, media, ocr_pending,
+    )
+    counts = await pool.fetch(
+        "SELECT status, count(*) AS count FROM listings GROUP BY status",
+    )
     items = []
     for r in rows:
         items.append({
@@ -77,8 +98,23 @@ async def queue(
             "source_text": r["raw_text"],
             "source_title": r["source_title"],
             "source_posted_at": r["raw_posted_at"].isoformat() if r["raw_posted_at"] else None,
+            "source_id": r["source_id"],
+            "has_media": r["has_media"],
+            "ocr_pending": r["ocr_pending"],
         })
-    return {"items": items}
+    return {"items": items, "total": total,
+            "counts": {row["status"]: row["count"] for row in counts}}
+
+
+@router.get("/queue-sources")
+async def queue_sources(status: str = "pending") -> dict:
+    if status not in {"pending", "published", "rejected", "archived"}:
+        raise HTTPException(status_code=400, detail="invalid listing status")
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    rows = await pool.fetch(SQL_QUEUE_SOURCES, status)
+    return {"items": [dict(row) for row in rows]}
 
 
 @router.get("/duplicates")
@@ -225,6 +261,11 @@ class RotatePhotoBody(BaseModel):
     clockwise: bool
 
 
+class UploadPhotoBody(BaseModel):
+    image_data: str
+    image_mime: str
+
+
 @router.post("/recollect")
 async def recollect(body: RecollectBody) -> dict:
     """Queue a Telegram refresh for up to 20 selected cards."""
@@ -316,6 +357,63 @@ async def update_duty_recovery(job_id: int, body: DutyRecoveryUpdate) -> dict:
     if not rows:
         raise HTTPException(status_code=404, detail="recovery job not found")
     return {"ok": True}
+
+
+@router.post("/{listing_id}/upload-photo")
+async def upload_review_photo(listing_id: int, body: UploadPhotoBody) -> dict:
+    """Attach a locally uploaded admin photo as pending visibility."""
+    if body.image_mime not in {"image/jpeg", "image/png", "image/webp"}:
+        raise HTTPException(status_code=400, detail="image must be JPEG, PNG or WebP")
+    try:
+        raw = base64.b64decode(body.image_data, validate=True)
+        if len(raw) > 10 * 1024 * 1024:
+            raise ValueError("image too large")
+        image = Image.open(io.BytesIO(raw))
+        if image.width * image.height > 40_000_000:
+            raise ValueError("image dimensions too large")
+        image.verify()
+        expected = {"image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP"}
+        if image.format != expected[body.image_mime]:
+            raise ValueError("image type mismatch")
+    except (ValueError, binascii.Error, OSError, Image.DecompressionBombError) as exc:
+        raise HTTPException(status_code=400, detail="invalid image") from exc
+
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    media_root = Path(get_settings().media_dir).resolve()
+    target_dir = media_root / "manual"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    extension = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}[body.image_mime]
+    filename = f"review_{listing_id}_{uuid.uuid4().hex}{extension}"
+    relative_path = f"manual/{filename}"
+    (target_dir / filename).write_bytes(raw)
+    item = {"kind": "photo", "path": relative_path, "visibility": "pending"}
+
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT source_msg_id, media_json, manual_fields FROM listings "
+                    "WHERE id=$1 FOR UPDATE", listing_id,
+                )
+                if row is None:
+                    raise HTTPException(status_code=404, detail="listing not found")
+                media = _decode(row["media_json"], [])
+                media.append(item)
+                encoded = json.dumps(media, ensure_ascii=False)
+                manual_fields = _decode(row["manual_fields"], {})
+                manual_fields["media"] = True
+                await conn.execute(
+                    "UPDATE listings SET media_json=$2::jsonb, manual_fields=$3::jsonb, updated_at=NOW() WHERE id=$1",
+                    listing_id, encoded, json.dumps(manual_fields),
+                )
+                if row["source_msg_id"] is not None:
+                    await conn.execute("UPDATE raw_messages SET media_json=$2::jsonb WHERE id=$1", row["source_msg_id"], encoded)
+    except Exception:
+        (target_dir / filename).unlink(missing_ok=True)
+        raise
+    return {"media": media}
 
 
 class DutyScanBody(BaseModel):
@@ -477,9 +575,8 @@ async def edit_content(
             old_media = _decode(row["media_json"], [])
             old_by_path = {entry.get("path"): entry for entry in old_media}
             paths = [entry.get("path") for entry in body.media]
-            if (len(paths) != len(old_media) or len(set(paths)) != len(paths)
-                    or set(paths) != set(old_by_path)):
-                raise HTTPException(status_code=400, detail="media items cannot be added or removed here")
+            if len(set(paths)) != len(paths) or not set(paths).issubset(old_by_path):
+                raise HTTPException(status_code=400, detail="media contains unknown or duplicate paths")
 
             updated_media = []
             for index, submitted in enumerate(body.media):
@@ -488,6 +585,8 @@ async def edit_content(
                     visibility = submitted.get("visibility", entry.get("visibility"))
                     if visibility not in {"public", "admin", "pending"}:
                         raise HTTPException(status_code=400, detail="invalid media visibility")
+                    if visibility != entry.get("visibility"):
+                        entry["visibility_override"] = True
                     entry["visibility"] = visibility
                     if submitted.get("visibility_override"):
                         entry["visibility_override"] = True
@@ -567,8 +666,8 @@ async def rotate_photo(listing_id: int, body: RotatePhotoBody) -> dict:
         async with conn.transaction():
             row = await conn.fetchrow(
                 "SELECT l.source_msg_id, l.media_json "
-                "FROM listings l JOIN raw_messages rm ON rm.id = l.source_msg_id "
-                "WHERE l.id = $1 FOR UPDATE OF rm",
+                "FROM listings l LEFT JOIN raw_messages rm ON rm.id = l.source_msg_id "
+                "WHERE l.id = $1 FOR UPDATE OF l",
                 listing_id,
             )
             if row is None:
@@ -600,10 +699,11 @@ async def rotate_photo(listing_id: int, body: RotatePhotoBody) -> dict:
                 "UPDATE listings SET media_json=$2::jsonb WHERE id=$1",
                 listing_id, encoded,
             )
-            await conn.execute(
-                "UPDATE raw_messages SET media_json=$2::jsonb WHERE id=$1",
-                row["source_msg_id"], encoded,
-            )
+            if row["source_msg_id"] is not None:
+                await conn.execute(
+                    "UPDATE raw_messages SET media_json=$2::jsonb WHERE id=$1",
+                    row["source_msg_id"], encoded,
+                )
     return {"media": media}
 
 
@@ -616,6 +716,22 @@ async def publish(listing_id: int) -> dict:
     if not rows[0]["ok"]:
         raise HTTPException(status_code=409, detail="cannot publish (archived?)")
     return {"ok": True}
+
+
+@router.post("/{listing_id}/restore")
+async def restore_listing(listing_id: int) -> dict:
+    """Return a rejected or archived card to the pending review queue."""
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    rows = await pool.fetch(
+        "UPDATE listings SET status='pending', updated_at=NOW() "
+        "WHERE id=$1 AND status IN ('rejected','archived') RETURNING id",
+        listing_id,
+    )
+    if not rows:
+        raise HTTPException(status_code=409, detail="only rejected or archived items can be restored")
+    return {"ok": True, "status": "pending"}
 
 
 @router.post("/{listing_id}/reject")

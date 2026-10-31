@@ -114,11 +114,11 @@ async def edit(asset_id: int, body: EditOcrBody) -> dict:
     rows = await pool.fetch(
         "UPDATE listing_media_ocr SET fields_json=$2::jsonb, "
         "normalized_text=COALESCE($3, normalized_text), updated_at=NOW() "
-        "WHERE id=$1 AND review_status='pending' RETURNING id",
+        "WHERE id=$1 AND review_status IN ('pending','not_card','confirmed') RETURNING id",
         asset_id, json.dumps(body.fields, ensure_ascii=False), body.normalized_text,
     )
     if not rows:
-        raise HTTPException(status_code=404, detail="pending OCR item not found")
+        raise HTTPException(status_code=404, detail="OCR item not found")
     return {"ok": True}
 
 
