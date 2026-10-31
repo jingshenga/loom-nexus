@@ -17,7 +17,7 @@ import time
 
 import asyncpg
 
-from runner import backfill, dialogs, duty_collection, hub, listener, login, media_meta, presence, probe, recollect, sender
+from runner import account_control, backfill, dialogs, duty_collection, hub, listener, login, media_meta, presence, probe, recollect, sender
 from runner.dbconn import connect_kwargs
 
 logger = logging.getLogger("nexus-bridge")
@@ -105,6 +105,7 @@ async def main() -> None:
         asyncio.create_task(duty_collection.run_duty_collection(pool, stop), name="duty-collection"),
         asyncio.create_task(recollect.run_recollect(pool, stop), name="recollect"),
         asyncio.create_task(login.run_login_watcher(pool, stop), name="login-watcher"),
+        asyncio.create_task(account_control.run_account_control(pool, stop), name="account-control"),
         asyncio.create_task(media_meta.run_enrich(pool, stop), name="media-enrich"),
     ]
     await stop.wait()

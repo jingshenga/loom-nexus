@@ -13,6 +13,7 @@ logger = logging.getLogger("nexus-bridge.hub")
 
 _lock = asyncio.Lock()
 _clients = {}
+_blocked = set()
 
 
 def _env_creds():
@@ -27,6 +28,8 @@ async def get_client(session_name: str):
     from telethon import TelegramClient
 
     async with _lock:
+        if session_name in _blocked:
+            return None
         client = _clients.get(session_name)
         if client is not None and client.is_connected():
             return client
@@ -55,6 +58,21 @@ async def disconnect_client(session_name: str) -> None:
                 await client.disconnect()
             except Exception:
                 pass
+
+
+async def force_disconnect(session_name: str) -> None:
+    """Block reconnects and close the current client for this session."""
+    async with _lock:
+        _blocked.add(session_name)
+        client = _clients.pop(session_name, None)
+        if client is not None:
+            await client.disconnect()
+
+
+async def allow_client(session_name: str) -> None:
+    """Allow an active account to reconnect after login or explicit activation."""
+    async with _lock:
+        _blocked.discard(session_name)
 
 
 async def disconnect_all() -> None:

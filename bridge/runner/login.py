@@ -28,7 +28,7 @@ import time
 
 import asyncpg
 
-from runner import sqlres
+from runner import hub, sqlres
 from runner.dbconn import connect_kwargs
 
 logger = logging.getLogger("nexus-bridge.login")
@@ -42,6 +42,7 @@ SQL_LOGIN_STATE = sqlres.load("login_state.sql")
 SQL_TAKE_CODE = sqlres.load("login_take_code.sql")
 SQL_TAKE_PASSWORD = sqlres.load("login_take_password.sql")
 SQL_LOGIN_CLAIM = sqlres.load("login_claim.sql")
+SQL_LOGIN_PREPARE_SESSION = sqlres.load("login_prepare_session.sql")
 WAIT_S = 600
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 LOGIN_CANCELLED = "__NEXUS_LOGIN_CANCELLED__"
@@ -225,8 +226,11 @@ async def db_login(req_id: int) -> int:
 
 async def _reap(proc, pool, req_id: int) -> None:
     rc = await proc.wait()
-    if rc != 0:
-        rows = await pool.fetch(SQL_LOGIN_GET, req_id)
+    rows = await pool.fetch(SQL_LOGIN_GET, req_id)
+    if rows and rows[0]["state"] == "done":
+        name = _safe_name(str(rows[0]["session_name"]))
+        await hub.allow_client(name)
+    elif rc != 0:
         if rows and rows[0]["state"] not in ("done", "failed"):
             await pool.fetch(
                 SQL_LOGIN_STATE, req_id, "failed", f"worker exited rc={rc}",
@@ -241,6 +245,20 @@ async def run_login_watcher(pool, stop: asyncio.Event) -> None:
             rows = await pool.fetch(SQL_LOGIN_CLAIM)
             req_id = rows[0]["request_id"] if rows else None
             if req_id is not None:
+                login_rows = await pool.fetch(SQL_LOGIN_GET, req_id)
+                if not login_rows:
+                    continue
+                name = _safe_name(str(login_rows[0]["session_name"]))
+                try:
+                    await pool.fetch(SQL_LOGIN_PREPARE_SESSION, f"{name}.session")
+                    await hub.force_disconnect(name)
+                except Exception as exc:
+                    await pool.fetch(
+                        SQL_LOGIN_STATE, req_id, "failed",
+                        f"session release failed: {str(exc)[:160]}",
+                    )
+                    logger.exception("could not release login session %s", name)
+                    continue
                 logger.info("login request %s claimed; spawning worker", req_id)
                 proc = await asyncio.create_subprocess_exec(
                     sys.executable, "-m", "runner.login",
