@@ -10,7 +10,15 @@ const modalOpen = ref(false);
 const status = ref("pending");
 const offset = ref(0);
 const total = ref(0);
-const pageSize = 40;
+const pageSize = 60;
+const categories = ref([]);
+const versions = ref([]);
+const categoryFilter = ref("");
+const confidenceRange = ref("");
+const confidenceSort = ref("confidence_asc");
+const labelClass = ref("info_card");
+const bulkClass = ref("info_card");
+const activeVersion = computed(() => versions.value.find((item) => item.status === "active") || null);
 const fieldsText = ref("{}");
 const normalizedText = ref("");
 const flash = ref("");
@@ -31,6 +39,22 @@ function statusLabel(item) {
   if (item.review_status === "confirmed") return "已确认";
   if (item.review_status === "not_card") return "非资料卡";
   return "待核对";
+}
+
+function categoryName(code) {
+  return categories.value.find((item) => item.code === code)?.name || ({
+    info_card: "资料卡", profile_photo: "人像", advertisement: "广告",
+    other: "其他", uncertain: "不确定",
+  }[code] || code || "未分类");
+}
+
+function confidenceText(item) {
+  return item.confidence !== null && item.confidence !== undefined && Number.isFinite(Number(item.confidence))
+    ? `${Math.round(Number(item.confidence) * 100)}%` : "";
+}
+
+function categoryDecision(code) {
+  return code === "info_card" ? "confirm" : "not_card";
 }
 
 function notify(message) {
@@ -81,6 +105,7 @@ function toggleAllMatching() {
 
 function select(item) {
   current.value = item;
+  labelClass.value = item.human_classification || item.predicted_classification || "info_card";
   fieldsText.value = JSON.stringify(item.fields || {}, null, 2);
   normalizedText.value = item.normalized_text || "";
   modalOpen.value = true;
@@ -96,7 +121,17 @@ function closeModal() {
 }
 
 async function load() {
-  const data = await api(`/api/admin/ocr/queue?status=${status.value}&limit=${pageSize}&offset=${offset.value}`);
+  const params = new URLSearchParams({
+    status: status.value, limit: String(pageSize), offset: String(offset.value),
+    sort: confidenceSort.value,
+  });
+  if (categoryFilter.value) params.set("category", categoryFilter.value);
+  if (confidenceRange.value) {
+    const [low, high] = confidenceRange.value.split(":");
+    params.set("confidence_min", low);
+    params.set("confidence_max", high);
+  }
+  const data = await api(`/api/admin/ocr/queue?${params}`);
   total.value = data.total;
   if (!data.items.length && offset.value > 0 && total.value > 0) {
     offset.value = Math.floor((total.value - 1) / pageSize) * pageSize;
@@ -107,6 +142,12 @@ async function load() {
     current.value = null;
     modalOpen.value = false;
   }
+}
+
+function changeFilter() {
+  offset.value = 0;
+  clearSelection();
+  load();
 }
 
 function changeStatus() {
@@ -173,9 +214,9 @@ async function decide(decision) {
     await api(`/api/admin/ocr/${current.value.id}/decision`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ decision, fields, normalized_text: normalizedText.value }),
+      body: JSON.stringify({ decision, class_code: labelClass.value, fields, normalized_text: normalizedText.value }),
     });
-    notify(decision === "confirm" ? "已保存并确认资料卡" : "已保存并标记为非资料卡");
+    notify(`已保存并标记为${categoryName(labelClass.value)}`);
     modalOpen.value = false;
     current.value = null;
     await load();
@@ -184,6 +225,10 @@ async function decide(decision) {
   } finally {
     busy.value = false;
   }
+}
+
+async function decideByClass() {
+  return decide(categoryDecision(labelClass.value));
 }
 
 async function retry() {
@@ -208,7 +253,8 @@ async function retry() {
 
 async function bulkDecision(decision) {
   if (!selectedCount.value || busy.value) return;
-  const label = decision === "confirm" ? "确认资料卡" : "非资料卡";
+  decision = categoryDecision(bulkClass.value);
+  const label = categoryName(bulkClass.value);
   const scope = allMatching.value ? `当前筛选的 ${selectedCount.value} 张图片` : `选中的 ${selectedCount.value} 张图片`;
   if (!confirm(`将${scope}统一改为“${label}”？这会更新最终审核状态。`)) return;
   busy.value = true;
@@ -218,10 +264,14 @@ async function bulkDecision(decision) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         decision,
+        class_code: bulkClass.value,
         ids: allMatching.value ? [] : selectedIds.value,
         all_matching: allMatching.value,
         status: status.value,
         exclude_ids: allMatching.value ? excludedIds.value : [],
+        category: allMatching.value ? categoryFilter.value || null : null,
+        confidence_min: allMatching.value && confidenceRange.value ? Number(confidenceRange.value.split(":")[0]) : null,
+        confidence_max: allMatching.value && confidenceRange.value ? Number(confidenceRange.value.split(":")[1]) : null,
       }),
     });
     clearSelection();
@@ -236,7 +286,32 @@ async function bulkDecision(decision) {
   }
 }
 
-onMounted(load);
+onMounted(async () => {
+  const [data, versionData] = await Promise.all([
+    api("/api/admin/ocr-classifier/categories"),
+    api("/api/admin/ocr-classifier/versions"),
+  ]);
+  categories.value = data.items.filter((item) => item.is_active && item.is_trainable);
+  versions.value = versionData.items;
+  if (!categories.value.some((item) => item.code === labelClass.value)) labelClass.value = categories.value[0]?.code || "";
+  bulkClass.value = labelClass.value;
+  await load();
+});
+
+async function reclassifySelected() {
+  if (!activeVersion.value || !selectedIds.value.length || allMatching.value || busy.value) return;
+  busy.value = true;
+  try {
+    const result = await api(`/api/admin/ocr-classifier/versions/${activeVersion.value.id}/reclassify`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: selectedIds.value }),
+    });
+    notify(`已按 V${result.version_id} 重新分类 ${result.updated} 张；人工标签保留`);
+    clearSelection();
+    await load();
+  } catch (error) { notify(`重新分类失败：${error.message}`); }
+  finally { busy.value = false; }
+}
 </script>
 
 <template>
@@ -251,7 +326,19 @@ onMounted(load);
         <option value="not_card">非资料卡</option>
         <option value="all">全部</option>
       </select>
-      <span class="text-xs text-slate-500">{{ total ? offset + 1 : 0 }}–{{ Math.min(offset + items.length, total) }} / {{ total }} 张</span>
+      <select v-model="categoryFilter" @change="changeFilter" class="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm">
+        <option value="">全部分类</option>
+        <option v-for="item in categories" :key="item.code" :value="item.code">{{ item.name }}</option>
+      </select>
+      <select v-model="confidenceRange" @change="changeFilter" class="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm">
+        <option value="">全部置信度</option><option value="0:0.5">0–50%</option>
+        <option value="0.5:0.8">50–80%</option><option value="0.8:1">80–100%</option>
+      </select>
+      <select v-model="confidenceSort" @change="changeFilter" class="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm">
+        <option value="confidence_asc">置信度低→高</option><option value="confidence_desc">置信度高→低</option>
+        <option value="newest">最新优先</option><option value="oldest">最早优先</option>
+      </select>
+      <span class="text-xs text-slate-500">{{ total ? offset + 1 : 0 }}–{{ Math.min(offset + items.length, total) }}/{{ total }}张</span>
       <button @click="togglePage" :disabled="!items.length || busy" class="flex items-center gap-1 rounded-lg border border-slate-700 px-2.5 py-1 text-xs text-slate-300 disabled:opacity-40">
         <component :is="pageFullySelected ? CheckSquare : Square" class="size-3.5" />
         {{ allMatching ? "取消全部选择" : pageFullySelected ? "取消本页选择" : "本页全选" }}
@@ -271,14 +358,16 @@ onMounted(load);
         <input type="checkbox" :checked="isSelected(item.id)" :disabled="busy" @change="toggleItem(item.id)"
           class="absolute left-2 top-2 z-10 size-5 cursor-pointer accent-sky-500 disabled:opacity-50" :aria-label="`选择图片 ${item.id}`" />
         <button @click="select(item)" class="block w-full text-left">
-          <div class="aspect-[3/4] overflow-hidden bg-black">
+          <div class="relative aspect-[3/4] overflow-hidden bg-black">
             <img :src="mediaUrl(item.media_path)" class="h-full w-full object-contain" :alt="item.nickname || 'OCR 图片'" loading="lazy" />
+            <span class="absolute right-1 top-1 max-w-[75%] truncate rounded bg-black/75 px-1.5 py-1 text-[10px] font-medium text-white">{{ categoryName(item.predicted_classification || item.classification) }}</span>
+            <span v-if="confidenceText(item)" class="absolute bottom-1 right-1 rounded bg-emerald-600/90 px-2 py-1 text-xs font-semibold text-white shadow" :title="item.confidence_source === 'model' ? `模型置信度 · V${item.classifier_version_id}` : '旧规则估值，尚未由训练模型校准'">{{ confidenceText(item) }}</span>
           </div>
           <div class="space-y-1 p-2">
             <div class="truncate text-xs font-medium text-slate-200">{{ item.nickname || item.source_title || `消息 #${item.raw_id || item.id}` }}</div>
             <div class="flex items-center justify-between gap-1 text-[10px] text-slate-400">
-              <span class="truncate">{{ item.classification }}</span>
-              <span class="shrink-0">{{ Math.round(item.confidence * 100) }}%</span>
+              <span class="truncate">{{ item.human_classification ? `人工：${categoryName(item.human_classification)}` : statusLabel(item) }}</span>
+              <span v-if="item.confidence_source === 'model'" class="shrink-0">V{{ item.classifier_version_id }}</span>
             </div>
             <div class="truncate text-[10px]" :class="item.status === 'failed' ? 'text-rose-300' : item.review_status === 'confirmed' ? 'text-emerald-300' : item.review_status === 'not_card' ? 'text-slate-400' : 'text-amber-300'">
               {{ statusLabel(item) }}<span v-if="item.error"> · {{ item.error }}</span>
@@ -291,11 +380,12 @@ onMounted(load);
 
     <div v-if="selectedCount" class="sticky bottom-2 z-20 flex flex-wrap items-center gap-2 rounded-xl border border-sky-800 bg-slate-950/95 p-3 shadow-xl backdrop-blur">
       <span class="mr-auto text-sm text-slate-200">已选 {{ selectedCount }} 张</span>
-      <button :disabled="busy" @click="bulkDecision('confirm')" class="flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-medium text-white disabled:opacity-50">
-        <Check class="size-4" />批量确认资料卡
-      </button>
-      <button :disabled="busy" @click="bulkDecision('not_card')" class="flex items-center gap-1 rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-200 disabled:opacity-50">
-        <X class="size-4" />批量标记非资料卡
+      <button v-if="activeVersion" :disabled="busy || allMatching || !selectedIds.length" @click="reclassifySelected" class="rounded-lg border border-sky-700 px-3 py-2 text-xs text-sky-200 disabled:opacity-40">按 V{{ activeVersion.id }} 重新分类</button>
+      <select v-model="bulkClass" class="rounded-lg border border-slate-700 bg-slate-900 px-2 py-2 text-xs text-slate-200">
+        <option v-for="item in categories" :key="item.code" :value="item.code">{{ item.name }}</option>
+      </select>
+      <button :disabled="busy" @click="bulkDecision(categoryDecision(bulkClass))" class="flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-medium text-white disabled:opacity-50">
+        <Check class="size-4" />批量标注类别
       </button>
       <button :disabled="busy" @click="clearSelection" class="rounded-lg px-2 py-2 text-xs text-slate-400 hover:text-white">清空选择</button>
     </div>
@@ -316,6 +406,12 @@ onMounted(load);
           </section>
           <section class="space-y-3 overflow-y-auto p-4">
             <div v-if="current.error" class="rounded-lg border border-rose-900/70 bg-rose-950/40 p-3 text-xs text-rose-200">识别失败：{{ current.error }}</div>
+            <label class="block text-xs text-slate-400">人工确认图片类别
+              <select v-model="labelClass" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100">
+                <option v-for="item in categories" :key="item.code" :value="item.code">{{ item.name }}</option>
+              </select>
+              <span class="mt-1 block text-[10px] text-slate-500">保存后作为训练标签；会保留模型原预测和版本记录。</span>
+            </label>
             <p class="whitespace-pre-wrap rounded-lg bg-slate-900 p-3 text-xs leading-relaxed text-slate-400">来源消息：{{ current.message_text || "（无正文）" }}</p>
             <label class="block text-xs text-slate-400">OCR 原文（只读）
               <textarea :value="current.raw_text" readonly rows="5" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-900 p-3 text-sm leading-relaxed text-slate-200" />
@@ -334,8 +430,7 @@ onMounted(load);
             </div>
             <div class="sticky bottom-0 flex flex-wrap gap-2 border-t border-slate-800 bg-slate-950 py-3">
               <button :disabled="busy" @click="saveOnly" class="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-200 disabled:opacity-50">保存修改</button>
-              <button :disabled="busy" @click="decide('confirm')" class="flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-medium text-white disabled:opacity-50"><Check class="size-4" />保存并确认资料卡</button>
-              <button :disabled="busy" @click="decide('not_card')" class="flex items-center gap-1 rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-200 disabled:opacity-50"><X class="size-4" />保存并标记非资料卡</button>
+              <button :disabled="busy || !labelClass" @click="decideByClass" class="flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-medium text-white disabled:opacity-50"><Check class="size-4" />保存并标记为{{ categoryName(labelClass) }}</button>
               <button v-if="current.status === 'failed'" :disabled="busy" @click="retry" class="flex items-center gap-1 rounded-lg border border-amber-700/60 px-3 py-2 text-xs text-amber-300 disabled:opacity-50"><RotateCw class="size-4" />重试识别</button>
             </div>
           </section>

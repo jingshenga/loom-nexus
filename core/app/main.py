@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from app import db
-from app.api import accounts, auth, chat, chat_media, gateway, health, listings, ocr_review, probe, review, rules, settings, sources, users
+from app.api import accounts, auth, chat, chat_media, gateway, health, listings, ocr_classifier, ocr_review, probe, review, review_meta, rules, settings, sources, users
 from app.config import get_settings
 
 logger = logging.getLogger("nexus-core")
@@ -67,7 +67,9 @@ app.include_router(health.router)
 app.include_router(auth.router)
 app.include_router(listings.router)
 app.include_router(review.router)
+app.include_router(review_meta.router)
 app.include_router(ocr_review.router)
+app.include_router(ocr_classifier.router)
 app.include_router(gateway.router)
 app.include_router(chat.router)
 app.include_router(chat_media.router)

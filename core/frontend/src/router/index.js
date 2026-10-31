@@ -22,6 +22,11 @@ const routes = [
     meta: { admin: true },
   },
   {
+    path: "/admin/ocr-classifier",
+    component: () => import("../views/AdminOcrClassifierView.vue"),
+    meta: { admin: true },
+  },
+  {
     path: "/admin/rules",
     component: () => import("../views/AdminRulesView.vue"),
     meta: { admin: true },

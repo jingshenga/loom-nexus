@@ -6,6 +6,10 @@ import { api, mediaUrl } from "../api/client";
 import AdminMediaGrid from "../components/AdminMediaGrid.vue";
 
 const queue = ref([]);
+const queueTotal = ref(0);
+const pageOffset = ref(0);
+const pageSize = 60;
+const sourceOptions = ref([]);
 const duplicatePairs = ref([]);
 const selectedDuplicate = ref(null);
 const duplicateSaving = ref(false);
@@ -90,18 +94,56 @@ function select(item) {
   };
 }
 
-async function loadQueue() {
-  const params = new URLSearchParams({ status: statusTab.value });
+async function loadQueue(resetPage = false) {
+  if (resetPage) pageOffset.value = 0;
+  const bucket = activeWorkbench.value === "checkin" ? "checkin_supplement"
+    : activeWorkbench.value === "tgprofile" ? "tg_profile_v2" : "";
+  const params = new URLSearchParams({ status: bucket ? "pending" : statusTab.value });
+  if (bucket) params.set("bucket", bucket);
+  params.set("limit", String(pageSize));
+  params.set("offset", String(pageOffset.value));
   if (appliedNickname.value) params.set("nickname", appliedNickname.value);
   if (appliedSource.value) params.set("source", appliedSource.value);
   if (mediaFilter.value) params.set("media", mediaFilter.value);
   params.set("sort", sortOrder.value);
-  const data = await api(`/api/admin/review/queue?${params}`);
+  const countParams = new URLSearchParams({ status: bucket ? "pending" : statusTab.value });
+  if (bucket) countParams.set("bucket", bucket);
+  if (appliedNickname.value) countParams.set("nickname", appliedNickname.value);
+  if (appliedSource.value) countParams.set("source", appliedSource.value);
+  if (mediaFilter.value) countParams.set("media", mediaFilter.value);
+  const [data, count] = await Promise.all([
+    api(`/api/admin/review/queue?${params}`),
+    api(`/api/admin/review/queue-total?${countParams}`),
+  ]);
+  queueTotal.value = count.total;
+  if (!data.items.length && pageOffset.value > 0 && queueTotal.value > 0) {
+    pageOffset.value = Math.floor((queueTotal.value - 1) / pageSize) * pageSize;
+    return loadQueue();
+  }
   queue.value = data.items;
   if (current.value) {
     const refreshed = data.items.find((x) => x.id === current.value.id);
     current.value = refreshed || null;
   }
+}
+
+async function loadReviewSources() {
+  const data = await api("/api/admin/review/sources");
+  sourceOptions.value = data.items;
+}
+
+function changePage(delta) {
+  const lastOffset = Math.max(0, Math.floor((queueTotal.value - 1) / pageSize) * pageSize);
+  pageOffset.value = Math.min(lastOffset, Math.max(0, pageOffset.value + delta * pageSize));
+  selectedIds.value = [];
+  loadQueue();
+}
+
+function setWorkbench(value) {
+  activeWorkbench.value = value;
+  pageOffset.value = 0;
+  if (value === "duplicates") loadDuplicatePairs();
+  if (["review", "checkin", "tgprofile"].includes(value)) loadQueue();
 }
 
 async function loadDuplicatePairs() {
@@ -241,14 +283,14 @@ async function createManualDutyCard() {
 
 async function applyNicknameFilter() {
   appliedNickname.value = nicknameFilter.value.trim();
-  appliedSource.value = sourceFilter.value.trim();
+  appliedSource.value = sourceFilter.value;
   selectedIds.value = [];
-  await loadQueue();
+  await loadQueue(true);
 }
 
 async function applyMediaFilters() {
   selectedIds.value = [];
-  await loadQueue();
+  await loadQueue(true);
 }
 
 async function batchPublish() {
@@ -387,7 +429,8 @@ const filteredDutyRecovery = computed(() => dutyRecovery.value
   }));
 
 onMounted(async () => {
-  await loadQueue();
+  await loadReviewSources();
+  await loadQueue(true);
   await loadDutyRecovery();
   window.addEventListener("keydown", onKey);
   timer = setInterval(() => { loadQueue(); loadDutyRecovery(); }, 15000);
@@ -413,14 +456,19 @@ onUnmounted(() => {
   <AdminTabs />
 
     <div class="flex gap-2">
-      <button @click="activeWorkbench = 'review'" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'review' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">审核队列</button>
+      <button @click="setWorkbench('review')" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'review' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">审核队列</button>
       <button @click="activeWorkbench = 'duplicates'; loadDuplicatePairs()" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'duplicates' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">疑似重复</button>
-      <button @click="activeWorkbench = 'duty'" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'duty' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">签到补采（{{ dutyRecovery.length }}）</button>
+      <button @click="statusTab = 'pending'; setWorkbench('checkin')" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'checkin' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">签到补采审核</button>
+      <button @click="statusTab = 'pending'; setWorkbench('tgprofile')" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'tgprofile' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">TG号采集V2</button>
+      <button @click="activeWorkbench = 'duty'" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'duty' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">旧签到恢复（{{ dutyRecovery.length }}）</button>
     </div>
 
     <div v-if="activeWorkbench !== 'review'" class="flex flex-wrap items-center gap-2 rounded-lg border border-slate-800 bg-slate-900/60 p-2">
       <input v-model="nicknameFilter" placeholder="按昵称筛选" class="min-w-28 rounded-lg border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm" />
-      <input v-model="sourceFilter" placeholder="按来源筛选" class="min-w-28 rounded-lg border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm" />
+      <select v-model="sourceFilter" class="min-w-36 rounded-lg border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm">
+        <option value="">全部采集群组</option>
+        <option v-for="source in sourceOptions" :key="source.id" :value="source.title">{{ source.title }}{{ source.username ? ` · @${source.username}` : "" }}</option>
+      </select>
       <select v-if="activeWorkbench === 'duplicates'" v-model="mediaFilter" class="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm">
         <option value="">全部媒体</option><option value="photo">有图片</option><option value="video">有视频</option>
       </select>
@@ -502,11 +550,11 @@ onUnmounted(() => {
       <div v-else class="flex items-center justify-center rounded-xl border border-slate-800 text-sm text-slate-500 lg:col-span-8">选择一个未找到账号</div>
     </section>
 
-    <template v-else-if="activeWorkbench === 'review'">
+    <template v-else-if="['review', 'checkin', 'tgprofile'].includes(activeWorkbench)">
 
     <div class="flex flex-wrap items-center gap-2">
-      <h2 class="text-lg font-semibold">审核工作台</h2>
-      <select v-model="statusTab" @change="selectedIds = []; loadQueue()"
+      <h2 class="text-lg font-semibold">{{ activeWorkbench === 'checkin' ? '签到补采审核' : activeWorkbench === 'tgprofile' ? 'TG号采集V2' : '审核工作台' }}</h2>
+      <select v-model="statusTab" @change="selectedIds = []; loadQueue(true)"
         class="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm">
         <option value="pending">待审核</option>
         <option value="published">已发布</option>
@@ -517,9 +565,11 @@ onUnmounted(() => {
         <input v-model="nicknameFilter" @keyup.enter="applyNicknameFilter"
           placeholder="按昵称筛选"
           class="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm sm:w-36 sm:flex-none" />
-        <input v-model="sourceFilter" @keyup.enter="applyNicknameFilter"
-          placeholder="按来源筛选"
-          class="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm sm:w-36 sm:flex-none" />
+        <select v-model="sourceFilter"
+          class="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm sm:w-44 sm:flex-none">
+          <option value="">全部采集群组</option>
+          <option v-for="source in sourceOptions" :key="source.id" :value="source.title">{{ source.title }}{{ source.username ? ` · @${source.username}` : "" }}</option>
+        </select>
         <button @click="applyNicknameFilter"
           class="rounded-lg border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800">筛选</button>
       </div>
@@ -529,6 +579,11 @@ onUnmounted(() => {
       <select v-model="sortOrder" @change="applyMediaFilters" class="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm">
         <option value="newest">最新优先</option><option value="oldest">最早优先</option>
       </select>
+      <div class="flex items-center gap-1 text-xs text-slate-400">
+        <span>{{ queueTotal ? pageOffset + 1 : 0 }}–{{ Math.min(pageOffset + queue.length, queueTotal) }}/{{ queueTotal }}张</span>
+        <button :disabled="pageOffset === 0" @click="changePage(-1)" class="rounded border border-slate-700 px-2 py-1 disabled:opacity-40">上一页</button>
+        <button :disabled="pageOffset + pageSize >= queueTotal" @click="changePage(1)" class="rounded border border-slate-700 px-2 py-1 disabled:opacity-40">下一页</button>
+      </div>
       <button v-if="appliedNickname || appliedSource || mediaFilter" @click="nicknameFilter = ''; sourceFilter = ''; appliedNickname = ''; appliedSource = ''; mediaFilter = ''; applyMediaFilters()"
         class="rounded-lg px-2 py-1 text-xs text-slate-500 hover:text-slate-300">清除筛选</button>
       <label class="flex items-center gap-1.5 text-xs text-slate-400">

@@ -81,7 +81,7 @@ def _save_uploaded_photo(image_data: str, image_mime: str) -> dict:
 async def queue(
     status: str = "pending", limit: int = 30, offset: int = 0,
     nickname: str = None, source: str = None, media: str = None,
-    sort: Literal["newest", "oldest"] = "newest",
+    sort: Literal["newest", "oldest"] = "newest", bucket: str = None,
 ) -> dict:
     pool = db.get_pool()
     if pool is None:
@@ -90,7 +90,7 @@ async def queue(
         raise HTTPException(status_code=400, detail="invalid media filter")
     rows = await pool.fetch(
         SQL_QUEUE, status, limit, offset, nickname or None,
-        source or None, media, sort,
+        source or None, media, sort, bucket or None,
     )
     items = []
     for r in rows:
@@ -168,7 +168,7 @@ async def decide_duplicate(
         async with conn.transaction():
             rows = await conn.fetch(
                 "SELECT l.id, l.status, l.created_at, l.nickname, l.district, "
-                "l.price_amount, l.price_currency, l.contact_peer_id, "
+                "l.price_amount, l.price_currency, l.contact_peer_id, l.profile_collection_job_id, "
                 "l.contact_username, COALESCE(NULLIF(rm.raw_text, ''), l.description, '') AS source_text "
                 "FROM listings l LEFT JOIN raw_messages rm ON rm.id=l.source_msg_id "
                 "WHERE l.id = ANY($1::bigint[]) ORDER BY l.id FOR UPDATE OF l",
@@ -176,7 +176,7 @@ async def decide_duplicate(
             )
             if len(rows) != 2:
                 raise HTTPException(status_code=404, detail="card not found")
-            if any(row["status"] not in {"published", "pending"} for row in rows):
+            if any(row["status"] not in {"published", "pending", "duplicate_pending", "archived"} for row in rows):
                 raise HTTPException(status_code=409, detail="cards are no longer active")
 
             def signature(value: str) -> str:
@@ -203,7 +203,14 @@ async def decide_duplicate(
                 and signature(first["source_text"]) != ""
                 and not same_identity
             )
-            if not same_profile:
+            same_nickname = (
+                (first["profile_collection_job_id"] is not None
+                 or second["profile_collection_job_id"] is not None)
+                and first["nickname"] is not None
+                and second["nickname"] is not None
+                and first["nickname"].strip().casefold() == second["nickname"].strip().casefold()
+            )
+            if not (same_identity or same_nickname or same_profile):
                 raise HTTPException(status_code=409, detail="cards are not a current duplicate candidate")
 
             latest = max(rows, key=lambda row: (row["created_at"], row["id"]))
@@ -212,8 +219,19 @@ async def decide_duplicate(
                 archived_id = next(row["id"] for row in rows if row["id"] != latest["id"])
                 await conn.execute(
                     "UPDATE listings SET status='archived', updated_at=NOW() "
-                    "WHERE id=$1 AND status IN ('published', 'pending')",
+                    "WHERE id=$1 AND status IN ('published', 'pending', 'duplicate_pending')",
                     archived_id,
+                )
+                await conn.execute(
+                    "UPDATE listings SET status='pending', updated_at=NOW() "
+                    "WHERE id=$1 AND status='duplicate_pending'",
+                    latest["id"],
+                )
+            else:
+                await conn.execute(
+                    "UPDATE listings SET status='pending', updated_at=NOW() "
+                    "WHERE id = ANY($1::bigint[]) AND status='duplicate_pending'",
+                    [left_id, right_id],
                 )
             await conn.execute(
                 "INSERT INTO listing_duplicate_decisions "
