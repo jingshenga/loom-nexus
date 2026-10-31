@@ -27,6 +27,7 @@ BEGIN
           "search_text": "今日开课老师",
           "update_mode": "edited_snapshot",
           "identity_mode": "direct_username_links",
+          "duty_identity_markers": true,
           "profile_query_required": true,
           "exclude_usernames": ["tyssbd_bot", "nbtyss"],
           "business_cutoff_hour": 4
@@ -48,6 +49,7 @@ BEGIN
           "update_mode": "replace_snapshot",
           "identity_mode": "linked_listing_messages",
           "target_channel_username": "NBXMWBGJ",
+          "target_peer_id": -1003083173117,
           "profile_query_required": false,
           "exclude_usernames": ["XMWGJR_BOT", "xiaomuwu88"],
           "business_cutoff_hour": 4

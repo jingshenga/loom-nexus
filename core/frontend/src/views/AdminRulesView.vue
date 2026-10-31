@@ -795,7 +795,9 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
         <div class="rounded-xl border border-slate-800 bg-slate-900/50 p-4">
           <h3 class="text-sm font-semibold">当前同步状态</h3>
           <div class="mt-3 grid grid-cols-2 gap-2 text-sm sm:grid-cols-3">
-            <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-sky-300">{{ current.duty_status?.matched || 0 }}</div><div class="text-xs text-slate-500">日报身份</div></div>
+            <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-sky-300">{{ current.duty_status?.matched || 0 }}</div><div class="text-xs text-slate-500">日报身份（可采集）</div></div>
+            <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-cyan-300">{{ current.duty_status?.green_blue || 0 }}</div><div class="text-xs text-slate-500">🟢💙并列</div></div>
+            <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-lime-300">{{ current.duty_status?.green_only || 0 }}</div><div class="text-xs text-slate-500">仅🟢，跳过采集</div></div>
             <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-emerald-400">{{ current.duty_status?.with_card || 0 }}</div><div class="text-xs text-slate-500">已有卡片</div></div>
             <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-amber-300">{{ current.duty_status?.queued || 0 }}</div><div class="text-xs text-slate-500">排队补采</div></div>
             <div class="rounded-lg bg-slate-950 p-3"><div class="text-2xl font-bold text-violet-300">{{ current.duty_status?.fetched || 0 }}</div><div class="text-xs text-slate-500">已取回，待提取</div></div>

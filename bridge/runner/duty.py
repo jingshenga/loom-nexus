@@ -82,6 +82,69 @@ def profile_usernames(message, config: dict | None = None) -> list[str]:
     return sorted(set(found))
 
 
+def _utf16_index(text: str, offset: int) -> int:
+    units = 0
+    for index, char in enumerate(text):
+        if units >= offset:
+            return index
+        units += len(char.encode("utf-16-le")) // 2
+    return len(text)
+
+
+def classified_profile_usernames(message, config: dict):
+    excluded = {str(x).lower().lstrip("@") for x in config.get("exclude_usernames") or []}
+    require_profile = bool(config.get("profile_query_required"))
+    text = message.raw_text or ""
+    collected, green_only, green_blue = set(), set(), set()
+    entities = []
+    for entity, _ in message.get_entities_text() or []:
+        url = getattr(entity, "url", None)
+        if url:
+            entities.append((entity, url))
+
+    previous_end = 0
+    for entity, url in entities:
+        start = _utf16_index(text, int(getattr(entity, "offset", 0)))
+        prior_end = previous_end
+        end = int(getattr(entity, "offset", 0)) + int(getattr(entity, "length", 0))
+        previous_end = max(previous_end, _utf16_index(text, end))
+        parsed = urlparse(url)
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) != 1 or (require_profile and "profile" not in parsed.query.lower()):
+            continue
+        username = parts[0].lower()
+        if username in excluded:
+            continue
+
+        line_start = max(text.rfind("\n", 0, start) + 1, prior_end)
+        prefix = text[line_start:start].rstrip("\u2060\u200b\ufeff \t\r")
+        marks = set()
+        while prefix:
+            prefix = prefix.rstrip("\u2060\u200b\ufeff \t\r\ufe0f")
+            if prefix.endswith("🟢"):
+                marks.add("green")
+                prefix = prefix[:-1]
+            elif prefix.endswith("💙"):
+                marks.add("blue")
+                prefix = prefix[:-1]
+            else:
+                break
+
+        if marks == {"green"}:
+            green_only.add(username)
+        else:
+            collected.add(username)
+            if marks == {"green", "blue"}:
+                green_blue.add(username)
+
+    # Keep legacy behavior for profile links represented only as visible URLs.
+    for username in profile_usernames(message, config):
+        if username not in collected and username not in green_only:
+            collected.add(username)
+    green_only.difference_update(collected)
+    return sorted(collected), sorted(green_only), sorted(green_blue)
+
+
 def linked_posts(message, target_channel: str) -> list[tuple[str, int, str]]:
     wanted = target_channel.lower().lstrip("@")
     found = []
@@ -97,14 +160,23 @@ def listing_contact_username(message) -> str | None:
     return match.group(1).lower() if match else None
 
 
-async def _resolve_link(pool, client, channel: str, msg_id: int, entity=None):
+async def _resolve_link(
+    pool, client, channel: str, msg_id: int, entity=None, target_peer_id=None,
+):
     from telethon import utils
 
-    entity = entity or await client.get_entity(channel)
+    if target_peer_id is not None:
+        rows = await pool.fetch(SQL_LINK_LOOKUP, int(target_peer_id), msg_id)
+        if rows:
+            return rows[0]["contact_username"]
+    entity = entity or await client.get_entity(
+        int(target_peer_id) if target_peer_id is not None else channel,
+    )
     target_peer_id = utils.get_peer_id(entity)
-    rows = await pool.fetch(SQL_LINK_LOOKUP, target_peer_id, msg_id)
-    if rows:
-        return rows[0]["contact_username"]
+    if target_peer_id is not None:
+        rows = await pool.fetch(SQL_LINK_LOOKUP, target_peer_id, msg_id)
+        if rows:
+            return rows[0]["contact_username"]
 
     rows = await pool.fetch(SQL_LISTING_LOOKUP, target_peer_id, msg_id)
     username = rows[0]["contact_username"] if rows else None
@@ -123,28 +195,36 @@ async def _resolve_link(pool, client, channel: str, msg_id: int, entity=None):
 async def parse_usernames(pool, client, message, config: dict):
     mode = config.get("identity_mode")
     if mode == "direct_username_links":
-        return profile_usernames(message, config), [], {}
+        if config.get("duty_identity_markers"):
+            usernames, green_only, green_blue = classified_profile_usernames(message, config)
+            return usernames, [], {}, green_only, green_blue
+        return profile_usernames(message, config), [], {}, [], []
     if mode != "linked_listing_messages":
-        return [], ["unsupported identity mode"], {}
+        return [], ["unsupported identity mode"], {}, [], []
 
     channel = str(config.get("target_channel_username") or "").lstrip("@")
     posts = linked_posts(message, channel)
     if not posts:
-        return [], [], {}
-    try:
-        entity = await client.get_entity(channel)
-    except Exception as exc:
-        logger.warning("duty target channel resolve failed (%s): %s", channel, exc)
-        return [], sorted({url for _, _, url in posts}), {}
-    from telethon import utils
+        return [], [], {}, [], []
+    target_peer_id = config.get("target_peer_id")
+    entity = None
+    if target_peer_id is None:
+        from telethon import utils
 
-    target_peer_id = utils.get_peer_id(entity)
+        try:
+            entity = await client.get_entity(channel)
+            target_peer_id = utils.get_peer_id(entity)
+        except Exception as exc:
+            logger.warning("duty target channel resolve failed (%s): %s", channel, exc)
+            return [], sorted({url for _, _, url in posts}), {}, [], []
     usernames = []
     unresolved = []
     linked_targets = {}
     for link_channel, msg_id, url in posts:
         try:
-            username = await _resolve_link(pool, client, link_channel, msg_id, entity)
+            username = await _resolve_link(
+                pool, client, link_channel, msg_id, entity, target_peer_id,
+            )
         except Exception as exc:
             logger.warning("duty link resolve failed (%s/%s): %s", link_channel, msg_id, exc)
             username = None
@@ -153,25 +233,29 @@ async def parse_usernames(pool, client, message, config: dict):
             linked_targets.setdefault(username, (target_peer_id, msg_id))
         else:
             unresolved.append(url)
-    return sorted(set(usernames)), sorted(set(unresolved)), linked_targets
+    return sorted(set(usernames)), sorted(set(unresolved)), linked_targets, [], []
 
 
 async def process_message(pool, client, rule, message) -> bool:
     config = decode_config(rule["config_json"])
     if not message_matches(message, config):
         return False
-    usernames, unresolved, linked_targets = await parse_usernames(pool, client, message, config)
+    usernames, unresolved, linked_targets, green_only, green_blue = await parse_usernames(
+        pool, client, message, config,
+    )
     observed_at = message.edit_date or message.date or datetime.now(timezone.utc)
     duty_date, expires_at = business_window(
         observed_at, int(config.get("business_cutoff_hour") or 4),
     )
     digest = hashlib.sha256(json.dumps(
-        {"usernames": usernames, "unresolved": unresolved},
+        {"usernames": usernames, "green_only": green_only,
+         "green_blue": green_blue, "unresolved": unresolved},
         ensure_ascii=False, sort_keys=True,
     ).encode("utf-8")).hexdigest()
     rows = await pool.fetch(
         SQL_SNAPSHOT, rule["rule_id"], rule["source_id"], duty_date,
         message.id, digest, json.dumps(usernames), json.dumps(unresolved),
+        json.dumps(green_only), json.dumps(green_blue),
         observed_at, expires_at,
     )
     changed = bool(rows[0]["changed"])

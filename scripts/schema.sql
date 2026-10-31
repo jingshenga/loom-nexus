@@ -76,6 +76,8 @@ CREATE TABLE IF NOT EXISTS duty_snapshots (
     platform_msg_id BIGINT NOT NULL,
     content_hash VARCHAR(64) NOT NULL,
     contact_usernames JSONB NOT NULL DEFAULT '[]',
+    green_only_usernames JSONB NOT NULL DEFAULT '[]',
+    green_blue_usernames JSONB NOT NULL DEFAULT '[]',
     unresolved_links JSONB NOT NULL DEFAULT '[]',
     observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at TIMESTAMPTZ NOT NULL,
@@ -83,6 +85,9 @@ CREATE TABLE IF NOT EXISTS duty_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_duty_snapshots_active
     ON duty_snapshots(duty_date, expires_at);
+ALTER TABLE duty_snapshots
+    ADD COLUMN IF NOT EXISTS green_only_usernames JSONB NOT NULL DEFAULT '[]',
+    ADD COLUMN IF NOT EXISTS green_blue_usernames JSONB NOT NULL DEFAULT '[]';
 
 -- Small persistent cache for aggregate lists that point at a channel post.
 CREATE TABLE IF NOT EXISTS duty_link_cache (
@@ -957,6 +962,8 @@ CREATE OR REPLACE FUNCTION duty_snapshot_upsert(
     p_content_hash VARCHAR(64),
     p_contact_usernames JSONB,
     p_unresolved_links JSONB,
+    p_green_only_usernames JSONB,
+    p_green_blue_usernames JSONB,
     p_observed_at TIMESTAMPTZ,
     p_expires_at TIMESTAMPTZ
 ) RETURNS BOOLEAN
@@ -966,15 +973,34 @@ DECLARE
 BEGIN
     INSERT INTO duty_snapshots AS ds (
         rule_id, source_id, duty_date, platform_msg_id, content_hash,
-        contact_usernames, unresolved_links, observed_at, expires_at
+        contact_usernames, unresolved_links, green_only_usernames,
+        green_blue_usernames, observed_at, expires_at
     ) VALUES (
         p_rule_id, p_source_id, p_duty_date, p_platform_msg_id, p_content_hash,
-        p_contact_usernames, p_unresolved_links, p_observed_at, p_expires_at
+        p_contact_usernames, p_unresolved_links, p_green_only_usernames,
+        p_green_blue_usernames, p_observed_at, p_expires_at
     )
     ON CONFLICT (rule_id, source_id, duty_date) DO UPDATE SET
         platform_msg_id = EXCLUDED.platform_msg_id,
         content_hash = EXCLUDED.content_hash,
-        contact_usernames = EXCLUDED.contact_usernames,
+        contact_usernames = CASE
+            WHEN jsonb_array_length(EXCLUDED.contact_usernames) = 0
+             AND jsonb_array_length(EXCLUDED.unresolved_links) > 0
+                THEN ds.contact_usernames
+            ELSE EXCLUDED.contact_usernames
+        END,
+        green_only_usernames = CASE
+            WHEN jsonb_array_length(EXCLUDED.contact_usernames) = 0
+             AND jsonb_array_length(EXCLUDED.unresolved_links) > 0
+                THEN ds.green_only_usernames
+            ELSE EXCLUDED.green_only_usernames
+        END,
+        green_blue_usernames = CASE
+            WHEN jsonb_array_length(EXCLUDED.contact_usernames) = 0
+             AND jsonb_array_length(EXCLUDED.unresolved_links) > 0
+                THEN ds.green_blue_usernames
+            ELSE EXCLUDED.green_blue_usernames
+        END,
         unresolved_links = EXCLUDED.unresolved_links,
         observed_at = EXCLUDED.observed_at,
         expires_at = EXCLUDED.expires_at

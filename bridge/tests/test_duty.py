@@ -1,13 +1,17 @@
+import json
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from runner.duty import (
     business_window,
+    classified_profile_usernames,
     linked_posts,
     listing_contact_username,
     message_matches,
+    process_message,
     profile_usernames,
 )
 from runner.duty_collection import (
@@ -23,6 +27,72 @@ class FakeMessage:
 
     def get_entities_text(self):
         return [(SimpleNamespace(url=url), "link") for url in self._urls]
+
+
+class LinkedProfileMessage:
+    def __init__(self, rows, header=""):
+        self.raw_text = "\n".join(([header] if header else []) + [text for text, _ in rows])
+        self._entities = []
+        offset = len(header.encode("utf-16-le")) // 2 + (1 if header else 0)
+        for text, url in rows:
+            name = text.rsplit("\u2060", 1)[-1]
+            start = text.index(name)
+            prefix = text[:start]
+            entity = SimpleNamespace(
+                url=url,
+                offset=offset + len(prefix.encode("utf-16-le")) // 2,
+                length=len(name.encode("utf-16-le")) // 2,
+            )
+            self._entities.append((entity, name))
+            offset += len(text.encode("utf-16-le")) // 2 + 1
+
+    def get_entities_text(self):
+        return self._entities
+
+
+class DutyProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_green_only_is_not_enqueued_but_green_blue_is(self):
+        message = LinkedProfileMessage([
+            ("🟢\u2060团子", "https://t.me/tuanzi?profile"),
+            ("🟢\u2060💙\u2060团团子", "https://t.me/tuantuanzi?profile"),
+        ], header="💖今日开课老师")
+        message.sender_id = 77
+        message.date = datetime.now(timezone.utc)
+        message.edit_date = None
+        message.id = 123
+
+        class Pool:
+            def __init__(self):
+                self.enqueued = []
+                self.snapshot_args = None
+
+            async def fetch(self, sql, *args):
+                if sql == "snapshot-sql":
+                    self.snapshot_args = args
+                    return [{"changed": True}]
+                self.enqueued.append(args)
+                return []
+
+        pool = Pool()
+        rule = {
+            "rule_id": 4,
+            "source_id": 5,
+            "config_json": {
+                "sender_peer_id": 77,
+                "match_prefix": "💖今日开课老师",
+                "identity_mode": "direct_username_links",
+                "profile_query_required": True,
+                "duty_identity_markers": True,
+                "collection_source_id": 8,
+            },
+        }
+        with patch("runner.duty.SQL_SNAPSHOT", "snapshot-sql"):
+            await process_message(pool, object(), rule, message)
+
+        self.assertEqual(len(pool.enqueued), 1)
+        self.assertEqual(pool.enqueued[0][2], "tuantuanzi")
+        self.assertEqual(json.loads(pool.snapshot_args[7]), ["tuanzi"])
+        self.assertEqual(json.loads(pool.snapshot_args[8]), ["tuantuanzi"])
 
 
 class DutyRuleTests(unittest.TestCase):
@@ -53,6 +123,19 @@ class DutyRuleTests(unittest.TestCase):
             "exclude_usernames": ["tyssbd_bot"],
         })
         self.assertEqual(usernames, ["lemony88"])
+
+    def test_tianyi_skips_only_green_and_collects_green_blue(self):
+        message = LinkedProfileMessage([
+            ("🟢\u2060团子", "https://t.me/tuanzi?profile"),
+            ("🟢\u2060💙\u2060团团子", "https://t.me/tuantuanzi?profile"),
+            ("\u2060小号", "https://t.me/othername?profile"),
+        ])
+        usernames, green_only, green_blue = classified_profile_usernames(message, {
+            "profile_query_required": True,
+        })
+        self.assertEqual(usernames, ["othername", "tuantuanzi"])
+        self.assertEqual(green_only, ["tuanzi"])
+        self.assertEqual(green_blue, ["tuantuanzi"])
 
     def test_xiaomuwu_keeps_only_target_channel_posts(self):
         message = FakeMessage("在线老师", 1, [

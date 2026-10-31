@@ -12,10 +12,22 @@ WITH clock AS (
     CROSS JOIN clock c
     CROSS JOIN LATERAL jsonb_array_elements_text(ds.contact_usernames) AS u(username)
     WHERE ds.duty_date = c.duty_date
+), green_only AS (
+    SELECT DISTINCT ds.rule_id, lower(u.username) AS username
+    FROM duty_snapshots ds CROSS JOIN clock c
+    CROSS JOIN LATERAL jsonb_array_elements_text(ds.green_only_usernames) AS u(username)
+    WHERE ds.duty_date = c.duty_date
+), green_blue AS (
+    SELECT DISTINCT ds.rule_id, lower(u.username) AS username
+    FROM duty_snapshots ds CROSS JOIN clock c
+    CROSS JOIN LATERAL jsonb_array_elements_text(ds.green_blue_usernames) AS u(username)
+    WHERE ds.duty_date = c.duty_date
 )
 SELECT ir.id AS rule_id,
        reports.observed_at,
        COUNT(DISTINCT c.username)::bigint AS matched,
+       (SELECT COUNT(*) FROM green_blue gb WHERE gb.rule_id = ir.id)::bigint AS green_blue,
+       (SELECT COUNT(*) FROM green_only go WHERE go.rule_id = ir.id)::bigint AS green_only,
        COUNT(DISTINCT c.username) FILTER (WHERE EXISTS (
            SELECT 1 FROM listings l WHERE lower(l.contact_username) = c.username
        ))::bigint AS with_card,
