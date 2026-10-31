@@ -2193,11 +2193,11 @@ BEGIN
     IF v_state NOT IN ('code_sent', 'password_needed', 'running') THEN
         RAISE EXCEPTION 'login request not waiting for input (state=%)', v_state;
     END IF;
-    UPDATE login_requests
+    UPDATE login_requests AS lr
     SET code = CASE WHEN NOT p_is_password THEN p_secret ELSE code END,
         password = CASE WHEN p_is_password THEN p_secret ELSE password END,
         updated_at = NOW()
-    WHERE id = p_id AND state IN ('code_sent', 'password_needed', 'running');
+    WHERE lr.id = p_id AND lr.state IN ('code_sent', 'password_needed', 'running');
     IF NOT FOUND THEN
         RAISE EXCEPTION 'login request is no longer waiting for input';
     END IF;
