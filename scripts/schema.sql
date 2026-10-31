@@ -2100,8 +2100,8 @@ DECLARE
     v_id BIGINT; v_name VARCHAR(64);
 BEGIN
     -- one live login workflow at a time
-    IF EXISTS (SELECT 1 FROM login_requests
-               WHERE state IN ('pending', 'running', 'code_sent', 'password_needed')) THEN
+    IF EXISTS (SELECT 1 FROM login_requests lr
+               WHERE lr.state IN ('pending', 'running', 'code_sent', 'password_needed')) THEN
         RAISE EXCEPTION 'a login request is already in progress';
     END IF;
     v_name := COALESCE(NULLIF(p_session_name, ''), 'gw');
@@ -2147,7 +2147,7 @@ LANGUAGE plpgsql AS $fn$
 DECLARE
     v_state VARCHAR(24);
 BEGIN
-    SELECT state INTO v_state FROM login_requests WHERE id = p_id;
+    SELECT lr.state INTO v_state FROM login_requests lr WHERE lr.id = p_id;
     IF v_state IS NULL THEN
         RAISE EXCEPTION 'login request not found';
     END IF;
