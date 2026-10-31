@@ -15,9 +15,7 @@ SQL_SNAPSHOT = sqlres.load("duty_snapshot_upsert.sql")
 SQL_LINK_LOOKUP = sqlres.load("duty_link_lookup.sql")
 SQL_LINK_UPSERT = sqlres.load("duty_link_upsert.sql")
 SQL_LISTING_LOOKUP = sqlres.load("duty_listing_lookup.sql")
-SQL_COLLECTION_ENQUEUE = sqlres.load("duty_collection_enqueue.sql")
-SQL_PROFILE_COLLECTION_ENQUEUE = sqlres.load("profile_collection_enqueue.sql")
-SQL_COLLECTION_CANCEL_STALE = sqlres.load("duty_collection_cancel_stale.sql")
+SQL_PROFILE_COLLECTION_ENQUEUE = sqlres.load("profile_collection_enqueue_from_duty.sql")
 
 TG_URL_RE = re.compile(r"https?://t\.me/([A-Za-z0-9_]+)(?:/(\d+))?[^\s]*", re.I)
 MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])@([A-Za-z][A-Za-z0-9_]{3,31})\b")
@@ -177,8 +175,6 @@ async def process_message(pool, client, rule, message) -> bool:
         observed_at, expires_at,
     )
     changed = bool(rows[0]["changed"])
-    if changed:
-        await pool.fetch(SQL_COLLECTION_CANCEL_STALE, duty_date, rule["rule_id"])
     collection_source_id = config.get("collection_source_id")
     today, _ = business_window(datetime.now(timezone.utc), int(config.get("business_cutoff_hour") or 4))
     if (
@@ -188,12 +184,10 @@ async def process_message(pool, client, rule, message) -> bool:
     ):
         for username in usernames:
             target_peer_id, target_msg_id = linked_targets.get(username, (None, None))
-            rows = await pool.fetch(
-                SQL_COLLECTION_ENQUEUE, rule["rule_id"], duty_date,
+            await pool.fetch(
+                SQL_PROFILE_COLLECTION_ENQUEUE, duty_date,
                 int(collection_source_id), username, target_peer_id, target_msg_id,
             )
-            for row in rows:
-                await pool.fetch(SQL_PROFILE_COLLECTION_ENQUEUE, row["id"])
     logger.info(
         "duty snapshot %s: rule=%s source=%s date=%s matched=%d unresolved=%d",
         "updated" if changed else "unchanged", rule["rule_id"],

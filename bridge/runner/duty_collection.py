@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -20,6 +21,12 @@ SQL_PROFILE_RATE = sqlres.load("duty_profile_rate.sql")
 SQL_PROFILE_RATE_WAIT = sqlres.load("duty_profile_rate_wait.sql")
 SQL_DEFER = sqlres.load("duty_collection_defer.sql")
 POLL_S = 3.0
+PROFILE_LOOKUP_INTERVAL_SECONDS = max(
+    1, int(os.getenv("NEXUS_PROFILE_LOOKUP_INTERVAL_SECONDS", "15")),
+)
+LEGACY_COLLECTION_ENABLED = os.getenv(
+    "NEXUS_DUTY_LEGACY_COLLECTION_ENABLED", "0",
+).strip().lower() in {"1", "true", "yes", "on"}
 SQL_SCAN_CLAIM = sqlres.load("duty_recovery_scan_claim.sql")
 SQL_SCAN_FINISH = sqlres.load("duty_recovery_scan_finish.sql")
 SQL_PROFILE_CLAIM = sqlres.load("profile_collection_claim.sql")
@@ -198,7 +205,7 @@ async def _rate_limited_entity(pool, client, account_id, username):
     if wait_s:
         await asyncio.sleep(wait_s)
     entity = await client.get_entity(username)
-    await pool.fetch(SQL_PROFILE_RATE, account_id, 30)
+    await pool.fetch(SQL_PROFILE_RATE, account_id, PROFILE_LOOKUP_INTERVAL_SECONDS)
     return entity
 
 
@@ -677,60 +684,64 @@ async def _scan_recovery(client, job):
 
 
 async def run_duty_collection(pool, stop) -> None:
-    logger.info("on-duty linked-message collection worker started")
+    logger.info(
+        "profile collection worker started (lookup_interval=%ss legacy_enabled=%s)",
+        PROFILE_LOOKUP_INTERVAL_SECONDS, LEGACY_COLLECTION_ENABLED,
+    )
     while not stop.is_set():
         try:
-            jobs = await pool.fetch(SQL_CLAIM)
-            for job in jobs:
-                try:
-                    if not job["session_file"]:
-                        raise RuntimeError("assigned Telegram account is unavailable")
-                    session_name = str(job["session_file"]).removesuffix(".session")
-                    client = await hub.get_client(session_name)
-                    if client is None:
-                        raise RuntimeError("Telegram account is unauthorized")
-                    status, raw_id, error = await _collect(pool, client, job)
-                    await pool.fetch(SQL_FINISH, job["job_id"], status, raw_id, error)
-                    logger.info(
-                        "on-duty linked-message job %s: job=%s username=%s source=%s",
-                        status, job["job_id"], job["contact_username"], job["source_id"],
-                    )
-                except Exception as exc:
-                    if _is_flood_wait(exc):
-                        wait_s = _flood_wait_seconds(exc)
-                        await pool.fetch(SQL_DEFER, job["job_id"], job["account_id"], wait_s)
-                        logger.warning(
-                            "on-duty profile lookup rate limited; retry deferred (job=%s username=%s wait=%ss)",
-                            job["job_id"], job["contact_username"], wait_s,
+            if LEGACY_COLLECTION_ENABLED:
+                jobs = await pool.fetch(SQL_CLAIM)
+                for job in jobs:
+                    try:
+                        if not job["session_file"]:
+                            raise RuntimeError("assigned Telegram account is unavailable")
+                        session_name = str(job["session_file"]).removesuffix(".session")
+                        client = await hub.get_client(session_name)
+                        if client is None:
+                            raise RuntimeError("Telegram account is unauthorized")
+                        status, raw_id, error = await _collect(pool, client, job)
+                        await pool.fetch(SQL_FINISH, job["job_id"], status, raw_id, error)
+                        logger.info(
+                            "on-duty linked-message job %s: job=%s username=%s source=%s",
+                            status, job["job_id"], job["contact_username"], job["source_id"],
                         )
-                        continue
-                    await pool.fetch(SQL_FINISH, job["job_id"], "failed", None, str(exc)[:1000])
-                    logger.warning(
-                        "on-duty linked-message job failed (job=%s): %s",
-                        job["job_id"], exc,
-                    )
-            scans = await pool.fetch(SQL_SCAN_CLAIM)
-            for scan in scans:
-                try:
-                    if not scan["session_file"]:
-                        raise RuntimeError("assigned Telegram account is unavailable")
-                    client = await hub.get_client(str(scan["session_file"]).removesuffix(".session"))
-                    if client is None:
-                        raise RuntimeError("Telegram account is unauthorized")
-                    count, cursor, candidates, status = await _scan_recovery(client, scan)
-                    await pool.fetch(
-                        SQL_SCAN_FINISH, scan["scan_id"], count, cursor,
-                        json.dumps(candidates, ensure_ascii=False), status, None,
-                    )
-                    logger.info("on-duty recovery scan %s: job=%s scanned=%s candidates=%s",
-                                status, scan["duty_job_id"], count, len(candidates))
-                except Exception as exc:
-                    await pool.fetch(
-                        SQL_SCAN_FINISH, scan["scan_id"], scan["scanned_count"],
-                        scan["scan_cursor"], json.dumps(_json_list(scan["candidates"])),
-                        "failed", str(exc)[:1000],
-                    )
-                    logger.warning("on-duty recovery scan failed (job=%s): %s", scan["duty_job_id"], exc)
+                    except Exception as exc:
+                        if _is_flood_wait(exc):
+                            wait_s = _flood_wait_seconds(exc)
+                            await pool.fetch(SQL_DEFER, job["job_id"], job["account_id"], wait_s)
+                            logger.warning(
+                                "on-duty profile lookup rate limited; retry deferred (job=%s username=%s wait=%ss)",
+                                job["job_id"], job["contact_username"], wait_s,
+                            )
+                            continue
+                        await pool.fetch(SQL_FINISH, job["job_id"], "failed", None, str(exc)[:1000])
+                        logger.warning(
+                            "on-duty linked-message job failed (job=%s): %s",
+                            job["job_id"], exc,
+                        )
+                scans = await pool.fetch(SQL_SCAN_CLAIM)
+                for scan in scans:
+                    try:
+                        if not scan["session_file"]:
+                            raise RuntimeError("assigned Telegram account is unavailable")
+                        client = await hub.get_client(str(scan["session_file"]).removesuffix(".session"))
+                        if client is None:
+                            raise RuntimeError("Telegram account is unauthorized")
+                        count, cursor, candidates, status = await _scan_recovery(client, scan)
+                        await pool.fetch(
+                            SQL_SCAN_FINISH, scan["scan_id"], count, cursor,
+                            json.dumps(candidates, ensure_ascii=False), status, None,
+                        )
+                        logger.info("on-duty recovery scan %s: job=%s scanned=%s candidates=%s",
+                                    status, scan["duty_job_id"], count, len(candidates))
+                    except Exception as exc:
+                        await pool.fetch(
+                            SQL_SCAN_FINISH, scan["scan_id"], scan["scanned_count"],
+                            scan["scan_cursor"], json.dumps(_json_list(scan["candidates"])),
+                            "failed", str(exc)[:1000],
+                        )
+                        logger.warning("on-duty recovery scan failed (job=%s): %s", scan["duty_job_id"], exc)
             profile_jobs = await pool.fetch(SQL_PROFILE_CLAIM)
             for job in profile_jobs:
                 try:
