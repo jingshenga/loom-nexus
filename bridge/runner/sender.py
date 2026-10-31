@@ -39,6 +39,7 @@ SQL_REGISTER = sqlres.load("register_account.sql")
 SQL_SOURCE_TEXT = sqlres.load("session_source_text.sql")
 SQL_SET_CHANNEL = sqlres.load("session_set_channel.sql")
 SQL_LIMIT_SET = sqlres.load("gateway_limit_set.sql")
+SQL_PROFILE_COLLECTION_DUE = sqlres.load("profile_collection_work_due.sql")
 
 SIM_ACCOUNTS = ((6660001, "sim-alpha"), (6660002, "sim-beta"))
 POLL_S = float(os.getenv("NEXUS_BRIDGE_SEND_INTERVAL", "2"))
@@ -284,7 +285,10 @@ async def run_sender(pool: asyncpg.Pool, stop: asyncio.Event) -> None:
                 # chat_open_session; refresh the sender pool so a newly
                 # authorized account can receive its already-routed sessions.
                 account_ids = await _real_account_ids(pool)
-            for account_id in account_ids:
+            collection_due = (
+                not sim and await pool.fetchval(SQL_PROFILE_COLLECTION_DUE)
+            )
+            for account_id in (() if collection_due else account_ids):
                 jobs = await pool.fetch(SQL_CLAIM, account_id)
                 for job in jobs:
                     logger.info(
