@@ -44,6 +44,11 @@ SQL_TAKE_PASSWORD = sqlres.load("login_take_password.sql")
 SQL_LOGIN_CLAIM = sqlres.load("login_claim.sql")
 WAIT_S = 600
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+LOGIN_CANCELLED = "__NEXUS_LOGIN_CANCELLED__"
+
+
+class LoginCancelled(Exception):
+    """Raised when an admin cancels a database-driven login request."""
 
 
 def _safe_name(name: str) -> str:
@@ -148,7 +153,10 @@ async def _wait_secret(conn, sql, req_id: int, timeout_s: int = WAIT_S) -> str:
     while time.time() < deadline:
         rows = await conn.fetch(sql, req_id)
         if rows and rows[0]["secret"]:
-            return str(rows[0]["secret"])
+            secret = str(rows[0]["secret"])
+            if secret == LOGIN_CANCELLED:
+                raise LoginCancelled()
+            return secret
         await asyncio.sleep(2)
     return ""
 
@@ -201,6 +209,8 @@ async def db_login(req_id: int) -> int:
             await client.disconnect()
         await _register(me, name)
         await conn.fetch(SQL_LOGIN_STATE, req_id, "done", None)
+        return 0
+    except LoginCancelled:
         return 0
     except Exception as exc:
         try:

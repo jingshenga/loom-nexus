@@ -10,7 +10,6 @@ const flash = ref("");
 const loginPhone = ref("");
 const loginName = ref("");
 const secretInput = ref("");
-const secretIsPassword = ref(false);
 let timer = null;
 
 const STATE_TEXT = {
@@ -20,6 +19,7 @@ const STATE_TEXT = {
   password_needed: "等待两步验证密码",
   done: "登录成功",
   failed: "失败",
+  cancelled: "已取消",
 };
 
 function notify(msg) {
@@ -60,7 +60,7 @@ async function submitSecret() {
       body: JSON.stringify({
         request_id: login.value.id,
         secret: secretInput.value.trim(),
-        is_password: secretIsPassword.value,
+        is_password: login.value.state === "password_needed",
       }),
     });
     secretInput.value = "";
@@ -68,6 +68,22 @@ async function submitSecret() {
     await load();
   } catch (e) {
     notify(`提交失败: ${String(e.message).slice(0, 90)}`);
+  }
+}
+
+function canCancelLogin() {
+  return login.value && ["pending", "running", "code_sent", "password_needed"].includes(login.value.state);
+}
+
+async function cancelLogin() {
+  if (!canCancelLogin()) return;
+  try {
+    await api(`/api/admin/accounts/login/${login.value.id}/cancel`, { method: "POST" });
+    secretInput.value = "";
+    notify("登录流程已取消，可以发起其他账号登录");
+    await load();
+  } catch (e) {
+    notify(`取消失败: ${String(e.message).slice(0, 90)}`);
   }
 }
 
@@ -118,9 +134,9 @@ onUnmounted(() => clearInterval(timer));
           class="w-56 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
         <input v-model="loginName" placeholder="会话名（可选，默认自动）"
           class="w-44 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
-        <button @click="startLogin"
-          class="rounded-lg bg-violet-600 px-4 py-2 text-sm font-medium hover:bg-violet-500">
-          发起登录
+        <button @click="startLogin" :disabled="canCancelLogin()"
+          class="rounded-lg bg-violet-600 px-4 py-2 text-sm font-medium hover:bg-violet-500 disabled:cursor-not-allowed disabled:opacity-50">
+          {{ canCancelLogin() ? "先取消当前流程" : "发起登录" }}
         </button>
       </div>
       <div v-if="login" class="space-y-2 rounded-lg border border-slate-800 bg-slate-900/60 p-3 text-xs">
@@ -134,11 +150,15 @@ onUnmounted(() => clearInterval(timer));
             {{ STATE_TEXT[login.state] || login.state }}
           </span>
           <span v-if="login.error" class="text-rose-400">{{ login.error }}</span>
+          <button v-if="canCancelLogin()" @click="cancelLogin"
+            class="ml-auto rounded-lg border border-rose-700/60 px-2.5 py-1 text-rose-300 hover:bg-rose-900/30">
+            取消登录
+          </button>
         </div>
         <div v-if="waitingSecret()" class="flex flex-wrap items-center gap-2">
           <KeyRound class="size-3.5 text-amber-300" />
           <input v-model="secretInput"
-            :type="secretIsPassword ? 'password' : 'text'"
+            :type="login.state === 'password_needed' ? 'password' : 'text'"
             :placeholder="login.state === 'password_needed' ? '两步验证密码' : 'Telegram 验证码'"
             class="w-48 rounded-lg border border-slate-700 bg-slate-950 px-3 py-1.5 text-sm"
             @keyup.enter="submitSecret" />

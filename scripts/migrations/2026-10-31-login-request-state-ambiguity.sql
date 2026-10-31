@@ -36,7 +36,59 @@ BEGIN
     SET code = CASE WHEN NOT p_is_password THEN p_secret ELSE code END,
         password = CASE WHEN p_is_password THEN p_secret ELSE password END,
         updated_at = NOW()
-    WHERE id = p_id;
+    WHERE id = p_id AND state IN ('code_sent', 'password_needed', 'running');
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'login request is no longer waiting for input';
+    END IF;
     RETURN QUERY SELECT v_state;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION login_request_update_state(
+    p_id BIGINT, p_state VARCHAR(24), p_error TEXT
+) RETURNS BOOLEAN
+LANGUAGE plpgsql AS $fn$
+BEGIN
+    UPDATE login_requests
+    SET state = p_state, error = p_error, updated_at = NOW()
+    WHERE id = p_id AND state <> 'cancelled';
+    RETURN FOUND;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION login_request_cancel(p_id BIGINT)
+RETURNS BOOLEAN
+LANGUAGE plpgsql AS $fn$
+BEGIN
+    UPDATE login_requests
+    SET state = 'cancelled', code = NULL, password = NULL,
+        error = 'cancelled by admin', updated_at = NOW()
+    WHERE id = p_id
+      AND state IN ('pending', 'running', 'code_sent', 'password_needed');
+    RETURN FOUND;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION login_request_take_secret(
+    p_id BIGINT, p_is_password BOOLEAN
+) RETURNS TEXT
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_secret TEXT;
+    v_state VARCHAR(24);
+BEGIN
+    SELECT lr.state, CASE WHEN p_is_password THEN lr.password ELSE lr.code END
+    INTO v_state, v_secret FROM login_requests lr WHERE lr.id = p_id;
+    IF v_state = 'cancelled' THEN
+        RETURN '__NEXUS_LOGIN_CANCELLED__';
+    END IF;
+    IF v_secret IS NOT NULL THEN
+        UPDATE login_requests
+        SET code = CASE WHEN NOT p_is_password THEN NULL ELSE code END,
+            password = CASE WHEN p_is_password THEN NULL ELSE password END,
+            updated_at = NOW()
+        WHERE id = p_id AND state <> 'cancelled';
+    END IF;
+    RETURN v_secret;
 END
 $fn$;

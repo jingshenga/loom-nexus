@@ -23,6 +23,7 @@ SQL_DISCONNECT = sqlres.load("account_disconnect.sql")
 SQL_ACTIVATE = sqlres.load("account_activate.sql")
 SQL_LOGIN_START = sqlres.load("login_start.sql")
 SQL_LOGIN_SECRET = sqlres.load("login_set_secret.sql")
+SQL_LOGIN_CANCEL = sqlres.load("login_cancel.sql")
 SQL_LOGIN_LATEST = sqlres.load("login_latest.sql")
 
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
@@ -123,6 +124,15 @@ async def submit_secret(body: SecretBody) -> dict:
     except Exception as exc:
         raise HTTPException(status_code=409, detail=str(exc)[:160])
     return {"ok": True, "state": rows[0]["state"]}
+
+
+@router.post("/login/{request_id}/cancel")
+async def cancel_login(request_id: int) -> dict:
+    pool = _pool()
+    rows = await pool.fetch(SQL_LOGIN_CANCEL, request_id)
+    if not rows[0]["cancelled"]:
+        raise HTTPException(status_code=409, detail="登录流程已结束或无法取消")
+    return {"ok": True, "state": "cancelled"}
 
 
 @router.post("/{account_id}/disconnect")
