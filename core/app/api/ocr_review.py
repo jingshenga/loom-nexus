@@ -20,6 +20,16 @@ class EditOcrBody(BaseModel):
 
 class DecisionBody(BaseModel):
     decision: str
+    fields: dict | None = None
+    normalized_text: str | None = None
+
+
+class BulkDecisionBody(BaseModel):
+    decision: str
+    ids: list[int] = Field(default_factory=list)
+    all_matching: bool = False
+    status: str = "pending"
+    exclude_ids: list[int] = Field(default_factory=list)
 
 
 def _decode(value, fallback):
@@ -31,9 +41,31 @@ def _decode(value, fallback):
         return fallback
 
 
+async def _sync_listing_ocr_text(conn, listing_id, old_text, new_text, include):
+    if listing_id is None:
+        return
+    listing = await conn.fetchrow(
+        "SELECT description FROM listings WHERE id=$1 FOR UPDATE", listing_id,
+    )
+    if listing is None:
+        return
+    description = listing["description"] or ""
+    old_marker = "图片识别内容：" + (old_text or "").strip()
+    if old_marker != "图片识别内容：" and old_marker in description:
+        description = description.replace(old_marker, "", 1).strip()
+    new_marker = "图片识别内容：" + (new_text or "").strip()
+    if include and new_marker != "图片识别内容：" and new_marker not in description:
+        description = "\n\n".join(part for part in (description.strip(), new_marker) if part)
+    if description != (listing["description"] or ""):
+        await conn.execute(
+            "UPDATE listings SET description=$2, updated_at=NOW() WHERE id=$1",
+            listing_id, description,
+        )
+
+
 @router.get("/queue")
 async def queue(status: str = "pending", limit: int = 40, offset: int = 0) -> dict:
-    if status not in {"pending", "confirmed", "not_card", "failed"}:
+    if status not in {"all", "pending", "confirmed", "not_card", "failed"}:
         raise HTTPException(status_code=400, detail="invalid OCR queue status")
     pool = db.get_pool()
     if pool is None:
@@ -55,7 +87,7 @@ async def queue(status: str = "pending", limit: int = 40, offset: int = 0) -> di
         "WHERE CASE WHEN $1='pending' THEN o.review_status='pending' "
         " WHEN $1='confirmed' THEN o.review_status='confirmed' "
         " WHEN $1='not_card' THEN o.review_status='not_card' "
-        " ELSE o.status='failed' END "
+        " WHEN $1='failed' THEN o.status='failed' ELSE TRUE END "
         "ORDER BY CASE WHEN o.status='failed' THEN 0 ELSE 1 END, o.id "
         "LIMIT GREATEST(1,$2::int) OFFSET GREATEST(0,$3::int)",
         status, limit, offset,
@@ -65,7 +97,7 @@ async def queue(status: str = "pending", limit: int = 40, offset: int = 0) -> di
         "WHERE CASE WHEN $1='pending' THEN o.review_status='pending' "
         " WHEN $1='confirmed' THEN o.review_status='confirmed' "
         " WHEN $1='not_card' THEN o.review_status='not_card' "
-        " ELSE o.status='failed' END",
+        " WHEN $1='failed' THEN o.status='failed' ELSE TRUE END",
         status,
     )
     items = []
@@ -98,14 +130,25 @@ async def edit(asset_id: int, body: EditOcrBody) -> dict:
     pool = db.get_pool()
     if pool is None:
         raise HTTPException(status_code=503, detail="database unavailable")
-    rows = await pool.fetch(
-        "UPDATE listing_media_ocr SET fields_json=$2::jsonb, "
-        "normalized_text=COALESCE($3, normalized_text), updated_at=NOW() "
-        "WHERE id=$1 AND review_status='pending' RETURNING id",
-        asset_id, json.dumps(body.fields, ensure_ascii=False), body.normalized_text,
-    )
-    if not rows:
-        raise HTTPException(status_code=404, detail="pending OCR item not found")
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT listing_id, review_status, normalized_text "
+                "FROM listing_media_ocr WHERE id=$1 FOR UPDATE",
+                asset_id,
+            )
+            if row is None:
+                raise HTTPException(status_code=404, detail="OCR item not found")
+            new_text = body.normalized_text if body.normalized_text is not None else row["normalized_text"]
+            if row["review_status"] == "confirmed":
+                await _sync_listing_ocr_text(
+                    conn, row["listing_id"], row["normalized_text"], new_text, True,
+                )
+            await conn.execute(
+                "UPDATE listing_media_ocr SET fields_json=$2::jsonb, "
+                "normalized_text=$3, updated_at=NOW() WHERE id=$1",
+                asset_id, json.dumps(body.fields, ensure_ascii=False), new_text,
+            )
     return {"ok": True}
 
 
@@ -119,7 +162,7 @@ async def decide(
     if pool is None:
         raise HTTPException(status_code=503, detail="database unavailable")
     row = await pool.fetchrow(
-        "SELECT raw_id, listing_id, media_path, normalized_text "
+        "SELECT raw_id, listing_id, media_path, normalized_text, review_status, fields_json "
         "FROM listing_media_ocr WHERE id=$1",
         asset_id,
     )
@@ -141,26 +184,86 @@ async def decide(
 
     if body.decision == "confirm":
         classification, review_status, visibility = "info_card", "confirmed", "admin"
-        normalized_text = (row["normalized_text"] or "").strip()
-        if row["listing_id"] is not None and normalized_text:
-            await pool.execute(
-                "UPDATE listings SET description = CASE "
-                "WHEN POSITION($2 IN COALESCE(description, '')) > 0 THEN description "
-                "ELSE concat_ws(E'\\n\\n', NULLIF(description, ''), '图片识别内容：' || $2) "
-                "END, updated_at=NOW() WHERE id=$1",
-                row["listing_id"], normalized_text,
-            )
     else:
         classification, review_status, visibility = "other", "not_card", "public"
     identity = bearer_identity(authorization)
-    await pool.execute(
-        "UPDATE listing_media_ocr SET classification=$2, review_status=$3, "
-        "reviewed_by=$4, reviewed_at=NOW(), updated_at=NOW() WHERE id=$1",
-        asset_id, classification, review_status, identity[0] if identity else None,
-    )
-    if row["raw_id"] is not None:
-        await pool.fetch(
-            "SELECT media_ocr_set_flags($1,$2,$3,'done',$4)",
-            row["raw_id"], row["media_path"], visibility, classification,
-        )
+    fields = body.fields if body.fields is not None else _decode(row["fields_json"], {})
+    normalized_text = body.normalized_text if body.normalized_text is not None else row["normalized_text"]
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _sync_listing_ocr_text(
+                conn, row["listing_id"], row["normalized_text"], normalized_text,
+                body.decision == "confirm",
+            )
+            await conn.execute(
+                "UPDATE listing_media_ocr SET status='done', classification=$2, review_status=$3, "
+                "fields_json=$4::jsonb, normalized_text=$5, reviewed_by=$6, "
+                "reviewed_at=NOW(), updated_at=NOW() WHERE id=$1",
+                asset_id, classification, review_status,
+                json.dumps(fields, ensure_ascii=False), normalized_text,
+                identity[0] if identity else None,
+            )
+            if row["raw_id"] is not None:
+                await conn.fetchval(
+                    "SELECT media_ocr_set_flags($1,$2,$3,'done',$4)",
+                    row["raw_id"], row["media_path"], visibility, classification,
+                )
     return {"ok": True}
+
+
+@router.post("/bulk-decision")
+async def bulk_decide(
+    body: BulkDecisionBody, authorization: str = Header(default=""),
+) -> dict:
+    if body.decision not in {"confirm", "not_card"}:
+        raise HTTPException(status_code=400, detail="invalid decision")
+    if body.status not in {"all", "pending", "confirmed", "not_card", "failed"}:
+        raise HTTPException(status_code=400, detail="invalid OCR queue status")
+    if body.all_matching == bool(body.ids):
+        raise HTTPException(status_code=400, detail="select ids or all_matching")
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+
+    identity = bearer_identity(authorization)
+    if body.all_matching:
+        rows_sql = (
+            "SELECT id, raw_id, listing_id, media_path, normalized_text, review_status "
+            "FROM listing_media_ocr o "
+            "WHERE CASE WHEN $1='pending' THEN o.review_status='pending' "
+            " WHEN $1='confirmed' THEN o.review_status='confirmed' "
+            " WHEN $1='not_card' THEN o.review_status='not_card' "
+            " WHEN $1='failed' THEN o.status='failed' ELSE TRUE END "
+            "AND NOT (o.id = ANY($2::bigint[])) ORDER BY o.id"
+        )
+        query_args = (body.status, body.exclude_ids)
+    else:
+        rows_sql = (
+            "SELECT id, raw_id, listing_id, media_path, normalized_text, review_status "
+            "FROM listing_media_ocr WHERE id = ANY($1::bigint[]) ORDER BY id"
+        )
+        query_args = (body.ids,)
+
+    classification = "info_card" if body.decision == "confirm" else "other"
+    review_status = "confirmed" if body.decision == "confirm" else "not_card"
+    visibility = "admin" if body.decision == "confirm" else "public"
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            rows = await conn.fetch(rows_sql, *query_args)
+            for row in rows:
+                await _sync_listing_ocr_text(
+                    conn, row["listing_id"], row["normalized_text"], row["normalized_text"],
+                    body.decision == "confirm",
+                )
+                await conn.execute(
+                    "UPDATE listing_media_ocr SET status='done', classification=$2, review_status=$3, "
+                    "reviewed_by=$4, reviewed_at=NOW(), updated_at=NOW() WHERE id=$1",
+                    row["id"], classification, review_status,
+                    identity[0] if identity else None,
+                )
+                if row["raw_id"] is not None:
+                    await conn.fetchval(
+                        "SELECT media_ocr_set_flags($1,$2,$3,'done',$4)",
+                        row["raw_id"], row["media_path"], visibility, classification,
+                    )
+    return {"ok": True, "updated": len(rows)}
