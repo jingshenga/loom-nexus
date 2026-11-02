@@ -22,12 +22,14 @@ WITH result AS (
 ), promoted AS (
     INSERT INTO listings (
         profile_collection_job_id, contact_peer_id, contact_username, nickname,
+        district, price_amount, price_currency,
         description, media_json, evidence_json, status, confidence
     )
     SELECT r.job_id, r.contact_peer_id, NULLIF(r.contact_username, ''),
-           CASE WHEN NULLIF(r.contact_username, '') IS NOT NULL
-                THEN '@' || r.contact_username
-                ELSE 'TG ID ' || r.contact_peer_id::text END,
+           NULLIF(r.evidence_json->>'nickname', ''),
+           NULLIF(r.evidence_json->'extracted_fields'->>'district', ''),
+           NULLIF(r.evidence_json->'extracted_fields'->>'price_amount', '')::numeric,
+           COALESCE(NULLIF(r.evidence_json->'extracted_fields'->>'price_currency', ''), 'CNY'),
            NULLIF(r.description, ''),
            COALESCE((
                SELECT jsonb_agg(
@@ -49,7 +51,19 @@ WITH result AS (
     DO UPDATE SET
         contact_peer_id = EXCLUDED.contact_peer_id,
         contact_username = EXCLUDED.contact_username,
-        nickname = EXCLUDED.nickname,
+        nickname = CASE
+            WHEN EXCLUDED.nickname IS NOT NULL THEN EXCLUDED.nickname
+            WHEN lower(trim(listings.nickname)) = lower(listings.contact_username)
+              OR lower(trim(listings.nickname)) = '@' || lower(listings.contact_username)
+              OR listings.nickname = 'TG ID ' || listings.contact_peer_id::text THEN NULL
+            ELSE listings.nickname
+        END,
+        district = COALESCE(EXCLUDED.district, listings.district),
+        price_amount = COALESCE(EXCLUDED.price_amount, listings.price_amount),
+        price_currency = COALESCE(
+            NULLIF(EXCLUDED.evidence_json->'extracted_fields'->>'price_currency', ''),
+            listings.price_currency, 'CNY'
+        ),
         description = EXCLUDED.description,
         media_json = EXCLUDED.media_json,
         evidence_json = EXCLUDED.evidence_json,

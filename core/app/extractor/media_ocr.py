@@ -327,6 +327,7 @@ class MediaOcrProcessor:
                     import json
                     config = json.loads(config)
                 profile_text = " ".join(str(item.get("text") or "").strip() for item in lines if item.get("text"))
+                fields, evidence = extract_card_fields(lines)
                 if model_row:
                     classification, confidence, probabilities = predict(
                         model_row["model"], profile_text, signals,
@@ -345,8 +346,8 @@ class MediaOcrProcessor:
                     visibility = "admin" if review_status == "pending" else "public"
                 await self._finish(
                     row, "done", classification, review_status, visibility,
-                    profile_text, normalize_ocr_text(profile_text), {},
-                    {"class_probabilities": probabilities}, confidence, None,
+                    profile_text, normalize_ocr_text(profile_text), fields,
+                    {**evidence, "class_probabilities": probabilities}, confidence, None,
                     version_id, signals,
                 )
                 return

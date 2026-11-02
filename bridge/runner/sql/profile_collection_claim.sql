@@ -52,4 +52,11 @@ RETURNING j.id AS job_id, j.rule_id, j.duty_date, j.source_id, j.account_id,
           (SELECT a.session_file FROM bridge_accounts a
            WHERE a.id = j.account_id AND a.status = 'active') AS session_file,
           (SELECT config_json FROM ingest_rules r WHERE r.id = j.rule_id) AS config_json,
+          (SELECT listing_rule.config_json
+           FROM source_rule_bindings binding
+           JOIN ingest_rules listing_rule ON listing_rule.id = binding.rule_id
+           WHERE binding.source_id = j.source_id
+             AND listing_rule.rule_type = 'listing' AND listing_rule.is_active
+           ORDER BY binding.priority, listing_rule.id
+           LIMIT 1) AS listing_config_json,
           (SELECT rule_type FROM ingest_rules r WHERE r.id = j.rule_id) AS rule_type;

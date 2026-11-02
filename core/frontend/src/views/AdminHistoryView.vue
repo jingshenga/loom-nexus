@@ -1,7 +1,7 @@
 <script setup>
 import AdminTabs from "../components/AdminTabs.vue";
 import AdminMediaGrid from "../components/AdminMediaGrid.vue";
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { api, mediaUrl } from "../api/client";
 
 const sources = ref([]);
@@ -65,10 +65,17 @@ function mediaCount(item) {
   return (item.media || []).length;
 }
 
+function onKeydown(event) {
+  if (event.key === "Escape") selected.value = null;
+}
+
 onMounted(async () => {
+  window.addEventListener("keydown", onKeydown);
   await loadSources();
   await load();
 });
+
+onUnmounted(() => window.removeEventListener("keydown", onKeydown));
 </script>
 
 <template>
@@ -128,21 +135,28 @@ onMounted(async () => {
       <div v-if="loading" class="col-span-full py-12 text-center text-sm text-slate-500">正在读取资料…</div>
     </div>
 
-    <section v-if="selected" class="space-y-3 rounded-xl border border-slate-700 bg-slate-900/80 p-4">
-      <div class="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h2 class="font-semibold">{{ selected.nickname || (selected.contact_username ? `@${selected.contact_username}` : `消息 #${selected.platform_msg_id}`) }}</h2>
-          <p class="mt-1 text-xs text-slate-400">{{ selected.source_title }} · {{ selected.posted_at ? new Date(selected.posted_at).toLocaleString('zh-CN') : '时间未知' }} · 消息 ID {{ selected.platform_msg_id }}</p>
-          <p v-if="selected.contact_username" class="mt-1 text-xs text-slate-300">TG：@{{ selected.contact_username }}</p>
+    <div v-if="selected" class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-0 sm:p-5" @click.self="selected = null">
+      <section class="flex h-full max-h-[100dvh] w-full max-w-5xl flex-col overflow-hidden border border-slate-700 bg-slate-950 shadow-2xl sm:max-h-[94dvh] sm:rounded-2xl">
+        <header class="flex flex-wrap items-start gap-3 border-b border-slate-800 px-4 py-3">
+          <div class="min-w-0 flex-1">
+            <h2 class="truncate font-semibold">{{ selected.nickname || (selected.contact_username ? `@${selected.contact_username}` : `消息 #${selected.platform_msg_id}`) }}</h2>
+            <p class="mt-1 text-xs text-slate-400">{{ selected.source_title }} · {{ selected.posted_at ? new Date(selected.posted_at).toLocaleString('zh-CN') : '时间未知' }} · 消息 ID {{ selected.platform_msg_id }}</p>
+            <p v-if="selected.contact_username" class="mt-1 text-xs text-slate-300">TG：@{{ selected.contact_username }}</p>
+          </div>
+          <a v-if="telegramUrl(selected)" :href="telegramUrl(selected)" target="_blank" rel="noopener noreferrer" class="rounded-lg border border-sky-700 px-3 py-2 text-xs text-sky-300 hover:bg-sky-950/40">打开 Telegram 原消息 ↗</a>
+          <button @click="selected = null" class="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-300 hover:bg-slate-800" aria-label="关闭历史资料详情">关闭</button>
+        </header>
+        <div class="min-h-0 flex-1 overflow-y-auto p-3 sm:p-4">
+          <div class="mb-3 text-xs text-slate-400">{{ selected.listing_id ? `已关联卡片 #${selected.listing_id}（${selected.listing_status}）` : `尚未生成卡片 · 提取状态：${selected.extract_state}` }}</div>
+          <div class="grid gap-4 lg:grid-cols-2">
+            <div class="min-w-0"><AdminMediaGrid :media="selected.media" /></div>
+            <details open class="min-w-0 rounded-lg border border-slate-800 bg-slate-900/60 p-3">
+              <summary class="cursor-pointer text-sm text-slate-300">原始消息内容</summary>
+              <p class="mt-3 whitespace-pre-wrap break-words text-sm leading-relaxed text-slate-300">{{ selected.raw_text || "（无文字）" }}</p>
+            </details>
+          </div>
         </div>
-        <a v-if="telegramUrl(selected)" :href="telegramUrl(selected)" target="_blank" rel="noopener noreferrer" class="rounded-lg border border-sky-700 px-3 py-2 text-xs text-sky-300 hover:bg-sky-950/40">打开 Telegram 原消息 ↗</a>
-      </div>
-      <div class="text-xs text-slate-400">{{ selected.listing_id ? `已关联卡片 #${selected.listing_id}（${selected.listing_status}）` : `尚未生成卡片 · 提取状态：${selected.extract_state}` }}</div>
-      <AdminMediaGrid :media="selected.media" />
-      <details open class="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
-        <summary class="cursor-pointer text-sm text-slate-300">原始消息内容</summary>
-        <p class="mt-3 whitespace-pre-wrap break-words text-sm leading-relaxed text-slate-300">{{ selected.raw_text || "（无文字）" }}</p>
-      </details>
-    </section>
+      </section>
+    </div>
   </div>
 </template>

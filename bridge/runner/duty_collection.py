@@ -53,6 +53,71 @@ def _matches_username(message, username: str) -> bool:
     return wanted in profile_usernames(message)
 
 
+def _clean_nickname(value, username=""):
+    value = re.sub(r"\s+", " ", str(value or "")).strip().strip("#，,。.;；")
+    if not value or len(value) > 128:
+        return None
+    normalized = re.sub(r"\s+", "", value).casefold().lstrip("@")
+    handle = str(username or "").strip().casefold().lstrip("@")
+    if normalized.isdigit() or normalized.startswith("tgid") or (handle and normalized == handle):
+        return None
+    if value.startswith("@") or re.fullmatch(r"tg\s*id\s*\d+", value, re.I):
+        return None
+    return value
+
+
+def _extract_profile_rule_fields(rule_config, text, username=""):
+    if isinstance(rule_config, str):
+        try:
+            rule_config = json.loads(rule_config)
+        except (TypeError, ValueError):
+            rule_config = {}
+    extract = (rule_config or {}).get("extract") or {}
+    fields, evidence = {}, {}
+
+    def first(patterns):
+        for pattern in patterns or []:
+            try:
+                match = re.search(pattern, text or "", re.I)
+            except re.error:
+                continue
+            if match:
+                value = (match.group(1) if match.groups() else match.group(0)).strip()
+                if value:
+                    return value
+        return None
+
+    nickname = _clean_nickname(first(extract.get("nickname")), username)
+    if nickname:
+        fields["nickname"] = nickname
+        evidence["nickname"] = {"value": nickname, "src": "listing_rule"}
+    district = first(extract.get("district"))
+    if district:
+        fields["district"] = district
+        evidence["district"] = {"value": district, "src": "listing_rule"}
+    price_raw = first(extract.get("price"))
+    if price_raw:
+        try:
+            amount = float(price_raw.replace(",", ""))
+            multiplier = extract.get("price_multiply")
+            if isinstance(multiplier, (int, float)) and multiplier:
+                amount *= multiplier
+            fields["price_amount"] = amount
+            evidence["price_amount"] = {"value": amount, "src": "listing_rule"}
+        except ValueError:
+            pass
+    for pattern, currency in (extract.get("currency_map") or {}).items():
+        try:
+            matched = re.search(pattern, text or "", re.I)
+        except re.error:
+            continue
+        if matched:
+            fields["price_currency"] = currency
+            evidence["price_currency"] = {"value": currency, "src": "listing_rule"}
+            break
+    return fields, evidence
+
+
 async def _find_checkin_matches(client, entity, username: str):
     matches = []
     async for message in client.iter_messages(entity, search=username, limit=20):
@@ -554,13 +619,26 @@ async def _collect_checkin_source(pool, client, job, cfg):
     if not description and not media:
         return "not_found", "命中消息没有可用文字或媒体"
     source_url = f"https://t.me/{channel_name}/{primary.id}"
-    nickname_match = re.search(
-        r"(?:老师昵称|昵称|姓名)[】\]]*\s*[:：]\s*#?([^,，\n#]+)", description,
+    extracted_fields, field_evidence = _extract_profile_rule_fields(
+        job["listing_config_json"], description, job["contact_username"],
     )
+    if not extracted_fields.get("nickname"):
+        nickname_match = re.search(
+            r"(?:老师昵称|昵称|姓名)[】\]]*\s*[:：]\s*#?([^,，\n#]+)", description,
+        )
+        nickname = _clean_nickname(
+            nickname_match.group(1) if nickname_match else None,
+            job["contact_username"],
+        )
+        if nickname:
+            extracted_fields["nickname"] = nickname
+            field_evidence["nickname"] = {"value": nickname, "src": "checkin_label"}
     evidence = {
         "collection_method": "daily_checkin_source_username_search",
         "review_bucket": "checkin_supplement",
-        "nickname": nickname_match.group(1).strip() if nickname_match else job["contact_username"],
+        "nickname": extracted_fields.get("nickname"),
+        "extracted_fields": extracted_fields,
+        "field_evidence": field_evidence,
         "profile_url": f"https://t.me/{job['contact_username']}",
         "source_messages": [{
             "url": source_url, "message_id": int(primary.id),
@@ -793,6 +871,18 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
     if not description and not media:
         return "not_found", "No usable profile, linked-channel, or media content found"
 
+    extracted_fields, field_evidence = _extract_profile_rule_fields(
+        job["listing_config_json"], description, job["contact_username"],
+    )
+    profile_name = _clean_nickname(
+        " ".join(x for x in (getattr(user, "first_name", None), getattr(user, "last_name", None)) if x),
+        job["contact_username"],
+    )
+    nickname = extracted_fields.get("nickname") or profile_name
+    if nickname and "nickname" not in extracted_fields:
+        extracted_fields["nickname"] = nickname
+        field_evidence["nickname"] = {"value": nickname, "src": "telegram_profile"}
+
     evidence = {
         "collection_method": "profile -> linked channel pins and next 5 -> recent 10 -> older/gallery messages",
         "profile_url": f"https://t.me/{user.username or job['contact_username']}",
@@ -809,8 +899,9 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
         "intro_min_chars": min_chars,
         "intro_min_lines": min_lines,
         "any_sender_in_linked_channel": True,
-        "nickname": " ".join(x for x in (getattr(user, "first_name", None), getattr(user, "last_name", None)) if x)
-                    or job["contact_username"],
+        "nickname": nickname,
+        "extracted_fields": extracted_fields,
+        "field_evidence": field_evidence,
         "review_bucket": "tg_profile_v2",
     }
     await _persist_profile_result(

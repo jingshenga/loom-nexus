@@ -15,8 +15,8 @@ from runner.duty import (
     profile_usernames,
 )
 from runner.duty_collection import (
-    _find_checkin_matches, _flood_wait_seconds, _is_flood_wait,
-    _profile_media_kind,
+    _extract_profile_rule_fields, _find_checkin_matches, _flood_wait_seconds,
+    _is_flood_wait, _profile_media_kind,
 )
 
 
@@ -97,6 +97,29 @@ class DutyProcessTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DutyRuleTests(unittest.TestCase):
+    def test_profile_uses_bound_listing_rule_fields(self):
+        fields, evidence = _extract_profile_rule_fields({
+            "extract": {
+                "nickname": [r"昵称[:：]\s*([^，,\n]+)"],
+                "district": [r"地区[:：]\s*([^，,\n]+)"],
+                "price": [r"价格[:：]\s*(\d+)"],
+                "currency_map": {"美元|USD": "USD"},
+            },
+        }, "昵称：小雨\n地区：西雅图\n价格：800 USD", "xiaoyu")
+
+        self.assertEqual(fields, {
+            "nickname": "小雨", "district": "西雅图",
+            "price_amount": 800.0, "price_currency": "USD",
+        })
+        self.assertEqual(evidence["nickname"]["src"], "listing_rule")
+
+    def test_profile_rule_never_uses_telegram_handle_as_nickname(self):
+        fields, _ = _extract_profile_rule_fields({
+            "extract": {"nickname": [r"联系人[:：]\s*(@?\w+)"]},
+        }, "联系人：@sample_user", "sample_user")
+
+        self.assertNotIn("nickname", fields)
+
     def test_business_day_rolls_at_four(self):
         zone = ZoneInfo("Asia/Shanghai")
         before = datetime(2026, 10, 28, 3, 59, tzinfo=zone)

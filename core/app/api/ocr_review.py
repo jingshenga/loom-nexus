@@ -1,5 +1,6 @@
 """Admin-only review queue for locally classified OCR card images."""
 import json
+import re
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
@@ -124,7 +125,7 @@ async def queue(
         " AND ($4::numeric IS NULL OR COALESCE(o.predicted_confidence,o.confidence)<=$4) "
     )
     rows = await pool.fetch(
-        "SELECT o.id, o.raw_id, o.listing_id, o.media_path, o.status, "
+        "SELECT o.id, o.raw_id, COALESCE(o.listing_id,l.id) AS listing_id, o.media_path, o.status, "
         "o.classification, o.human_classification, o.predicted_classification, "
         "o.predicted_confidence, o.classifier_version_id, o.classifier_signals_json, "
         "o.review_status, o.raw_text, o.normalized_text, "
@@ -132,13 +133,17 @@ async def queue(
         "o.error_text, COALESCE(rm.raw_text, l.description) AS message_text, "
         "COALESCE(rm.posted_at, l.created_at) AS posted_at, "
         "COALESCE(s.title, CASE WHEN l.duty_collection_job_id IS NOT NULL "
+        "OR l.profile_collection_job_id IS NOT NULL "
         "THEN '签到资料自动采集' END) AS source_title, l.nickname "
         "FROM listing_media_ocr o "
         "LEFT JOIN raw_messages rm ON rm.id=o.raw_id "
         "LEFT JOIN ingest_sources s ON s.id=rm.source_id "
-        "LEFT JOIN LATERAL (SELECT id, nickname, description, created_at, duty_collection_job_id "
-        " FROM listings WHERE id=o.listing_id OR source_msg_id=o.raw_id "
-        " ORDER BY CASE WHEN id=o.listing_id THEN 0 ELSE 1 END, id DESC LIMIT 1) l ON TRUE "
+        "LEFT JOIN profile_collection_results pr ON pr.id=o.profile_result_id "
+        "LEFT JOIN LATERAL (SELECT id, nickname, description, created_at, "
+        "duty_collection_job_id, profile_collection_job_id FROM listings "
+        " WHERE id=o.listing_id OR source_msg_id=o.raw_id OR profile_collection_job_id=pr.job_id "
+        " ORDER BY CASE WHEN id=o.listing_id THEN 0 "
+        "WHEN profile_collection_job_id=pr.job_id THEN 1 ELSE 2 END, id DESC LIMIT 1) l ON TRUE "
         "WHERE CASE WHEN $1='pending' THEN o.review_status='pending' "
         " WHEN $1='confirmed' THEN o.review_status='confirmed' "
         " WHEN $1='not_card' THEN o.review_status='not_card' "
@@ -216,6 +221,58 @@ async def edit(asset_id: int, body: EditOcrBody) -> dict:
                 asset_id, json.dumps(body.fields, ensure_ascii=False), new_text,
             )
     return {"ok": True}
+
+
+@router.post("/{asset_id}/apply-stage-name")
+async def apply_stage_name(asset_id: int) -> dict:
+    """Apply a human-reviewed OCR name candidate without replacing an edited name."""
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT o.review_status, COALESCE(o.human_classification,o.classification) AS classification, "
+                "o.fields_json, COALESCE(o.listing_id,l.id) AS listing_id "
+                "FROM listing_media_ocr o "
+                "LEFT JOIN profile_collection_results pr ON pr.id=o.profile_result_id "
+                "LEFT JOIN LATERAL (SELECT id FROM listings "
+                " WHERE id=o.listing_id OR profile_collection_job_id=pr.job_id "
+                " ORDER BY CASE WHEN id=o.listing_id THEN 0 ELSE 1 END, id DESC LIMIT 1) l ON TRUE "
+                "WHERE o.id=$1 FOR UPDATE OF o",
+                asset_id,
+            )
+            if row is None:
+                raise HTTPException(status_code=404, detail="OCR item not found")
+            if row["review_status"] != "confirmed" or row["classification"] != "info_card":
+                raise HTTPException(status_code=409, detail="先将图片核对为资料卡，再应用昵称候选")
+            if row["listing_id"] is None:
+                raise HTTPException(status_code=409, detail="该 OCR 图片没有关联名片")
+            fields = _decode(row["fields_json"], {})
+            candidate = str(fields.get("stage_name") or fields.get("stage_name_candidate") or "")
+            candidate = re.sub(r"\s+", " ", candidate).strip().strip("#，,。.;；")
+            if (not candidate or len(candidate) > 32 or candidate.startswith("@")
+                    or re.fullmatch(r"tg\s*id\s*\d+|\d+", candidate, re.I)):
+                raise HTTPException(status_code=422, detail="OCR 中没有可应用的昵称候选")
+            updated = await conn.fetchrow(
+                "UPDATE listings SET nickname=$2, "
+                "evidence_json=COALESCE(evidence_json,'{}'::jsonb) || "
+                "jsonb_build_object('nickname_source','ocr_confirmed','nickname_ocr_id',$3), "
+                "manual_fields=COALESCE(manual_fields,'{}'::jsonb) || '{\"nickname\":true}'::jsonb, "
+                "updated_at=NOW() WHERE id=$1 "
+                "AND NOT (COALESCE(manual_fields,'{}'::jsonb) ? 'nickname') "
+                "AND (nickname IS NULL OR trim(nickname)='' "
+                "OR lower(trim(nickname))=lower(contact_username) "
+                "OR lower(trim(nickname))='@'||lower(contact_username) "
+                "OR nickname='TG ID '||contact_peer_id::text) "
+                "AND lower(trim($2))<>lower(COALESCE(contact_username,'')) "
+                "AND lower(trim($2))<>'@'||lower(COALESCE(contact_username,'')) "
+                "RETURNING id, nickname",
+                row["listing_id"], candidate, asset_id,
+            )
+            if updated is None:
+                raise HTTPException(status_code=409, detail="名片昵称已人工修改或不再是 TG 号占位值")
+    return {"ok": True, "listing_id": updated["id"], "nickname": updated["nickname"]}
 
 
 @router.post("/{asset_id}/decision")

@@ -179,6 +179,15 @@ function parseFields() {
   return fields;
 }
 
+function stageNameCandidate() {
+  try {
+    const fields = JSON.parse(fieldsText.value || "{}");
+    return String(fields.stage_name || fields.stage_name_candidate || "").trim();
+  } catch {
+    return "";
+  }
+}
+
 async function save() {
   if (!current.value) return false;
   const fields = parseFields();
@@ -200,6 +209,26 @@ async function saveOnly() {
     if (await save()) notify("修改已保存");
   } catch (error) {
     notify(`保存失败：${error.message}`);
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function applyStageName() {
+  if (!current.value || busy.value) return;
+  const candidate = stageNameCandidate();
+  if (!candidate || !current.value.listing_id) return;
+  if (!confirm(`将 OCR 昵称候选“${candidate}”应用到关联名片？这会标记为人工确认。`)) return;
+  busy.value = true;
+  try {
+    if (!(await save())) return;
+    const result = await api(`/api/admin/ocr/${current.value.id}/apply-stage-name`, { method: "POST" });
+    notify(`已将“${result.nickname}”写入卡片 #${result.listing_id}`);
+    modalOpen.value = false;
+    current.value = null;
+    await load();
+  } catch (error) {
+    notify(`应用昵称失败：${error.message}`);
   } finally {
     busy.value = false;
   }
@@ -413,6 +442,7 @@ async function reclassifySelected() {
               <span class="mt-1 block text-[10px] text-slate-500">保存后作为训练标签；会保留模型原预测和版本记录。</span>
             </label>
             <p class="whitespace-pre-wrap rounded-lg bg-slate-900 p-3 text-xs leading-relaxed text-slate-400">来源消息：{{ current.message_text || "（无正文）" }}</p>
+            <p v-if="current.listing_id" class="rounded-lg bg-slate-900 p-3 text-xs text-slate-300">关联名片 #{{ current.listing_id }} · 当前昵称：{{ current.nickname || "未识别" }}</p>
             <label class="block text-xs text-slate-400">OCR 原文（只读）
               <textarea :value="current.raw_text" readonly rows="5" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-900 p-3 text-sm leading-relaxed text-slate-200" />
             </label>
@@ -427,6 +457,10 @@ async function reclassifySelected() {
               <div v-for="(ev, key) in current.evidence" :key="key" class="rounded bg-slate-900 px-2 py-1.5 text-xs">
                 <span class="text-sky-300">{{ key }}</span><span class="ml-2 text-slate-400">{{ ev.line }}</span>
               </div>
+            </div>
+            <div v-if="current.review_status === 'confirmed' && current.listing_id && stageNameCandidate()" class="rounded-lg border border-emerald-900/70 bg-emerald-950/20 p-3">
+              <p class="text-xs text-emerald-200">昵称候选：{{ stageNameCandidate() }}。请核对后单独应用到关联名片。</p>
+              <button :disabled="busy" @click="applyStageName" class="mt-2 rounded-lg bg-emerald-700 px-3 py-2 text-xs font-medium text-white disabled:opacity-50">确认并应用昵称</button>
             </div>
             <div class="sticky bottom-0 flex flex-wrap gap-2 border-t border-slate-800 bg-slate-950 py-3">
               <button :disabled="busy" @click="saveOnly" class="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-200 disabled:opacity-50">保存修改</button>
