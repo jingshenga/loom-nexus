@@ -44,6 +44,17 @@ function isSelected(id) {
   return selectedIds.value.includes(id);
 }
 
+function isTelegramPlaceholder(item) {
+  const nickname = String(item?.nickname || "").trim();
+  const username = String(item?.contact_username || "").replace(/^@/, "").trim();
+  if (nickname && username && nickname.toLowerCase().replace(/^@/, "") === username.toLowerCase()) return true;
+  return Boolean(item?.contact_peer_id && new RegExp(`^TG ID\\s*${item.contact_peer_id}$`, "i").test(nickname));
+}
+
+function nicknameLabel(item) {
+  return isTelegramPlaceholder(item) ? "昵称待核对" : item?.nickname || `#${item?.id}`;
+}
+
 function toggleSelect(id) {
   selectedIds.value = isSelected(id)
     ? selectedIds.value.filter((x) => x !== id)
@@ -76,7 +87,7 @@ async function removeCards(ids) {
 
 async function deleteCurrent() {
   if (!current.value) return;
-  const label = current.value.nickname || `#${current.value.id}`;
+  const label = nicknameLabel(current.value);
   if (!window.confirm(`删除「${label}」？原始 Telegram 消息会保留。`)) return;
   await removeCards([current.value.id]);
 }
@@ -85,7 +96,7 @@ function select(item) {
   current.value = item;
   mediaManualOrder.value = (item.media || []).some((media) => Number.isInteger(media.manual_order));
   form.value = {
-    nickname: item.nickname || "",
+    nickname: isTelegramPlaceholder(item) ? "" : item.nickname || "",
     district: item.district || "",
     price_amount: item.price_amount,
     price_currency: item.price_currency || "",
@@ -644,7 +655,7 @@ onUnmounted(() => {
               <span v-else class="flex size-full items-center justify-center text-xs text-slate-600">无图片</span>
             </div>
             <div class="space-y-1 p-2">
-              <div class="truncate text-xs font-medium">{{ item.nickname || `#${item.id}` }}</div>
+              <div class="truncate text-xs font-medium">{{ nicknameLabel(item) }}</div>
               <div class="truncate text-[10px] text-slate-400">{{ item.source_title || '来源未知' }}</div>
               <div class="truncate text-[10px] text-slate-500">{{ new Date(item.created_at).toLocaleString('zh-CN') }}</div>
             </div>
@@ -663,7 +674,7 @@ onUnmounted(() => {
       <section class="flex max-h-[96dvh] w-full max-w-6xl flex-col gap-3 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950 p-4 shadow-2xl">
         <button @click="current = null" class="ml-auto rounded border border-slate-700 px-2 py-1 text-xs text-slate-400">关闭</button>
         <div class="flex flex-wrap items-start justify-between gap-2">
-          <div><h3 class="font-semibold">{{ current.nickname || `卡片 #${current.id}` }}</h3><p class="mt-1 text-xs text-slate-400">{{ current.source_title || "未知来源" }}<span v-if="current.contact_username"> · @{{ current.contact_username }}</span></p></div>
+          <div><h3 class="font-semibold">{{ nicknameLabel(current) }}</h3><p class="mt-1 text-xs text-slate-400">{{ current.source_title || "未知来源" }}<span v-if="current.contact_username"> · @{{ current.contact_username }}</span></p></div>
           <div class="text-right text-xs"><div class="text-sky-300">采集于 {{ new Date(current.created_at).toLocaleString('zh-CN') }}</div><div v-if="current.source_posted_at" class="mt-1 text-slate-500">原消息 {{ new Date(current.source_posted_at).toLocaleString('zh-CN') }}</div></div>
         </div>
         <div class="flex flex-wrap gap-2 text-sm text-slate-300"><span v-if="current.district" class="rounded bg-slate-800 px-2 py-1">{{ current.district }}</span><span class="rounded bg-slate-800 px-2 py-1">{{ current.price_amount ?? "价格待核" }} {{ current.price_currency || "" }}</span><span v-if="current.contact_peer_id" class="rounded bg-slate-800 px-2 py-1">TG ID {{ current.contact_peer_id }}</span></div>
