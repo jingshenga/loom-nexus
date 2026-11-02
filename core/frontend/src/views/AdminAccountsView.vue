@@ -87,19 +87,27 @@ async function cancelLogin() {
   }
 }
 
-async function disconnectAccount(acc) {
+async function forceDisconnectAccount(acc) {
   const bound = acc.bound_sources > 0
     ? `；该账号还绑定着 ${acc.bound_sources} 个采集来源（将暂停采集）` : "";
-  if (!confirm(`确认让账号 ${acc.display_name || acc.username || acc.account_uid} 下线？其开放中的咨询会话会被关闭${bound}`)) return;
-  const data = await api(`/api/admin/accounts/${acc.id}/disconnect`, { method: "POST" });
-  notify(`已下线（关闭 ${data.closed_sessions} 个会话${bound}）`);
-  await load();
+  if (!confirm(`确认强制下线账号 ${acc.display_name || acc.username || acc.account_uid} 并释放本地 Telegram 会话？这会关闭其开放中的咨询会话${bound}。不会删除 session 文件或撤销 Telegram 授权。`)) return;
+  try {
+    const data = await api(`/api/admin/accounts/${acc.id}/force-disconnect`, { method: "POST" });
+    notify(`账号已下线，会话已释放（关闭 ${data.closed_sessions} 个咨询会话）。现在可以重新登录。`);
+    await load();
+  } catch (e) {
+    notify(`下线未确认: ${String(e.message).slice(0, 110)}`);
+  }
 }
 
 async function activateAccount(acc) {
-  await api(`/api/admin/accounts/${acc.id}/activate`, { method: "POST" });
-  notify(`账号 ${acc.display_name || acc.account_uid} 已重新启用（约 1 分钟内接入）`);
-  await load();
+  try {
+    await api(`/api/admin/accounts/${acc.id}/activate`, { method: "POST" });
+    notify(`账号 ${acc.display_name || acc.account_uid} 已重新启用（约 1 分钟内接入）`);
+    await load();
+  } catch (e) {
+    notify(`启用失败: ${String(e.message).slice(0, 110)}`);
+  }
 }
 
 const waitingSecret = () =>
@@ -186,7 +194,7 @@ onUnmounted(() => clearInterval(timer));
         </div>
         <span class="rounded px-2 py-0.5 text-xs font-medium"
           :class="acc.status === 'active' ? 'bg-emerald-900/50 text-emerald-300' : 'bg-slate-800 text-slate-400'">
-          {{ acc.status === 'active' ? "在线服务中" : acc.status }}
+          {{ acc.status === 'active' ? "在线服务中" : acc.status === 'needs_auth' ? "需重新登录" : "已下线" }}
         </span>
         <span class="text-xs text-slate-400">咨询会话 {{ acc.open_sessions }} · 绑定来源 {{ acc.bound_sources }}</span>
         <span class="text-xs text-slate-600">{{ acc.session_file }}</span>
@@ -195,9 +203,9 @@ onUnmounted(() => clearInterval(timer));
             class="flex items-center gap-1 rounded-lg border border-emerald-700/60 px-3 py-1.5 text-xs text-emerald-300 hover:bg-emerald-900/30">
             <Power class="size-3.5" />启用
           </button>
-          <button v-else @click="disconnectAccount(acc)"
+          <button @click="forceDisconnectAccount(acc)"
             class="flex items-center gap-1 rounded-lg border border-rose-700/60 px-3 py-1.5 text-xs text-rose-300 hover:bg-rose-900/30">
-            <LogOut class="size-3.5" />退出登录
+            <LogOut class="size-3.5" />强制下线并释放会话
           </button>
         </div>
       </div>

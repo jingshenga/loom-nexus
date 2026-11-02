@@ -2,42 +2,44 @@ SELECT l.id, l.nickname, l.district, l.price_amount, l.price_currency,
        l.description, l.media_json, l.evidence_json, l.confidence, l.status,
        l.contact_peer_id, l.contact_username, l.created_at,
        COALESCE(rm.raw_text, l.description) AS raw_text,
-       COALESCE(s.title, profile_source.title,
-                CASE WHEN l.duty_collection_job_id IS NOT NULL
-                     THEN 'Telegram 个人资料/关联频道' END) AS source_title,
-       COALESCE(rm.posted_at, profile_result.collected_at) AS raw_posted_at,
-       COALESCE(rm.source_id, profile_job.source_id) AS source_id,
-       jsonb_array_length(COALESCE(l.media_json, '[]'::jsonb)) > 0 AS has_media,
-       EXISTS (
-           SELECT 1 FROM listing_media_ocr o
-           WHERE o.review_status = 'pending'
-             AND (o.listing_id = l.id
-                  OR o.raw_id = l.source_msg_id
-                  OR o.profile_result_id = profile_result.id)
-       ) AS ocr_pending
+       COALESCE(s.title, CASE WHEN ir.rule_type = 'checkin_reverse' THEN '签到来源反查 V2'
+                              WHEN ir.rule_type = 'profile_collection' THEN 'TG号采集 V2'
+                              WHEN l.duty_collection_job_id IS NOT NULL
+                              THEN 'Telegram 个人资料/关联频道' END) AS source_title,
+       rm.posted_at AS raw_posted_at
 FROM listings l
 LEFT JOIN raw_messages rm ON rm.id = l.source_msg_id
 LEFT JOIN ingest_sources s ON s.id = rm.source_id
-LEFT JOIN profile_collection_jobs profile_job
-       ON profile_job.id = l.profile_collection_job_id
-LEFT JOIN ingest_sources profile_source ON profile_source.id = profile_job.source_id
-LEFT JOIN profile_collection_results profile_result
-       ON profile_result.job_id = profile_job.id
+LEFT JOIN profile_collection_jobs pcj ON pcj.id = l.profile_collection_job_id
+LEFT JOIN ingest_rules ir ON ir.id = pcj.rule_id
 WHERE l.status = $1::text
+  AND (($8::text IS NULL AND l.profile_collection_job_id IS NULL)
+       OR ($8::text IS NOT NULL AND l.evidence_json->>'review_bucket' = $8::text))
   AND ($4::text IS NULL OR l.nickname ILIKE '%' || $4::text || '%')
-  AND ($5::bigint IS NULL OR COALESCE(rm.source_id, profile_job.source_id) = $5::bigint)
-  AND ($6::text = 'all'
-       OR ($6::text = 'with_media' AND jsonb_array_length(COALESCE(l.media_json, '[]'::jsonb)) > 0)
-       OR ($6::text = 'no_media' AND jsonb_array_length(COALESCE(l.media_json, '[]'::jsonb)) = 0))
-  AND (NOT $7::boolean OR EXISTS (
-       SELECT 1 FROM listing_media_ocr o
-       WHERE o.review_status = 'pending'
-         AND (o.listing_id = l.id
-              OR o.raw_id = l.source_msg_id
-              OR o.profile_result_id = profile_result.id)
+  AND ($5::text IS NULL OR COALESCE(s.title, CASE WHEN l.duty_collection_job_id IS NOT NULL THEN 'Telegram 个人资料/关联频道' END, '') ILIKE '%' || $5::text || '%')
+  AND ($6::text IS NULL OR EXISTS (
+      SELECT 1 FROM jsonb_array_elements(COALESCE(l.media_json, '[]'::jsonb)) m
+      WHERE m->>'kind' = $6::text
   ))
-ORDER BY CASE WHEN $8::text = 'oldest' THEN l.created_at END ASC,
-         CASE WHEN $8::text = 'newest' THEN l.created_at END DESC,
-         CASE WHEN $8::text = 'oldest' THEN l.id END ASC,
-         CASE WHEN $8::text = 'newest' THEN l.id END DESC
+  AND ($1::text <> 'pending' OR NOT EXISTS (
+      SELECT 1 FROM listings other
+      WHERE other.id <> l.id
+        AND other.status IN ('pending', 'duplicate_pending', 'published', 'archived')
+        AND NULLIF(l.nickname, '') IS NOT NULL
+        AND NULLIF(other.nickname, '') IS NOT NULL
+        AND regexp_replace(lower(l.nickname), '[[:space:][:punct:]_]+', '', 'g')
+            = regexp_replace(lower(other.nickname), '[[:space:][:punct:]_]+', '', 'g')
+        AND (l.profile_collection_job_id IS NOT NULL OR other.profile_collection_job_id IS NOT NULL
+             OR EXISTS (SELECT 1 FROM raw_messages history_raw
+                        JOIN checkin_history_scans hs ON hs.source_id=history_raw.source_id
+                        WHERE history_raw.id=l.source_msg_id OR history_raw.id=other.source_msg_id))
+        AND NOT EXISTS (
+            SELECT 1 FROM listing_duplicate_decisions d
+            WHERE d.left_listing_id = LEAST(l.id, other.id)
+              AND d.right_listing_id = GREATEST(l.id, other.id)
+        )
+  ))
+ORDER BY CASE WHEN $7::text = 'oldest' THEN l.created_at END ASC,
+         CASE WHEN $7::text <> 'oldest' THEN l.created_at END DESC,
+         l.id DESC
 LIMIT GREATEST(1, $2::int) OFFSET GREATEST(0, $3::int);

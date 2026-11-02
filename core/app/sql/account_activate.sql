@@ -1,1 +1,1 @@
-UPDATE bridge_accounts SET status = 'active' WHERE id = $1::bigint AND status = 'disconnected';
+SELECT * FROM account_activate_request($1::bigint);

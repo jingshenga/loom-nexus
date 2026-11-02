@@ -7,6 +7,7 @@ from pathlib import Path
 from PIL import Image
 
 from app import sqlres
+from app.extractor.image_classifier import predict
 
 logger = logging.getLogger("nexus-core.media-ocr")
 
@@ -298,62 +299,75 @@ class MediaOcrProcessor:
         if not media_path.is_relative_to(self._media_dir) or not media_path.is_file():
             await self._finish(row, "failed", "uncertain", "pending", "admin", "", "", {}, {}, 0.0, "image file missing")
             return
+        media = await self._load_media(row)
+        items = media["media_json"] if media else []
+        if isinstance(items, str):
+            import json
+            items = json.loads(items)
+        entry = next((
+            item for item in items
+            if item.get("path") == row["media_path"]
+            or item.get("poster") == row["media_path"]
+        ), {})
+        face_score = entry.get("score")
+        uniformity, dimensions = image_signals(str(media_path))
+        model_row = await self._load_active_classifier()
+        signals = self._signals([], face_score, uniformity, dimensions)
         try:
             document = await self._ocr.read_document(str(media_path))
             if not document.get("ok"):
                 raise RuntimeError(document.get("error") or "OCR worker failed")
             lines = document.get("lines", [])
+            signals = self._signals(lines, face_score, uniformity, dimensions)
             raw_text = "\n".join(str(item.get("text") or "").strip() for item in lines if item.get("text"))
             normalized = normalize_ocr_text(raw_text)
-            if row["profile_result_id"] is not None:
-                media = await self._pool.fetchrow(
-                    "SELECT media_json, profile_config FROM profile_collection_results WHERE id=$1",
-                    row["profile_result_id"],
-                )
-            elif row["raw_id"] is not None:
-                media = await self._pool.fetchrow(
-                    "SELECT media_json FROM raw_messages WHERE id=$1", row["raw_id"],
-                )
-            else:
-                media = await self._pool.fetchrow(
-                    "SELECT media_json FROM listings WHERE id=$1", row["listing_id"],
-                )
-            items = media["media_json"] if media else []
-            if isinstance(items, str):
-                import json
-                items = json.loads(items)
-            entry = next((
-                item for item in items
-                if item.get("path") == row["media_path"]
-                or item.get("poster") == row["media_path"]
-            ), {})
             if row["profile_result_id"] is not None:
                 config = media["profile_config"] or {}
                 if isinstance(config, str):
                     import json
                     config = json.loads(config)
-                classification, confidence, profile_text = classify_profile_image(
-                    lines,
-                    max(1, int(config.get("intro_min_chars", 30))),
-                    max(1, int(config.get("intro_min_lines", 3))),
-                )
-                review_status = "pending" if classification in ("info_card", "uncertain") else "not_required"
+                profile_text = " ".join(str(item.get("text") or "").strip() for item in lines if item.get("text"))
+                if model_row:
+                    classification, confidence, probabilities = predict(
+                        model_row["model"], profile_text, signals,
+                    )
+                    version_id = model_row["id"]
+                    review_status, visibility = self._route(model_row["policy"], classification, confidence)
+                else:
+                    classification, confidence, profile_text = classify_profile_image(
+                        lines,
+                        max(1, int(config.get("intro_min_chars", 30))),
+                        max(1, int(config.get("intro_min_lines", 3))),
+                    )
+                    version_id = None
+                    probabilities = {}
+                    review_status = "pending" if classification in ("info_card", "uncertain") else "not_required"
+                    visibility = "admin" if review_status == "pending" else "public"
                 await self._finish(
-                    row, "done", classification, review_status, "admin",
-                    profile_text, normalize_ocr_text(profile_text), {}, {}, confidence, None,
+                    row, "done", classification, review_status, visibility,
+                    profile_text, normalize_ocr_text(profile_text), {},
+                    {"class_probabilities": probabilities}, confidence, None,
+                    version_id, signals,
                 )
                 return
-            face_score = entry.get("score")
-            uniformity, dimensions = image_signals(str(media_path))
-            classification, confidence = classify_image(lines, face_score, uniformity, dimensions)
-            fields, evidence = extract_card_fields(lines)
-            if classification in ("info_card", "uncertain"):
-                review_status, visibility = "pending", "admin"
+            if model_row:
+                classification, confidence, probabilities = predict(model_row["model"], raw_text, signals)
+                version_id = model_row["id"]
+                review_status, visibility = self._route(model_row["policy"], classification, confidence)
             else:
-                review_status, visibility = "not_required", "public"
+                classification, confidence = classify_image(lines, face_score, uniformity, dimensions)
+                probabilities = {}
+                version_id = None
+                if classification in ("info_card", "uncertain"):
+                    review_status, visibility = "pending", "admin"
+                else:
+                    review_status, visibility = "not_required", "public"
+            fields, evidence = extract_card_fields(lines)
+            evidence["classifier"] = {"probabilities": probabilities} if probabilities else {}
             await self._finish(
                 row, "done", classification, review_status, visibility,
                 raw_text, normalized, fields, evidence, confidence, None,
+                version_id, signals,
             )
             logger.info(
                 "OCR image %s -> %s (chars=%d labels=%d confidence=%.2f)",
@@ -362,11 +376,68 @@ class MediaOcrProcessor:
             )
         except Exception as exc:
             logger.warning("OCR image %s failed: %s", row["id"], exc)
-            await self._finish(row, "failed", "uncertain", "pending", "admin", "", "", {}, {}, 0.0, str(exc)[:500])
+            classification, confidence, version_id = "uncertain", 0.0, None
+            evidence = {}
+            if model_row:
+                classification, confidence, probabilities = predict(model_row["model"], "", signals)
+                version_id = model_row["id"]
+                evidence = {"classifier": {"probabilities": probabilities}}
+            await self._finish(
+                row, "failed", classification, "pending", "admin", "", "", {},
+                evidence, confidence, str(exc)[:500], version_id, signals,
+            )
+
+    async def _load_media(self, row):
+        if row["profile_result_id"] is not None:
+            return await self._pool.fetchrow(
+                "SELECT media_json,profile_config FROM profile_collection_results WHERE id=$1",
+                row["profile_result_id"],
+            )
+        if row["raw_id"] is not None:
+            return await self._pool.fetchrow(
+                "SELECT media_json FROM raw_messages WHERE id=$1", row["raw_id"],
+            )
+        return await self._pool.fetchrow(
+            "SELECT media_json FROM listings WHERE id=$1", row["listing_id"],
+        )
+
+    async def _load_active_classifier(self):
+        row = await self._pool.fetchrow(
+            "SELECT id,model_json,policy_json FROM ocr_classifier_versions "
+            "WHERE status='active' ORDER BY id DESC LIMIT 1"
+        )
+        if row is None:
+            return None
+        import json
+        model = row["model_json"] if isinstance(row["model_json"], dict) else json.loads(row["model_json"])
+        policy = row["policy_json"] if isinstance(row["policy_json"], dict) else json.loads(row["policy_json"])
+        return {"id": row["id"], "model": model, "policy": policy}
+
+    @staticmethod
+    def _signals(lines, face_score, uniformity, dimensions):
+        texts = [str(item.get("text") or "").strip() for item in lines if item.get("text")]
+        chars = len(re.sub(r"\s+", "", "".join(texts)))
+        box_area = sum(_box_area(item.get("box")) for item in lines)
+        width, height = dimensions or (0, 0)
+        coverage = min(1.0, box_area / (width * height)) if width and height else 0.0
+        return {
+            "face_score": face_score,
+            "uniformity": round(float(uniformity), 5),
+            "text_chars": chars,
+            "text_lines": len(texts),
+            "text_coverage": round(coverage, 5),
+        }
+
+    @staticmethod
+    def _route(policy, classification, confidence):
+        review_classes = set(policy.get("review_classes") or ["info_card", "uncertain"])
+        pending = classification in review_classes or confidence < float(policy.get("confidence_threshold", 0.65))
+        return ("pending", "admin") if pending else ("not_required", "public")
 
     async def _finish(
         self, row, status, classification, review_status, visibility,
         raw_text, normalized, fields, evidence, confidence, error,
+        version_id=None, signals=None,
     ):
         import json
 
@@ -374,6 +445,8 @@ class MediaOcrProcessor:
             SQL_FINISH, row["id"], status, classification, review_status,
             raw_text, normalized, json.dumps(fields, ensure_ascii=False),
             json.dumps(evidence, ensure_ascii=False), confidence, ENGINE_VERSION, error,
+            classification, confidence, version_id,
+            json.dumps(signals or {}, ensure_ascii=False),
         )
         if row["profile_result_id"] is not None:
             await self._pool.fetch(

@@ -5,6 +5,7 @@ a login_requests row, the bridge login-watcher spawns the Telethon
 login worker, the worker flips state to code_sent (or password_needed)
 and the page submits the secret through here.
 """
+import asyncio
 import re
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -20,6 +21,8 @@ router = APIRouter(
 
 SQL_LIST = sqlres.load("admin_accounts.sql")
 SQL_DISCONNECT = sqlres.load("account_disconnect.sql")
+SQL_FORCE_DISCONNECT = sqlres.load("account_force_disconnect.sql")
+SQL_DISCONNECT_STATUS = sqlres.load("account_disconnect_status.sql")
 SQL_ACTIVATE = sqlres.load("account_activate.sql")
 SQL_LOGIN_START = sqlres.load("login_start.sql")
 SQL_LOGIN_SECRET = sqlres.load("login_set_secret.sql")
@@ -149,10 +152,49 @@ async def disconnect_account(account_id: int) -> dict:
     }
 
 
+@router.post("/{account_id}/force-disconnect")
+async def force_disconnect_account(account_id: int) -> dict:
+    """Deactivate an account and wait for bridge to release its session."""
+    pool = _pool()
+    rows = await pool.fetch(SQL_FORCE_DISCONNECT, account_id)
+    if not rows:
+        raise HTTPException(status_code=404, detail="account not found")
+    request = rows[0]
+    deadline = asyncio.get_running_loop().time() + 15
+    while asyncio.get_running_loop().time() < deadline:
+        status = await pool.fetchrow(SQL_DISCONNECT_STATUS, request["request_id"])
+        if status and status["state"] == "done":
+            return {
+                "ok": True,
+                "released": True,
+                "closed_sessions": request["closed_sessions"],
+                "bound_sources": request["bound_sources"],
+            }
+        if status and status["state"] == "failed":
+            raise HTTPException(
+                status_code=502,
+                detail=f"账号已停用，但会话释放失败：{status['error'] or '未知错误'}",
+            )
+        await asyncio.sleep(0.25)
+    raise HTTPException(
+        status_code=504,
+        detail="账号已停用，但 bridge 尚未确认释放会话；请勿立即重新登录，稍后重试",
+    )
+
+
 @router.post("/{account_id}/activate")
 async def activate_account(account_id: int) -> dict:
     pool = _pool()
     rows = await pool.fetch(SQL_ACTIVATE, account_id)
     if not rows:
-        raise HTTPException(status_code=404, detail="account not found")
-    return {"ok": True}
+        raise HTTPException(status_code=409, detail="账号状态已变化，请刷新后重试")
+    request_id = rows[0]["request_id"]
+    deadline = asyncio.get_running_loop().time() + 15
+    while asyncio.get_running_loop().time() < deadline:
+        status = await pool.fetchrow(SQL_DISCONNECT_STATUS, request_id)
+        if status and status["state"] == "done":
+            return {"ok": True}
+        if status and status["state"] == "failed":
+            raise HTTPException(status_code=502, detail="启用账号失败")
+        await asyncio.sleep(0.25)
+    raise HTTPException(status_code=504, detail="bridge 尚未确认启用，请稍后刷新状态")

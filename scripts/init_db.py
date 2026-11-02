@@ -28,10 +28,16 @@ EXPECTED_TABLES = (
     "ingest_sources",
     "ingest_source_account_backups",
     "listings",
+    "listing_media_ocr",
     "listing_duplicate_decisions",
+    "ocr_classification_categories",
+    "ocr_classification_labels",
+    "ocr_classifier_versions",
     "outbox_jobs",
     "profile_collection_jobs",
     "profile_collection_results",
+    "checkin_history_scans",
+    "checkin_identity_index",
     "raw_messages",
     "source_rule_bindings",
     "user_favorites",
@@ -46,10 +52,9 @@ EXPECTED_INDEXES = (
 EXPECTED_SEED_RULE = "default-rule"
 
 REAPPLY_HINT = (
-    "schema incomplete — scripts/schema.sql runs automatically on the FIRST "
-    "boot of an empty nexus-db data directory; to re-apply on an existing "
-    "cluster run: docker compose exec -T nexus-db psql -U <user> -d <db> "
-    "< scripts/schema.sql"
+    "schema incomplete — first-boot SQL is applied automatically only on an empty "
+    "nexus-db data directory; apply the matching idempotent file from scripts/migrations/ "
+    "with psql -v ON_ERROR_STOP=1 before restarting nexus-core"
 )
 
 

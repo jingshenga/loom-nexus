@@ -9,7 +9,7 @@ import re
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app import db, llm, sqlres
 from app.api.auth import require_admin
@@ -35,6 +35,7 @@ SQL_PROFILE_COLLECTION_RESULTS = sqlres.load("profile_collection_results.sql")
 SQL_PROFILE_COLLECTION_SUMMARY = sqlres.load("profile_collection_summary.sql")
 SQL_PROFILE_COLLECTION_ENQUEUE = sqlres.load("profile_collection_enqueue_manual.sql")
 SQL_PROFILE_COLLECTION_REQUEUE = sqlres.load("profile_collection_requeue_ineffective.sql")
+SQL_CHECKIN_HISTORY_STATUS = sqlres.load("checkin_history_status.sql")
 
 LLM_SYSTEM_PROMPT = (
     "你是消息抽取规则生成器。根据用户给出的样本消息，产出一个 JSON 规则对象，"
@@ -50,7 +51,7 @@ LLM_SYSTEM_PROMPT = (
 
 class RuleBody(BaseModel):
     rule_name: str
-    rule_type: Literal["listing", "on_duty", "profile_collection"] = "listing"
+    rule_type: Literal["listing", "on_duty", "profile_collection", "checkin_reverse"] = "listing"
     config: dict
     is_active: bool = True
 
@@ -78,7 +79,9 @@ class CopyBody(BaseModel):
 
 
 class ProfileCollectionEnqueueBody(BaseModel):
-    telegram_username: str
+    telegram_username: str = ""
+    telegram_usernames: list[str] = Field(default_factory=list)
+    source_id: int | None = None
 
 
 def _pool():
@@ -168,6 +171,15 @@ async def upsert_rule(body: RuleBody) -> dict:
         for key in ("channel_any_sender_matches", "skip_video_when_photo_found", "exclude_avatar"):
             if body.config.get(key) is not True:
                 raise HTTPException(status_code=422, detail=f"资料深采配置 {key} 必须启用")
+    if body.rule_type == "checkin_reverse":
+        body.config.pop("max_age_days", None)
+        source_username = str(body.config.get("source_username") or "").strip().lstrip("@").lower()
+        if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", source_username):
+            raise HTTPException(status_code=422, detail="请填写公开签到来源频道/群组用户名")
+        body.config["source_username"] = source_username
+        body.config.setdefault("collection_mode", "checkin_source_reverse")
+        if body.config["collection_mode"] != "checkin_source_reverse":
+            raise HTTPException(status_code=422, detail="签到反查规则模式无效")
     if body.rule_type == "on_duty":
         required = ("sender_peer_id", "match_prefix", "update_mode", "identity_mode")
         missing = [key for key in required if not body.config.get(key)]
@@ -256,21 +268,57 @@ async def profile_collection_results(rule_id: int, limit: int = 50) -> dict:
     ]}
 
 
+@router.get("/{rule_id}/history-scan")
+async def checkin_history_status(rule_id: int) -> dict:
+    row = await _pool().fetchrow(SQL_CHECKIN_HISTORY_STATUS, rule_id)
+    if row is None:
+        return {"scan": None}
+    return {"scan": {
+        "source_id": row["source_id"], "source_username": row["source_username"],
+        "status": row["status"], "cursor_msg_id": row["cursor_msg_id"],
+        "scanned_count": row["scanned_count"], "stored_count": row["stored_count"],
+        "candidate_count": row["candidate_count"],
+        "last_scanned_msg_id": row["last_scanned_msg_id"],
+        "last_scanned_at": row["last_scanned_at"].isoformat() if row["last_scanned_at"] else None,
+        "next_attempt_at": row["next_attempt_at"].isoformat() if row["next_attempt_at"] else None,
+        "started_at": row["started_at"].isoformat() if row["started_at"] else None,
+        "completed_at": row["completed_at"].isoformat() if row["completed_at"] else None,
+        "error": row["error"], "progress_note": row["progress_note"],
+        "published_count": row["published_count"], "review_count": row["review_count"],
+    }}
+
+
 @router.post("/{rule_id}/profile-collection/enqueue")
 async def enqueue_profile_collection(rule_id: int, body: ProfileCollectionEnqueueBody) -> dict:
-    raw = body.telegram_username.strip()
-    match = re.fullmatch(
-        r"(?:https?://)?(?:www\.)?t\.me/([A-Za-z0-9_]{5,32})/?|@?([A-Za-z0-9_]{5,32})",
-        raw, re.IGNORECASE,
-    )
-    if not match:
-        raise HTTPException(status_code=422, detail="请输入 Telegram 用户名（@username 或 t.me/username）")
-    username = (match.group(1) or match.group(2)).lower()
-    rows = await _pool().fetch(SQL_PROFILE_COLLECTION_ENQUEUE, rule_id, username)
-    if not rows:
+    raw_values = list(body.telegram_usernames or [])
+    if body.telegram_username.strip():
+        raw_values.append(body.telegram_username)
+    usernames = []
+    for raw_value in raw_values:
+        for raw in re.split(r"[,\s;，；]+", str(raw_value).strip()):
+            if not raw:
+                continue
+            match = re.fullmatch(
+                r"(?:https?://)?(?:www\.)?t\.me/([A-Za-z0-9_]{5,32})/?|@?([A-Za-z0-9_]{5,32})",
+                raw, re.IGNORECASE,
+            )
+            if not match:
+                raise HTTPException(status_code=422, detail=f"TG 号格式无效：{raw}")
+            username = (match.group(1) or match.group(2)).lower()
+            if username not in usernames:
+                usernames.append(username)
+    if not usernames:
+        raise HTTPException(status_code=422, detail="请输入至少一个 Telegram 用户名")
+    if len(usernames) > 100:
+        raise HTTPException(status_code=422, detail="单次最多提交 100 个 TG 号")
+    jobs = []
+    for username in usernames:
+        rows = await _pool().fetch(SQL_PROFILE_COLLECTION_ENQUEUE, rule_id, username, body.source_id)
+        if rows:
+            jobs.append({"job_id": rows[0]["job_id"], "username": username, "status": rows[0]["status"]})
+    if not jobs:
         raise HTTPException(status_code=409, detail="该规则没有已启用并绑定的采集来源/账号")
-    row = rows[0]
-    return {"job_id": row["job_id"], "username": username, "status": row["status"]}
+    return {"jobs": jobs, "queued": len(jobs), "skipped": len(usernames) - len(jobs)}
 
 
 @router.post("/{rule_id}/profile-collection/requeue-ineffective")

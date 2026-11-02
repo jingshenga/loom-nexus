@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 
 import asyncpg
 
@@ -26,6 +27,8 @@ SQL_POLICY = sqlres.load("settings_get_num.sql")
 SQL_POLICY_ENABLED = sqlres.load("settings_get.sql")
 SQL_MEDIA_FLAGS = sqlres.load("media_ocr_set_flags.sql")
 SQL_LISTING_SYNC_MEDIA = sqlres.load("listing_sync_media.sql")
+SQL_HISTORY_SOURCE = sqlres.load("history_scan_source.sql")
+SQL_CREATE_HISTORY_LISTING = sqlres.load("upsert_history_scan.sql")
 
 FALLBACK_RULE = {"gate": {}, "extract": {}, "lifecycle_terms": []}
 
@@ -100,6 +103,7 @@ class Extractor:
             rule = FALLBACK_RULE
         media = _decode_jsonb(row["media_json"], [])
         try:
+            history_source = await self._pool.fetchval(SQL_HISTORY_SOURCE, row["source_id"])
             for item in media:
                 if item.get("kind") != "photo" or item.get("ocr_status") in (
                     "processing", "done", "failed",
@@ -132,6 +136,13 @@ class Extractor:
                 return
 
             fields, evidence = ast_rules.extract_fields(rule, text)
+            if history_source:
+                evidence["collection_method"] = "checkin_history_scan"
+                evidence["review_bucket"] = "checkin_supplement"
+                if not fields.get("username"):
+                    match = re.search(r"(?:TG|电报)\s*[:：]?\s*@?([A-Za-z][A-Za-z0-9_]{3,31})", text, re.I)
+                    if match:
+                        fields["username"] = match.group(1).lower()
             ocr_cfg = (rule.get("ocr") or {})
             missing = [
                 key for key in (ocr_cfg.get("trigger_when_missing") or [])
@@ -164,12 +175,14 @@ class Extractor:
                 k in fields
                 for k in ("nickname", "price_amount", "district", "username")
             )
-            if not has_structure:
+            if not has_structure and not (history_source and (text.strip() or media)):
                 await self._mark(raw_id, "dropped")
                 logger.info("raw %s dropped (no fields extracted)", raw_id)
                 return
-
-            confidence = score_confidence(fields, evidence, len(media))
+            if not has_structure and history_source:
+                confidence = 0.0
+            else:
+                confidence = score_confidence(fields, evidence, len(media))
             ocr_used = any(v.get("src") == "ocr" for v in evidence.values())
             auto_enabled, threshold = await _load_policy(self._pool)
             # below-threshold or OCR-sourced data needs human review;
@@ -179,8 +192,9 @@ class Extractor:
             )
             if ocr_used:
                 confidence = min(confidence, 0.79)  # cap OCR confidence
+            history_source = await self._pool.fetchval(SQL_HISTORY_SOURCE, row["source_id"])
             rows = await self._pool.fetch(
-                SQL_CREATE_LISTING,
+                SQL_CREATE_HISTORY_LISTING if history_source else SQL_CREATE_LISTING,
                 raw_id,
                 None,  # sender is the channel bot, NOT the contact; the
                        # contact identity is the extracted username

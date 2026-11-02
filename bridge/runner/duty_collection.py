@@ -35,6 +35,9 @@ SQL_PROFILE_DEFER = sqlres.load("profile_collection_defer.sql")
 SQL_PROFILE_RESULT = sqlres.load("profile_collection_result.sql")
 SQL_PROFILE_OCR_ENQUEUE = sqlres.load("profile_collection_ocr_enqueue.sql")
 SQL_PROFILE_PROGRESS = sqlres.load("profile_collection_progress.sql")
+SQL_PROFILE_LISTING = sqlres.load("profile_collection_listing.sql")
+SQL_CHECKIN_INDEX_USERNAME = sqlres.load("checkin_index_by_username.sql")
+SQL_CHECKIN_INDEX_NICKNAME = sqlres.load("checkin_index_by_nickname.sql")
 
 
 async def _profile_progress(pool, job, stage, current=None, total=None, note=""):
@@ -48,6 +51,24 @@ def _matches_username(message, username: str) -> bool:
     if listing_contact_username(message) == wanted:
         return True
     return wanted in profile_usernames(message)
+
+
+async def _find_checkin_matches(client, entity, username: str):
+    matches = []
+    async for message in client.iter_messages(entity, search=username, limit=20):
+        if _matches_username(message, username):
+            if not _is_obvious_promo((message.raw_text or "").strip()):
+                matches.append(message)
+    if not matches:
+        # Telegram's server-side search can omit messages that remain visible
+        # in channel history (for example, usernames represented by entities).
+        # Keep the fallback bounded to one recent page to avoid scanning large
+        # check-in channels for every account.
+        async for message in client.iter_messages(entity, limit=100):
+            if _matches_username(message, username):
+                if not _is_obvious_promo((message.raw_text or "").strip()):
+                    matches.append(message)
+    return matches
 
 
 async def _find_message(client, job):
@@ -453,8 +474,117 @@ async def _collect_profile_listing(pool, client, job) -> tuple[str, int | None, 
     return "fetched", None, None
 
 
+async def _persist_profile_result(pool, job, peer_id, profile_url, channel_url,
+                                  bot_url, description, media, evidence, cfg):
+    await _profile_progress(pool, job, "save_result", 0, 1, "写入资料结果并排入 OCR 与审核")
+    rows = await pool.fetch(
+        SQL_PROFILE_RESULT, job["job_id"], peer_id, job["contact_username"],
+        profile_url, channel_url or "", bot_url or "", description,
+        json.dumps(backfill.order_media(media), ensure_ascii=False),
+        json.dumps(evidence, ensure_ascii=False), json.dumps(cfg, ensure_ascii=False),
+    )
+    result_id = rows[0]["id"]
+    await pool.execute(SQL_PROFILE_OCR_ENQUEUE, result_id, json.dumps(media, ensure_ascii=False))
+    bucket = "checkin_supplement" if job["rule_type"] == "checkin_reverse" else "tg_profile_v2"
+    await pool.fetch(SQL_PROFILE_LISTING, job["job_id"], bucket)
+
+
+async def _collect_checkin_source(pool, client, job, cfg):
+    source_username = str(cfg.get("source_username") or "").strip().lstrip("@")
+    if not source_username:
+        raise RuntimeError("签到反查规则缺少来源频道用户名")
+    if job["target_msg_id"] is None:
+        indexed = await pool.fetch(
+            SQL_CHECKIN_INDEX_USERNAME, job["source_id"], job["contact_username"],
+        )
+        if indexed:
+            return "skipped", f"资料库已按 TG 号命中卡片 #{indexed[0]['listing_id']}"
+        nickname = str(job["contact_nickname"] or "").strip()
+        if nickname:
+            indexed = await pool.fetch(
+                SQL_CHECKIN_INDEX_NICKNAME, job["source_id"], nickname,
+            )
+            if len(indexed) == 1:
+                return "skipped", f"资料库已按唯一昵称命中卡片 #{indexed[0]['listing_id']}"
+    entity = await _rate_limited_entity(
+        pool, client, job["account_id"], source_username,
+    )
+    matches = []
+    if job["target_msg_id"] is not None and job["target_peer_id"] is not None:
+        from telethon import utils
+
+        if int(job["target_peer_id"]) == int(utils.get_peer_id(entity)):
+            target = await client.get_messages(entity, ids=job["target_msg_id"])
+            if target and _matches_username(target, job["contact_username"]):
+                matches = [target]
+    if not matches:
+        matches = await _find_checkin_matches(
+            client, entity, job["contact_username"],
+        )
+    if not matches:
+        return "not_found", "签到来源中没有找到包含该 TG 号的消息"
+    matches.sort(
+        key=lambda message: message.date or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+
+    primary = matches[0]
+    parts = await _fetch_album(client, entity, primary)
+    channel_name = getattr(entity, "username", None) or source_username
+    media = []
+    video_candidates = []
+    for part in parts:
+        kind = _profile_media_kind(part)
+        if kind == "photo" and sum(item["kind"] == "photo" for item in media) < 6:
+            entries = await backfill.save_media(
+                part, job["source_id"], stable_prefix=f"checkin_v2_{job['job_id']}_{part.id}",
+                force_kind="photo",
+            )
+            media.extend({**item, "message_id": int(part.id)} for item in entries if item.get("kind") == "photo")
+        elif kind == "video":
+            video_candidates.append(part)
+    if not any(item["kind"] == "photo" for item in media):
+        for part in video_candidates[:2]:
+            entries = await backfill.save_media(
+                part, job["source_id"], stable_prefix=f"checkin_v2_{job['job_id']}_{part.id}",
+                force_kind="video",
+            )
+            media.extend({**item, "message_id": int(part.id)} for item in entries if item.get("kind") == "video")
+    description = (primary.raw_text or "").strip()
+    if not description and not media:
+        return "not_found", "命中消息没有可用文字或媒体"
+    source_url = f"https://t.me/{channel_name}/{primary.id}"
+    nickname_match = re.search(
+        r"(?:老师昵称|昵称|姓名)[】\]]*\s*[:：]\s*#?([^,，\n#]+)", description,
+    )
+    evidence = {
+        "collection_method": "daily_checkin_source_username_search",
+        "review_bucket": "checkin_supplement",
+        "nickname": nickname_match.group(1).strip() if nickname_match else job["contact_username"],
+        "profile_url": f"https://t.me/{job['contact_username']}",
+        "source_messages": [{
+            "url": source_url, "message_id": int(primary.id),
+            "posted_at": primary.date.isoformat() if primary.date else None,
+            "matched_by": "exact_contact_username_in_message",
+        }],
+        "matched_message_count": len(matches),
+        "avatar_used": False,
+    }
+    await _persist_profile_result(
+        pool, job, None, evidence["profile_url"], f"https://t.me/{channel_name}",
+        "", description, media, evidence, cfg,
+    )
+    return "fetched", None
+
+
 async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
-    """Collect a V2 result into its isolated trial table; never writes a listing."""
+    """Collect a bounded Telegram profile result and stage it for admin review."""
+    cfg = job["config_json"]
+    if isinstance(cfg, str):
+        cfg = json.loads(cfg)
+    cfg = cfg if isinstance(cfg, dict) else {}
+    if job["rule_type"] == "checkin_reverse":
+        return await _collect_checkin_source(pool, client, job, cfg)
     from telethon.tl.functions.users import GetFullUserRequest
 
     await _profile_progress(pool, job, "resolve_profile", 0, 1, "解析 Telegram 用户名")
@@ -473,10 +603,6 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
         pool, job, "resolve_channel", 1, 1,
         f"关联频道：{channel_url or '未找到，使用个人公开资料'}",
     )
-    cfg = job["config_json"]
-    if isinstance(cfg, str):
-        cfg = json.loads(cfg)
-    cfg = cfg if isinstance(cfg, dict) else {}
     recent_window = max(1, min(10, int(cfg.get("recent_window", 10))))
     scan_limit = max(recent_window, min(100, int(cfg.get("max_scan_messages", 100))))
     photo_limit = max(1, min(MAX_PROFILE_V2_PHOTOS, int(cfg.get("max_photos", 6))))
@@ -620,6 +746,7 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
     text_parts = [f"个人简介：\n{about}"] if about else []
     media, video_candidates, sources = [], [], []
     channel_username = getattr(channel, "username", None) if channel is not None else None
+    await _profile_progress(pool, job, "collect_media", 0, len(unique), f"筛选 {len(unique)} 条匹配消息的媒体")
     for message_index, msg in enumerate(unique, start=1):
         parts = await _fetch_album(client, channel, msg) if channel is not None else [msg]
         anchor = next((part for part in parts if (part.raw_text or "").strip()), msg)
@@ -652,7 +779,7 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
         if message_index % 5 == 0 or message_index == len(unique):
             await _profile_progress(
                 pool, job, "collect_media", message_index, len(unique),
-                f"整理关联消息与媒体 {message_index}/{len(unique)} 条",
+                f"媒体处理 {message_index}/{len(unique)} 条消息",
             )
 
     if not any(item["kind"] == "photo" for item in media):
@@ -682,16 +809,14 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
         "intro_min_chars": min_chars,
         "intro_min_lines": min_lines,
         "any_sender_in_linked_channel": True,
+        "nickname": " ".join(x for x in (getattr(user, "first_name", None), getattr(user, "last_name", None)) if x)
+                    or job["contact_username"],
+        "review_bucket": "tg_profile_v2",
     }
-    await _profile_progress(pool, job, "save_result", 0, 1, "写入 V2 资料结果并排入 OCR")
-    rows = await pool.fetch(
-        SQL_PROFILE_RESULT, job["job_id"], int(user.id), job["contact_username"],
-        evidence["profile_url"], channel_url or "", bot_url or "", description,
-        json.dumps(backfill.order_media(media), ensure_ascii=False),
-        json.dumps(evidence, ensure_ascii=False), json.dumps(cfg, ensure_ascii=False),
+    await _persist_profile_result(
+        pool, job, int(user.id), evidence["profile_url"], channel_url or "",
+        bot_url or "", description, media, evidence, cfg,
     )
-    result_id = rows[0]["id"]
-    await pool.execute(SQL_PROFILE_OCR_ENQUEUE, result_id, json.dumps(media, ensure_ascii=False))
     return "fetched", None
 
 

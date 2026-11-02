@@ -1,10 +1,11 @@
 <script setup>
 import { onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { Star, ArrowLeft, MessageCircle, TriangleAlert, ExternalLink, Pencil, Save, X, ChevronUp, ChevronDown, RotateCcw } from "lucide-vue-next";
-import { api, mediaUrl } from "../api/client";
+import { Star, ArrowLeft, MessageCircle, TriangleAlert, ExternalLink, Pencil, Save, X, RotateCcw } from "lucide-vue-next";
+import { api } from "../api/client";
 import { useSession } from "../stores/session";
 import MediaGallery from "../components/MediaGallery.vue";
+import AdminMediaGrid from "../components/AdminMediaGrid.vue";
 import BackToTop from "../components/BackToTop.vue";
 
 const route = useRoute();
@@ -40,28 +41,20 @@ function cancelEdit() {
   editError.value = "";
 }
 
-function moveMedia(index, delta) {
-  const target = index + delta;
-  if (target < 0 || target >= editForm.value.media.length) return;
-  const media = editForm.value.media;
-  [media[index], media[target]] = [media[target], media[index]];
-  manualOrder.value = true;
-}
-
-function setVisibility(index, value) {
-  const media = editForm.value.media[index];
-  media.visibility = value;
-  media.visibility_override = true;
-}
-
 function restoreAutomaticMedia() {
   for (const media of editForm.value.media) {
+    if (media.image_data) {
+      media.visibility = "admin";
+      media.visibility_override = true;
+      continue;
+    }
     delete media.manual_order;
     delete media.visibility_override;
     if (media.kind === "photo") {
       media.visibility = media.ocr_classification === "profile_photo"
         ? "public"
-        : media.ocr_classification === "info_card" ? "admin" : "pending";
+        : media.ocr_classification === "info_card" ? "admin"
+          : media.ocr_classification ? "pending" : (media.visibility || "admin");
     }
   }
   editForm.value.media.sort((a, b) => {
@@ -94,6 +87,8 @@ async function saveEdit() {
           path: media.path,
           visibility: media.visibility,
           visibility_override: media.visibility_override === true,
+          image_data: media.image_data,
+          image_mime: media.image_mime,
         })),
       }),
     });
@@ -152,7 +147,8 @@ const fieldRowsBottom = (it) => [
 <template>
   <div v-if="error" class="py-24 text-center text-slate-500">{{ error }}</div>
   <div v-else-if="item" class="grid gap-6 pb-[calc(150px+env(safe-area-inset-bottom,0px))] lg:grid-cols-2 lg:pb-0">
-    <MediaGallery :media="editing && editForm ? editForm.media : item.media" fixed-mobile-frame />
+    <AdminMediaGrid v-if="editing && editForm" v-model:media="editForm.media" editable @order-change="manualOrder = true" />
+    <MediaGallery v-else :media="item.media" fixed-mobile-frame />
     <div class="space-y-4">
       <div class="flex flex-wrap items-center gap-2">
         <h2 class="flex items-center gap-2 text-2xl font-bold">
@@ -250,34 +246,12 @@ const fieldRowsBottom = (it) => [
           <textarea v-model="editForm.description" rows="6" class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
         </label>
         <div class="flex items-center justify-between gap-2">
-          <h3 class="text-sm font-semibold">媒体顺序与公开范围</h3>
+          <h3 class="text-sm font-semibold">图片与顺序</h3>
           <button @click="restoreAutomaticMedia" class="flex items-center gap-1 text-xs text-sky-400 hover:text-sky-300">
             <RotateCcw class="size-3.5" />恢复自动识别与排序
           </button>
         </div>
-        <div v-for="(media, index) in editForm.media" :key="media.path"
-          class="flex items-center gap-2 rounded-lg border border-slate-800 bg-slate-950 p-2">
-          <img v-if="media.kind === 'photo' || media.poster"
-            :src="mediaUrl(media.kind === 'photo' ? media.path : media.poster)"
-            class="size-14 shrink-0 rounded-md object-cover" />
-          <div v-else class="flex size-14 shrink-0 items-center justify-center rounded-md bg-slate-800 text-xs">视频</div>
-          <div class="min-w-0 flex-1">
-            <p class="truncate text-xs text-slate-300">{{ media.ocr_classification || media.kind }} · {{ media.path.split('/').pop() }}</p>
-            <label v-if="media.kind === 'photo'" class="mt-1 flex items-center gap-2 text-xs text-slate-500">
-              <span>可见范围</span>
-              <select :value="media.visibility || 'pending'" @change="setVisibility(index, $event.target.value)"
-                class="rounded border border-slate-700 bg-slate-900 px-1.5 py-1 text-slate-300">
-                <option value="public">公开</option><option value="admin">仅管理员</option>
-              </select>
-            </label>
-          </div>
-          <div class="flex shrink-0 flex-col">
-            <button @click="moveMedia(index, -1)" :disabled="index === 0" aria-label="上移"
-              class="rounded p-1 text-slate-400 disabled:opacity-30"><ChevronUp class="size-4" /></button>
-            <button @click="moveMedia(index, 1)" :disabled="index === editForm.media.length - 1" aria-label="下移"
-              class="rounded p-1 text-slate-400 disabled:opacity-30"><ChevronDown class="size-4" /></button>
-          </div>
-        </div>
+        <p class="text-xs text-slate-500">移除只会从这张卡片中取消展示，原始媒体文件保留。新增图片默认仅管理员可见。</p>
         <p v-if="editError" class="text-sm text-rose-400">{{ editError }}</p>
       </div>
     </div>
