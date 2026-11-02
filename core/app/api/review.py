@@ -127,6 +127,7 @@ async def duplicate_candidates() -> dict:
     rows = await pool.fetch(SQL_DUPLICATE_CANDIDATES)
 
     def card(row, prefix: str) -> dict:
+        media = _decode(row[f"{prefix}_media"], [])
         return {
             "id": row[f"{prefix}_id"],
             "status": row[f"{prefix}_status"],
@@ -138,7 +139,8 @@ async def duplicate_candidates() -> dict:
                 if row[f"{prefix}_price"] is not None else None,
             "price_currency": row[f"{prefix}_currency"],
             "description": row[f"{prefix}_description"],
-            "media": _decode(row[f"{prefix}_media"], []),
+            "media": media,
+            "media_count": len(media),
             "source_text": row[f"{prefix}_source_text"],
             "source_title": row[f"{prefix}_source_title"],
             "collected_at": row[f"{prefix}_collected_at"].isoformat(),
@@ -146,13 +148,23 @@ async def duplicate_candidates() -> dict:
                 if row[f"{prefix}_posted_at"] else None,
         }
 
-    return {"items": [{"left": card(row, "left"), "right": card(row, "right"),
-                        "match_reason": row["match_reason"]}
-                       for row in rows]}
+    items = []
+    for row in rows:
+        left, right = card(row, "left"), card(row, "right")
+        suggested = max(
+            (left, right),
+            key=lambda item: (item["media_count"], item["collected_at"], item["id"]),
+        )
+        items.append({
+            "left": left, "right": right, "match_reason": row["match_reason"],
+            "suggested_id": suggested["id"],
+        })
+    return {"items": items}
 
 
 class DuplicateDecision(BaseModel):
-    decision: Literal["keep_latest", "keep_both"]
+    decision: Literal["keep_selected", "keep_both"]
+    preferred_id: int | None = None
 
 
 @router.post("/duplicates/{first_id}/{second_id}")
@@ -160,9 +172,11 @@ async def decide_duplicate(
     first_id: int, second_id: int, body: DuplicateDecision,
     authorization: str = Header(default=""),
 ) -> dict:
-    """Record an admin decision; retaining the latest archives the older card."""
+    """Record an admin decision; retaining one card archives the other."""
     if first_id == second_id:
         raise HTTPException(status_code=400, detail="two different cards are required")
+    if body.decision == "keep_selected" and body.preferred_id not in {first_id, second_id}:
+        raise HTTPException(status_code=400, detail="preferred_id must match one of the cards")
     left_id, right_id = sorted((first_id, second_id))
     pool = db.get_pool()
     if pool is None:
@@ -189,14 +203,14 @@ async def decide_duplicate(
                 return re.sub(r"\s+", "", value.casefold())
 
             first, second = rows
+            same_username = bool(first["contact_username"] and second["contact_username"])
+            same_username = same_username and (
+                first["contact_username"].casefold() == second["contact_username"].casefold()
+            )
             same_identity = (
                 first["contact_peer_id"] is not None
                 and first["contact_peer_id"] == second["contact_peer_id"]
-            ) or (
-                (first["contact_peer_id"] is None or second["contact_peer_id"] is None)
-                and (first["contact_username"] or "").casefold()
-                    == (second["contact_username"] or "").casefold()
-            )
+            ) or same_username
             same_profile = (
                 first["nickname"] is not None
                 and second["nickname"] is not None
@@ -226,10 +240,9 @@ async def decide_duplicate(
             if not (same_identity or same_nickname or same_profile):
                 raise HTTPException(status_code=409, detail="cards are not a current duplicate candidate")
 
-            latest = max(rows, key=lambda row: (row["created_at"], row["id"]))
             archived_id = None
-            if body.decision == "keep_latest":
-                archived_id = next(row["id"] for row in rows if row["id"] != latest["id"])
+            if body.decision == "keep_selected":
+                archived_id = next(row["id"] for row in rows if row["id"] != body.preferred_id)
                 await conn.execute(
                     "UPDATE listings SET status='archived', updated_at=NOW() "
                     "WHERE id=$1 AND status IN ('published', 'pending', 'duplicate_pending')",
@@ -237,13 +250,13 @@ async def decide_duplicate(
                 )
                 await conn.execute(
                     "UPDATE listings SET status='pending', updated_at=NOW() "
-                    "WHERE id=$1 AND status='duplicate_pending'",
-                    latest["id"],
+                    "WHERE id=$1 AND status IN ('duplicate_pending', 'archived')",
+                    body.preferred_id,
                 )
             else:
                 await conn.execute(
                     "UPDATE listings SET status='pending', updated_at=NOW() "
-                    "WHERE id = ANY($1::bigint[]) AND status='duplicate_pending'",
+                    "WHERE id = ANY($1::bigint[]) AND status IN ('duplicate_pending', 'archived')",
                     [left_id, right_id],
                 )
             await conn.execute(
@@ -256,7 +269,7 @@ async def decide_duplicate(
                 left_id, right_id, body.decision, current_user_id(authorization),
             )
     return {"ok": True, "decision": body.decision,
-            "preferred_id": latest["id"], "archived_id": archived_id}
+            "preferred_id": body.preferred_id, "archived_id": archived_id}
 
 
 @router.get("/history/sources")

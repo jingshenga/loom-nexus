@@ -75,4 +75,8 @@ WHERE d.left_listing_id IS NULL
                    AND lower(coalesce(a.contact_username, ''))
                        <> lower(coalesce(b.contact_username, '')))))
   )
-ORDER BY GREATEST(a.created_at, b.created_at) DESC, a.id, b.id;
+ORDER BY GREATEST(
+             COALESCE(jsonb_array_length(a.media_json), 0),
+             COALESCE(jsonb_array_length(b.media_json), 0)
+         ) DESC,
+         GREATEST(a.created_at, b.created_at) DESC, a.id, b.id;

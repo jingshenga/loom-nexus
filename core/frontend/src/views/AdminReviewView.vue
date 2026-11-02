@@ -155,12 +155,15 @@ async function loadDuplicatePairs() {
   selectedDuplicate.value = selected || data.items[0] || null;
 }
 
-function newestCard(pair) {
-  return [pair.left, pair.right].sort((a, b) =>
-    new Date(b.collected_at) - new Date(a.collected_at) || b.id - a.id)[0];
+function suggestedCard(pair) {
+  return [pair.left, pair.right].find((card) => card.id === pair.suggested_id)
+    || [pair.left, pair.right].sort((a, b) =>
+      b.media_count - a.media_count
+      || new Date(b.collected_at) - new Date(a.collected_at)
+      || b.id - a.id)[0];
 }
 
-async function decideDuplicate(decision) {
+async function decideDuplicate(decision, preferredId = null) {
   const pair = selectedDuplicate.value;
   if (!pair || duplicateSaving.value) return;
   const ids = [pair.left.id, pair.right.id].sort((a, b) => a - b);
@@ -169,15 +172,35 @@ async function decideDuplicate(decision) {
     await api(`/api/admin/review/duplicates/${ids[0]}/${ids[1]}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ decision }),
+      body: JSON.stringify({ decision, preferred_id: preferredId }),
     });
-    notify(decision === "keep_latest"
-      ? `已保留最新采集卡片 #${newestCard(pair).id}，较早卡片已归档`
+    notify(decision === "keep_selected"
+      ? `已保留卡片 #${preferredId}，另一张已归档`
       : "已记录为不同账号，保留两张卡片");
     await loadDuplicatePairs();
     await loadQueue();
   } catch (e) {
     notify(`处理失败：${e.message}`);
+  } finally {
+    duplicateSaving.value = false;
+  }
+}
+
+async function deleteDuplicateCard(card) {
+  if (!card || duplicateSaving.value) return;
+  if (!window.confirm(`永久删除「${card.nickname || `#${card.id}`}」？Telegram 原始消息会保留。`)) return;
+  duplicateSaving.value = true;
+  try {
+    const result = await api("/api/admin/review/batch-delete", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: [card.id] }),
+    });
+    notify(`已删除 ${result.deleted} 张卡片，原始消息保留`);
+    selectedDuplicate.value = null;
+    await loadDuplicatePairs();
+    await loadQueue(true);
+  } catch (e) {
+    notify(`删除失败：${e.message}`);
   } finally {
     duplicateSaving.value = false;
   }
@@ -410,8 +433,12 @@ const filteredDuplicatePairs = computed(() => duplicatePairs.value
     return true;
   })
   .sort((a, b) => {
-    const aDate = new Date(newestCard(a).collected_at).getTime();
-    const bDate = new Date(newestCard(b).collected_at).getTime();
+    const aSuggested = suggestedCard(a);
+    const bSuggested = suggestedCard(b);
+    const mediaDifference = bSuggested.media_count - aSuggested.media_count;
+    if (mediaDifference) return mediaDifference;
+    const aDate = new Date(aSuggested.collected_at).getTime();
+    const bDate = new Date(bSuggested.collected_at).getTime();
     return sortOrder.value === "oldest" ? aDate - bDate : bDate - aDate;
   }));
 
@@ -662,24 +689,27 @@ onUnmounted(() => {
           <div class="flex items-center justify-between gap-2"><span class="font-medium">{{ pair.left.nickname || pair.right.nickname || '疑似重复资料' }}</span><span class="rounded bg-amber-500/15 px-2 py-0.5 text-[11px] text-amber-300">待人工核对</span></div>
           <div class="mt-1 text-[11px] text-amber-200">{{ pair.match_reason }}</div>
           <div class="mt-1 truncate text-xs text-slate-400">@{{ pair.left.contact_username || '未记录' }} / @{{ pair.right.contact_username || '未记录' }}</div>
-          <div class="mt-1 text-xs text-sky-300">最新采集 {{ new Date(newestCard(pair).collected_at).toLocaleString('zh-CN') }}</div>
+          <div class="mt-1 text-xs text-sky-300">建议优先保留 #{{ suggestedCard(pair).id }} · 媒体 {{ suggestedCard(pair).media_count }} 项 · {{ new Date(suggestedCard(pair).collected_at).toLocaleString('zh-CN') }}</div>
         </button>
         <div v-if="!filteredDuplicatePairs.length" class="py-16 text-center text-sm text-slate-500">暂无符合筛选条件的疑似重复卡片</div>
       </aside>
       <section v-if="selectedDuplicate" class="space-y-4 overflow-y-auto rounded-xl border border-slate-800 bg-slate-900/50 p-4 lg:col-span-8">
-        <div class="rounded-lg border border-amber-700/40 bg-amber-950/20 p-3 text-sm text-amber-200">候选可能由 TG 号、规范化昵称或资料内容匹配产生。请核对来源、账号、时间和媒体；系统只提供线索，不会自动合并。</div>
+        <div class="rounded-lg border border-amber-700/40 bg-amber-950/20 p-3 text-sm text-amber-200">{{ selectedDuplicate.match_reason }}。系统优先建议媒体数量较多的一张，数量相同时参考采集时间。请核对候选；系统不会自动合并或删除。</div>
         <div class="grid gap-4 md:grid-cols-2">
           <article v-for="card in [selectedDuplicate.left, selectedDuplicate.right]" :key="card.id" class="min-w-0 space-y-3 rounded-lg border border-slate-800 bg-slate-950/50 p-3">
-            <div class="flex flex-wrap items-start justify-between gap-2"><div><h3 class="font-semibold">{{ card.nickname }} · #{{ card.id }}</h3><p class="mt-1 text-xs text-slate-400">{{ card.source_title || '来源未知' }} · {{ card.status === 'published' ? '已发布' : '待审核' }}</p></div><span v-if="card.id === newestCard(selectedDuplicate).id" class="rounded bg-sky-500/15 px-2 py-1 text-xs text-sky-300">最新采集 · 优先建议</span></div>
-            <div class="space-y-1 text-xs"><p class="text-sky-300">采集于 {{ new Date(card.collected_at).toLocaleString('zh-CN') }}</p><p class="text-slate-500">原消息 {{ card.posted_at ? new Date(card.posted_at).toLocaleString('zh-CN') : '时间未知' }}</p><p class="text-slate-300">TG：@{{ card.contact_username || '未记录' }}<span v-if="card.contact_peer_id"> · ID {{ card.contact_peer_id }}</span></p><p class="text-slate-400">{{ card.district || '位置未知' }} · {{ card.price_amount ?? '价格未知' }} {{ card.price_currency || '' }}</p></div>
+            <div class="flex flex-wrap items-start justify-between gap-2"><div><h3 class="font-semibold">{{ card.nickname }} · #{{ card.id }}</h3><p class="mt-1 text-xs text-slate-400">{{ card.source_title || '来源未知' }} · {{ card.status === 'published' ? '已发布' : card.status === 'duplicate_pending' ? '重复待核对' : card.status === 'archived' ? '已归档' : '待审核' }}</p></div><span v-if="card.id === selectedDuplicate.suggested_id" class="rounded bg-sky-500/15 px-2 py-1 text-xs text-sky-300">媒体较多 · 优先建议</span></div>
+            <div class="space-y-1 text-xs"><p class="text-sky-300">媒体 {{ card.media_count }} 项 · 采集于 {{ new Date(card.collected_at).toLocaleString('zh-CN') }}</p><p class="text-slate-500">原消息 {{ card.posted_at ? new Date(card.posted_at).toLocaleString('zh-CN') : '时间未知' }}</p><p class="text-slate-300">TG：@{{ card.contact_username || '未记录' }}<span v-if="card.contact_peer_id"> · ID {{ card.contact_peer_id }}</span></p><p class="text-slate-400">{{ card.district || '位置未知' }} · {{ card.price_amount ?? '价格未知' }} {{ card.price_currency || '' }}</p></div>
             <AdminMediaGrid v-model:media="card.media" editable @order-change="markDuplicateOrder(card)" />
             <button @click="saveDuplicateMedia(card)" :disabled="duplicateMediaSaving" class="rounded-lg border border-emerald-800 px-3 py-1.5 text-xs text-emerald-300 disabled:opacity-50">保存图片修改</button>
             <RouterLink :to="`/explore/${card.id}`" class="inline-block text-xs text-sky-300 hover:text-sky-200">编辑此卡片和图片 ↗</RouterLink>
             <details class="rounded border border-slate-800 p-2"><summary class="cursor-pointer text-xs text-slate-400">查看原始消息</summary><p class="mt-2 whitespace-pre-wrap text-xs leading-relaxed text-slate-500">{{ card.source_text || card.description || '（无正文）' }}</p></details>
+            <div class="flex flex-wrap gap-2 border-t border-slate-800 pt-3">
+              <button @click="decideDuplicate('keep_selected', card.id)" :disabled="duplicateSaving" class="rounded bg-sky-600 px-3 py-2 text-xs font-medium text-white disabled:opacity-50">保留此卡，归档另一张</button>
+              <button @click="deleteDuplicateCard(card)" :disabled="duplicateSaving" class="rounded border border-rose-800 px-3 py-2 text-xs text-rose-300 disabled:opacity-50">删除此卡</button>
+            </div>
           </article>
         </div>
         <div class="sticky bottom-0 flex flex-col gap-2 border-t border-slate-800 bg-slate-950/95 py-3 backdrop-blur sm:flex-row">
-          <button @click="decideDuplicate('keep_latest')" :disabled="duplicateSaving" class="flex-1 rounded-lg bg-sky-600 px-3 py-2.5 text-sm font-medium hover:bg-sky-500 disabled:opacity-50">确认重复，保留最新并归档较早卡片</button>
           <button @click="decideDuplicate('keep_both')" :disabled="duplicateSaving" class="flex-1 rounded-lg border border-slate-600 px-3 py-2.5 text-sm text-slate-200 hover:bg-slate-800 disabled:opacity-50">不同账号，保留两张</button>
         </div>
       </section>
