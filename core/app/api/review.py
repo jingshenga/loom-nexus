@@ -300,12 +300,23 @@ class DutyRecoveryUpdate(BaseModel):
     bot_url: str | None = None
 
 
+def _normalize_bot_url(value: str | None) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    match = re.fullmatch(r"(?:(?:https?://)?(?:www\.)?t\.me/)?@?([A-Za-z][A-Za-z0-9_]{4,31})", value, re.I)
+    if not match:
+        raise HTTPException(status_code=400, detail="Bot 地址请填写 Telegram 用户名")
+    return "https://t.me/" + match.group(1)
+
+
 @router.patch("/duty-recovery/{job_id}")
 async def update_duty_recovery(job_id: int, body: DutyRecoveryUpdate) -> dict:
     pool = db.get_pool()
     if pool is None:
         raise HTTPException(status_code=503, detail="database unavailable")
-    links = [value.strip() if value else None for value in (body.profile_url, body.channel_url, body.bot_url)]
+    bot_url = _normalize_bot_url(body.bot_url) or None
+    links = [value.strip() if value else None for value in (body.profile_url, body.channel_url, bot_url)]
     for value in links:
         if value and not re.fullmatch(r"https?://t\.me/[A-Za-z0-9_]+(?:/\d+)?(?:\?[^\s]*)?", value, re.I):
             raise HTTPException(status_code=400, detail="links must be Telegram t.me URLs")
@@ -405,7 +416,7 @@ async def create_manual_duty_card(job_id: int, body: ManualDutyListing) -> dict:
         media = [{"kind": "photo", "path": f"manual/{filename}"}]
 
     source_url = body.source_url.strip()
-    bot_url = body.bot_url.strip() or recovery["bot_url"] or ""
+    bot_url = _normalize_bot_url(body.bot_url) or recovery["bot_url"] or ""
     for label, value in (("source_url", source_url), ("bot_url", bot_url)):
         if value and not re.fullmatch(r"https?://t\.me/[A-Za-z0-9_]+(?:/\d+)?(?:\?[^\s]*)?", value, re.I):
             raise HTTPException(status_code=400, detail=f"{label} must be a Telegram link")

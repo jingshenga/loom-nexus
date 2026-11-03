@@ -1,6 +1,6 @@
 <script setup>
 import AdminTabs from "../components/AdminTabs.vue";
-import { onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { CheckCircle2, XCircle, Save, Inbox, ArchiveRestore, Trash2 } from "lucide-vue-next";
 import { api } from "../api/client";
 import MediaGallery from "../components/MediaGallery.vue";
@@ -27,6 +27,22 @@ let recollectTimer = null;
 let recollectJobIds = [];
 let pollingRecollect = false;
 const RECOLLECT_STORAGE_KEY = "nexus-admin-recollect-jobs";
+const recoveryBotUsername = computed({
+  get: () => botUsername(recoveryForm.value.bot_url),
+  set: (value) => { recoveryForm.value.bot_url = botLink(value); },
+});
+
+function botUsername(value) {
+  return String(value || "").trim()
+    .replace(/^(?:https?:\/\/)?(?:www\.)?t\.me\//i, "")
+    .replace(/^@/, "")
+    .split(/[/?#]/, 1)[0];
+}
+
+function botLink(value) {
+  const username = botUsername(value);
+  return username ? "https://t.me/" + username : "";
+}
 
 function isSelected(id) {
   return selectedIds.value.includes(id);
@@ -359,7 +375,7 @@ onUnmounted(() => {
           <label class="text-xs text-slate-400">Telegram 数字 ID<input v-model="recoveryForm.contact_peer_id" inputmode="numeric" class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm" /></label>
           <label class="text-xs text-slate-400">公开简介链接<input v-model="recoveryForm.profile_url" class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm" /></label>
           <label class="text-xs text-slate-400">频道链接<input v-model="recoveryForm.channel_url" class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm" /></label>
-          <label class="text-xs text-slate-400">Bot 联系地址（单独保存）<input v-model="recoveryForm.bot_url" class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-2 text-sm" /></label>
+          <label class="text-xs text-slate-400">Bot 用户名（单独保存）<span class="mt-1 flex rounded border border-slate-700 bg-slate-950 text-sm"><span class="flex items-center border-r border-slate-700 px-2 text-slate-500">https://t.me/</span><input v-model="recoveryBotUsername" placeholder="例如 xxxxxxbot" spellcheck="false" class="min-w-0 flex-1 bg-transparent px-2 py-2 text-slate-100 outline-none" /></span></label>
         </div>
         <button @click="saveRecoveryLinks" class="rounded-lg border border-slate-700 px-3 py-2 text-sm hover:bg-slate-800">保存账号与链接</button>
         <details class="rounded-lg border border-slate-800 bg-slate-950/60 p-3">

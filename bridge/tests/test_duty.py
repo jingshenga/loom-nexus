@@ -15,7 +15,7 @@ from runner.duty import (
     profile_usernames,
 )
 from runner.duty_collection import (
-    _flood_wait_seconds, _is_flood_wait, _profile_media_kind,
+    _flood_wait_seconds, _is_flood_wait, _profile_links, _profile_media_kind,
 )
 
 
@@ -96,6 +96,13 @@ class DutyProcessTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DutyRuleTests(unittest.TestCase):
+    def test_bot_lookup_includes_bare_bot_suffix_candidates(self):
+        candidates = _profile_links("Bot地址 xiaomubot\n备用 @service_bot\nhttps://t.me/shopbot")
+        self.assertIn(("xiaomubot", None), candidates)
+        self.assertIn(("service_bot", None), candidates)
+        self.assertIn(("shopbot", None), candidates)
+        self.assertEqual(candidates[0][0], "shopbot")
+
     def test_business_day_rolls_at_four(self):
         zone = ZoneInfo("Asia/Shanghai")
         before = datetime(2026, 10, 28, 3, 59, tzinfo=zone)

@@ -141,6 +141,7 @@ def _flood_wait_seconds(exc: Exception) -> int:
 
 TG_PROFILE_LINK_RE = re.compile(r"https?://t\.me/([A-Za-z0-9_]+)(?:/(\d+))?", re.I)
 TG_MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])@([A-Za-z][A-Za-z0-9_]{3,31})\b", re.I)
+TG_BOT_USERNAME_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_]{1,28}bot)\b", re.I)
 PROMO_MARKER_RE = re.compile(
     r"博彩|彩票|贷款|返利|刷单|高回报|招商|加盟|优惠券|代购|推广|扫码|兼职日结"
 )
@@ -192,7 +193,9 @@ def _has_profile_content(message) -> bool:
 def _profile_links(text: str) -> list[tuple[str, str | None]]:
     links = [(m.group(1), m.group(2)) for m in TG_PROFILE_LINK_RE.finditer(text or "")]
     links.extend((name, None) for name in TG_MENTION_RE.findall(text or ""))
-    return list(dict.fromkeys(links))
+    links.extend((name, None) for name in TG_BOT_USERNAME_RE.findall(text or ""))
+    unique = list(dict.fromkeys(links))
+    return sorted(unique, key=lambda item: not item[0].lower().endswith("bot"))
 
 
 def _entity_url(entity, fallback: str | None = None) -> str | None:
@@ -252,28 +255,36 @@ async def _profile_channel(pool, client, job, full, user, about, saved_channel_u
                 pass
 
     links = _profile_links(about or "")
-    resolved_link = False
+    lookup_failures = 0
+    resolved_non_bots = 0
     for name, msg_id in links[:8]:
         link = f"https://t.me/{name}" + (f"/{msg_id}" if msg_id else "")
-        if name.lower().endswith("bot") and not bot_url:
-            bot_url = link
-        if channel is not None or resolved_link:
-            continue
         try:
             entity = await _rate_limited_entity(pool, client, job["account_id"], name)
-            resolved_link = True
         except Exception as exc:
             if _is_flood_wait(exc):
                 raise
+            lookup_failures += 1
             continue
         if getattr(entity, "bot", False):
-            bot_url = bot_url or link
+            bot_url = bot_url or _entity_url(entity, link)
         elif channel is None and isinstance(entity, (Channel, Chat)):
             channel = entity
             channel_url = _entity_url(entity, link)
+        else:
+            resolved_non_bots += 1
+        if bot_url and channel:
+            break
 
     if getattr(user, "bot", False):
         bot_url = bot_url or f"https://t.me/{user.username}"
+    if job.get("rule_type") == "bot_collection":
+        logger.info(
+            "bot profile lookup (job=%s candidates=%s lookup_failures=%s "
+            "resolved_non_bots=%s found=%s)",
+            job["job_id"], min(len(links), 8), lookup_failures,
+            resolved_non_bots, bool(bot_url),
+        )
     return channel, channel_url, bot_url, personal_id, full_user
 
 
@@ -378,7 +389,6 @@ async def _collect_profile_listing(pool, client, job) -> tuple[str, int | None, 
 
     pinned_text = next((text.split("：\n", 1)[1] for text in texts if text.startswith("频道置顶消息：\n")), None)
     if not bot_url:
-        resolved_link = False
         related_text = "\n".join([about, *(msg.raw_text or "" for msg in messages)])
         links = _profile_links(related_text)
         for msg in messages:
@@ -386,21 +396,17 @@ async def _collect_profile_listing(pool, client, job) -> tuple[str, int | None, 
                 match = TG_PROFILE_LINK_RE.search(url)
                 if match:
                     links.append((match.group(1), match.group(2)))
-        for name, msg_id in dict.fromkeys(links):
-            if name.lower().endswith("bot"):
-                bot_url = f"https://t.me/{name}" + (f"/{msg_id}" if msg_id else "")
-                break
-            if channel is not None or resolved_link:
-                continue
+        links = sorted(dict.fromkeys(links), key=lambda item: not item[0].lower().endswith("bot"))
+        for name, msg_id in links[:8]:
+            link = f"https://t.me/{name}" + (f"/{msg_id}" if msg_id else "")
             try:
                 linked = await _rate_limited_entity(pool, client, job["account_id"], name)
-                resolved_link = True
             except Exception as exc:
                 if _is_flood_wait(exc):
                     raise
                 continue
             if getattr(linked, "bot", False):
-                bot_url = f"https://t.me/{name}" + (f"/{msg_id}" if msg_id else "")
+                bot_url = _entity_url(linked, link)
                 break
     await _save_profile(
         pool, job, user, about, channel, channel_url, bot_url,
