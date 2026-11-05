@@ -210,6 +210,12 @@ function setWorkbench(value) {
   pageOffset.value = 0;
   if (value === "duplicates") loadDuplicatePairs();
   if (["review", "checkin", "tgprofile"].includes(value)) loadQueue();
+  if (value === "duty") loadDutyRecovery();
+}
+
+async function toggleFieldSettings() {
+  if (!showFieldSettings.value) await loadFieldDefinitions();
+  showFieldSettings.value = !showFieldSettings.value;
 }
 
 async function loadDuplicatePairs() {
@@ -523,12 +529,14 @@ const filteredDutyRecovery = computed(() => dutyRecovery.value
   }));
 
 onMounted(async () => {
-  await loadReviewSources();
-  await loadFieldDefinitions();
-  await loadQueue(true);
-  await loadDutyRecovery();
   window.addEventListener("keydown", onKey);
-  timer = setInterval(() => { loadQueue(); loadDutyRecovery(); }, 15000);
+  await Promise.allSettled([loadReviewSources(), loadQueue(true)]);
+  timer = setInterval(() => {
+    if (document.visibilityState !== "visible") return;
+    if (activeWorkbench.value === "duty") loadDutyRecovery();
+    else if (activeWorkbench.value === "duplicates") loadDuplicatePairs();
+    else if (["review", "checkin", "tgprofile"].includes(activeWorkbench.value)) loadQueue();
+  }, 15000);
   try {
     recollectJobIds = JSON.parse(sessionStorage.getItem(RECOLLECT_STORAGE_KEY) || "[]");
     if (recollectJobIds.length) {
@@ -556,7 +564,7 @@ onUnmounted(() => {
       <button @click="activeWorkbench = 'duplicates'; loadDuplicatePairs()" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'duplicates' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">疑似重复</button>
       <button @click="statusTab = 'pending'; setWorkbench('checkin')" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'checkin' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">签到补采审核</button>
       <button @click="statusTab = 'pending'; setWorkbench('tgprofile')" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'tgprofile' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">TG号采集V2</button>
-      <button @click="activeWorkbench = 'duty'" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'duty' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">旧签到恢复（{{ dutyRecovery.length }}）</button>
+      <button @click="setWorkbench('duty')" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'duty' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">旧签到恢复（{{ dutyRecovery.length }}）</button>
     </div>
 
     <div v-if="activeWorkbench !== 'review'" class="flex flex-wrap items-center gap-2 rounded-lg border border-slate-800 bg-slate-900/60 p-2">
@@ -718,7 +726,7 @@ onUnmounted(() => {
         重采 Bot 地址（{{ selectedIds.length }}）
       </button>
       <span v-if="recollectStatus" class="text-xs text-sky-300">{{ recollectStatus }}</span>
-      <button @click="showFieldSettings = !showFieldSettings" class="rounded-lg border border-slate-700 px-3 py-1 text-xs text-slate-300">自定义字段</button>
+      <button @click="toggleFieldSettings" class="rounded-lg border border-slate-700 px-3 py-1 text-xs text-slate-300">自定义字段</button>
       <span class="text-xs text-slate-500">Ctrl+Enter 快捷发布</span>
       <span v-if="flash" class="ml-auto rounded bg-emerald-600/20 px-3 py-1 text-xs text-emerald-300">{{ flash }}</span>
     </div>
