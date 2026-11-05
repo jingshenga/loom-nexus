@@ -74,9 +74,12 @@ async def _sync_listing_ocr_text(conn, listing_id, old_text, new_text, include):
     if listing_id is None:
         return
     listing = await conn.fetchrow(
-        "SELECT description FROM listings WHERE id=$1 FOR UPDATE", listing_id,
+        "SELECT description,manual_fields FROM listings WHERE id=$1 FOR UPDATE", listing_id,
     )
     if listing is None:
+        return
+    manual_fields = _decode(listing["manual_fields"], {})
+    if manual_fields.get("description"):
         return
     description = listing["description"] or ""
     old_marker = "图片识别内容：" + (old_text or "").strip()

@@ -36,16 +36,17 @@ async def lifespan(_: FastAPI):
         from app.extractor.pipeline import Extractor
 
         ocr_worker = OcrWorker()
+        media_ocr_processor = MediaOcrProcessor(db.get_pool(), settings.media_dir, ocr_worker)
         extractor = Extractor(
             db.get_pool(), settings.media_dir, settings.extract_ocr_enabled,
-            ocr_worker,
+            ocr_worker, media_ocr_processor,
         )
         background_tasks.append(asyncio.create_task(
             extractor.run(stop, settings.extract_batch, settings.extract_interval_s),
             name="extractor",
         ))
         background_tasks.append(asyncio.create_task(
-            MediaOcrProcessor(db.get_pool(), settings.media_dir, ocr_worker).run(stop),
+            media_ocr_processor.run(stop),
             name="media-card-ocr",
         ))
     yield

@@ -1,13 +1,16 @@
 """Admin controls for OCR media labels, classifier training, and release."""
 import json
 import re
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from app import db
 from app.api.auth import current_user_id, require_admin
-from app.extractor.image_classifier import predict, split_samples, train_and_validate
+from app.extractor.image_classifier import (
+    as_card_binary_samples, predict, split_samples, train_and_validate,
+)
 
 router = APIRouter(
     prefix="/api/admin/ocr-classifier", tags=["admin-ocr-classifier"],
@@ -28,6 +31,7 @@ class CategoryUpdate(BaseModel):
 
 
 class TrainBody(BaseModel):
+    classification_mode: Literal["multi_class", "card_binary"] = "multi_class"
     confidence_threshold: float = Field(default=0.65, ge=0, le=1)
     review_classes: list[str] = Field(default_factory=lambda: ["info_card", "uncertain"])
     min_samples_per_class: int = Field(default=5, ge=2, le=1000)
@@ -132,18 +136,34 @@ async def list_versions() -> dict:
 async def train(body: TrainBody, authorization: str = Header(default="")) -> dict:
     pool = _pool()
     categories = await pool.fetch(
-        "SELECT code FROM ocr_classification_categories WHERE is_active AND is_trainable ORDER BY code"
+        "SELECT code,review_required FROM ocr_classification_categories "
+        "WHERE is_active AND is_trainable ORDER BY code"
     )
+    source_classes = [row["code"] for row in categories]
     counts_rows = await pool.fetch(
         "SELECT category_code, count(*) AS n FROM ocr_classification_labels "
-        "WHERE superseded_at IS NULL GROUP BY category_code"
+        "WHERE superseded_at IS NULL AND category_code = ANY($1::text[]) GROUP BY category_code",
+        source_classes,
     )
-    counts = {row["category_code"]: row["n"] for row in counts_rows}
-    train_classes = [row["code"] for row in categories if counts.get(row["code"], 0) >= 2]
-    if len(train_classes) < 2:
+    source_counts = {row["category_code"]: row["n"] for row in counts_rows}
+    if body.classification_mode == "card_binary":
+        train_classes = ["info_card", "other"]
+        counts = {
+            "info_card": source_counts.get("info_card", 0),
+            "other": sum(source_counts.get(code, 0) for code in source_classes if code != "info_card"),
+        }
+    else:
+        counts = {code: source_counts.get(code, 0) for code in source_classes}
+        train_classes = [code for code in source_classes if counts[code] >= 2]
+    if len(train_classes) < 2 or any(counts.get(code, 0) < 2 for code in train_classes):
+        message = (
+            "资料卡和非资料卡各至少需要 2 张有效标注图片"
+            if body.classification_mode == "card_binary"
+            else "至少两个启用类别各需要 2 张有效标注图片"
+        )
         raise HTTPException(
             status_code=409,
-            detail={"message": "至少两个启用类别各有 2 张人工标注图片后才能训练", "counts": counts},
+            detail={"message": message, "counts": counts},
         )
     samples_rows = await pool.fetch(
         "SELECT DISTINCT ON (label.ocr_id) label.ocr_id AS id,label.category_code AS label, "
@@ -154,13 +174,15 @@ async def train(body: TrainBody, authorization: str = Header(default="")) -> dic
         "LEFT JOIN raw_messages rm ON rm.id=o.raw_id LEFT JOIN ingest_sources s ON s.id=rm.source_id "
         "WHERE label.superseded_at IS NULL AND label.category_code = ANY($1::text[]) "
         "ORDER BY label.ocr_id,label.created_at DESC,label.id DESC",
-        train_classes,
+        source_classes,
     )
     samples = [{
         "id": row["id"], "label": row["label"], "text": row["text"],
         "signals": _json(row["signals"], {}), "source_group": row["source_group"],
         "message_group": row["message_group"],
     } for row in samples_rows]
+    if body.classification_mode == "card_binary":
+        samples = as_card_binary_samples(samples)
     try:
         model, metrics = train_and_validate(samples, train_classes)
     except ValueError as exc:
@@ -175,13 +197,17 @@ async def train(body: TrainBody, authorization: str = Header(default="")) -> dic
             "actual": row["label"], "predicted": predicted, "confidence": round(confidence, 5),
         })
     metrics["validation_cases"] = validation_cases
-    metrics["excluded_categories"] = {
+    metrics["excluded_categories"] = {} if body.classification_mode == "card_binary" else {
         row["code"]: counts.get(row["code"], 0)
         for row in categories if row["code"] not in train_classes
     }
     policy = {
+        "classification_mode": body.classification_mode,
         "confidence_threshold": body.confidence_threshold,
-        "review_classes": body.review_classes,
+        "review_classes": (
+            ["info_card"] if body.classification_mode == "card_binary"
+            else [row["code"] for row in categories if row["review_required"]]
+        ),
         "min_samples_per_class": body.min_samples_per_class,
         "min_macro_f1": body.min_macro_f1,
     }
@@ -262,6 +288,15 @@ async def publish_version(version_id: int) -> dict:
                 version_id,
             )
     return _version(row)
+
+
+@router.post("/rollback-to-legacy")
+async def rollback_to_legacy() -> dict:
+    result = await _pool().execute(
+        "UPDATE ocr_classifier_versions SET status='retired',retired_at=NOW() "
+        "WHERE status='active'"
+    )
+    return {"ok": True, "retired": int(result.rsplit(" ", 1)[-1])}
 
 
 @router.post("/versions/{version_id}/shadow")

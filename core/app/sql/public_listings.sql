@@ -3,7 +3,7 @@ WITH clock AS (
             + TIME '04:00') AT TIME ZONE 'Asia/Shanghai' AS business_start,
            ((NOW() AT TIME ZONE 'Asia/Shanghai') - INTERVAL '4 hours')::date AS business_date
 ), filtered AS (
-    SELECT l.id, rm.source_id, l.nickname, l.district, l.price_amount, l.price_currency,
+    SELECT l.id, rm.source_id, l.nickname, l.district, l.price_amount, l.price_currency, l.bot_url,
            l.description, l.media_json, l.confidence, l.published_at, l.created_at,
            COALESCE(cp.is_online, FALSE) AS is_online,
            COALESCE(cp.status_tier, 'unknown') AS presence_tier,
@@ -47,7 +47,7 @@ WITH clock AS (
       ))
 )
 SELECT id, source_id, nickname, district, price_amount, price_currency,
-       description, media_json, confidence, published_at, is_online,
+       description, media_json, confidence, published_at, is_online, bot_url,
        presence_tier, duty_label, favorited
 FROM filtered
 ORDER BY (on_duty_today AND newly_collected) DESC,

@@ -1,7 +1,7 @@
 <script setup>
 import { onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { Star, ArrowLeft, MessageCircle, TriangleAlert, ExternalLink, Pencil, Save, X, RotateCcw } from "lucide-vue-next";
+import { Star, ArrowLeft, MessageCircle, TriangleAlert, ExternalLink, Pencil, Save, X, RotateCcw, ArchiveRestore } from "lucide-vue-next";
 import { api } from "../api/client";
 import { useSession } from "../stores/session";
 import MediaGallery from "../components/MediaGallery.vue";
@@ -14,9 +14,11 @@ const session = useSession();
 const item = ref(null);
 const favorited = ref(false);
 const error = ref("");
+const withdrawError = ref("");
 const conflict = ref(false);
 const editing = ref(false);
 const savingEdit = ref(false);
+const withdrawing = ref(false);
 const editError = ref("");
 const editForm = ref(null);
 const manualOrder = ref(false);
@@ -106,6 +108,20 @@ async function toggleFavorite() {
   favorited.value = data.favorited;
 }
 
+async function withdrawListing() {
+  if (!item.value || withdrawing.value) return;
+  if (!window.confirm(`将「${item.value.nickname || "该卡片"}」从广场下架？`)) return;
+  withdrawing.value = true;
+  try {
+    await api(`/api/admin/review/${item.value.id}/withdraw`, { method: "POST" });
+    await router.push("/explore");
+  } catch (err) {
+    withdrawError.value = err.message || "下架失败，请重试";
+  } finally {
+    withdrawing.value = false;
+  }
+}
+
 async function startChat() {
   conflict.value = false;
   try {
@@ -170,6 +186,10 @@ const fieldRowsBottom = (it) => [
           class="flex items-center gap-1 rounded-lg border border-slate-700 px-3 py-1.5 text-sm text-slate-400">
           <X class="size-4" />取消
         </button>
+        <button v-if="session.isAdmin && !editing" @click="withdrawListing" :disabled="withdrawing"
+          class="flex items-center gap-1 rounded-lg border border-amber-700 px-3 py-1.5 text-sm text-amber-300 disabled:opacity-50">
+          <ArchiveRestore class="size-4" />{{ withdrawing ? "下架中" : "下架" }}
+        </button>
         <button @click="toggleFavorite"
           class="flex items-center gap-1 rounded-lg border border-slate-700 px-3 py-1.5 text-sm"
           :class="favorited ? 'border-amber-500 text-amber-400' : 'text-slate-400 hover:text-slate-200'">
@@ -179,6 +199,7 @@ const fieldRowsBottom = (it) => [
           <ArrowLeft class="size-4" />返回广场
         </RouterLink>
       </div>
+      <p v-if="withdrawError" class="rounded-lg border border-rose-700/50 bg-rose-900/20 px-3 py-2 text-sm text-rose-300">{{ withdrawError }}</p>
       <div v-if="conflict"
         class="flex items-center gap-3 rounded-xl border border-amber-600/40 bg-amber-600/15 px-4 py-3 text-sm text-amber-300">
         <TriangleAlert class="size-5 shrink-0" />
@@ -209,6 +230,8 @@ const fieldRowsBottom = (it) => [
               <template v-else>
                 <span class="text-slate-500">通过立即聊天联系</span>
               </template>
+              <a v-if="item.bot_url" :href="item.bot_url" target="_blank" rel="noreferrer"
+                class="rounded border border-violet-700/60 px-2 py-1 text-xs text-violet-300">联系 Bot</a>
               <button @click="startChat"
                 class="nx-grad hidden items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-semibold text-white hover:opacity-90 lg:flex">
                 <MessageCircle class="size-4" />立即聊天

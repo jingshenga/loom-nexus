@@ -86,6 +86,14 @@ def predict(model: dict, text: str | None, signals: dict | None = None) -> tuple
     return label, probabilities[label], probabilities
 
 
+def as_card_binary_samples(samples: list[dict]) -> list[dict]:
+    """Collapse every reviewed non-card category into the existing `other` label."""
+    return [
+        {**sample, "label": "info_card" if sample["label"] == "info_card" else "other"}
+        for sample in samples
+    ]
+
+
 def split_samples(samples: list[dict], classes: list[str]) -> tuple[list[dict], list[dict], dict[str, str]]:
     grouped: dict[str, list[dict]] = defaultdict(list)
     for sample in sorted(samples, key=lambda item: int(item["id"])):

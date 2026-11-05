@@ -27,8 +27,10 @@ const dutyForm = ref({});
 const profileForm = ref({});
 const profileResults = ref([]);
 const profileSummary = ref(null);
+const historyScan = ref(null);
 const profileUpdatedAt = ref(null);
-const profileUsername = ref("");
+const profileUsernames = ref("");
+const profileSourceId = ref(null);
 let profileRefreshTimer;
 const filteredRules = computed(() => rules.value.filter((r) => (r.rule_type || "listing") === activeTab.value));
 
@@ -57,9 +59,11 @@ const EMPTY_PROFILE_CONFIG = {
   channel_any_sender_matches: true,
   skip_video_when_photo_found: true,
   exclude_avatar: true,
-  stale_channel_days: 60,
   pinned_followup_messages: 5,
 };
+
+const EMPTY_CHECKIN_CONFIG = { collection_mode: "checkin_source_reverse", source_username: "" };
+const checkinForm = ref({ ...EMPTY_CHECKIN_CONFIG });
 
 const EMPTY_CONFIG = {
   gate: { require_any_keywords: [], blocked_sender_peer_ids: [] },
@@ -120,19 +124,33 @@ function select(rule) {
   dryrun.value = null;
   dutyForm.value = { ...EMPTY_DUTY_CONFIG, ...(rule.config || {}) };
   profileForm.value = { ...EMPTY_PROFILE_CONFIG, ...(rule.config || {}) };
+  checkinForm.value = { ...EMPTY_CHECKIN_CONFIG, ...(rule.config || {}) };
   // default the sample drawer to the first group this rule is bound to
   const first = (rule.bindings || [])[0];
   if (first) sampleSourceId.value = first.source_id;
-  if (activeTab.value === "profile_collection" && rule.id) loadProfileResults(rule.id);
-  else profileResults.value = [];
+  if (["profile_collection", "bot_collection", "checkin_reverse"].includes(activeTab.value) && rule.id) {
+    loadProfileResults(rule.id);
+    if (activeTab.value === "checkin_reverse") loadHistoryScan(rule.id);
+    else historyScan.value = null;
+  } else {
+    profileResults.value = [];
+    historyScan.value = null;
+  }
+  profileSourceId.value = rule.bindings?.[0]?.source_id || collectionSources.value[0]?.id || null;
 }
 
 async function loadProfileResults(ruleId = current.value?.id) {
   if (!ruleId) return;
-  const data = await api(`/api/admin/rules/${ruleId}/profile-collection`);
+  const data = await api(`/api/admin/rules/${ruleId}/profile-collection?limit=100`);
   profileResults.value = data.items || [];
   profileSummary.value = data.summary || null;
   profileUpdatedAt.value = new Date();
+}
+
+async function loadHistoryScan(ruleId = current.value?.id) {
+  if (!ruleId) return;
+  const data = await api(`/api/admin/rules/${ruleId}/history-scan`);
+  historyScan.value = data.scan || null;
 }
 
 function profileProgress() {
@@ -156,15 +174,16 @@ function profileCooldownDeadline(value) {
 }
 
 async function enqueueProfileUsername() {
-  if (!current.value?.id || !profileUsername.value.trim()) return notify("请输入 Telegram 用户名");
+  if (!current.value?.id || !profileUsernames.value.trim()) return notify("请输入 Telegram 用户名");
+  if (!profileSourceId.value) return notify("请选择采集账号来源");
   const data = await api(`/api/admin/rules/${current.value.id}/profile-collection/enqueue`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ telegram_username: profileUsername.value.trim() }),
+    body: JSON.stringify({ telegram_usernames: profileUsernames.value.split(/[\n\r,，;；\s]+/).filter(Boolean), source_id: profileSourceId.value }),
   });
-  profileUsername.value = "";
+  profileUsernames.value = "";
   await loadProfileResults();
-  notify(`@${data.username} 已加入采集队列（${data.status}）`);
+  notify(`已提交 ${data.queued} 个 TG 号，${data.skipped} 个未入队`);
 }
 
 async function requeueIneffectiveProfiles() {
@@ -179,12 +198,15 @@ async function requeueIneffectiveProfiles() {
 function newRule() {
   current.value = { rule_name: "", rule_type: activeTab.value, is_active: true };
   const config = activeTab.value === "on_duty" ? EMPTY_DUTY_CONFIG
-    : activeTab.value === "profile_collection" ? EMPTY_PROFILE_CONFIG : EMPTY_CONFIG;
+    : ["profile_collection", "bot_collection"].includes(activeTab.value) ? EMPTY_PROFILE_CONFIG
+      : activeTab.value === "checkin_reverse" ? EMPTY_CHECKIN_CONFIG : EMPTY_CONFIG;
   configText.value = JSON.stringify(config, null, 2);
   dutyForm.value = { ...EMPTY_DUTY_CONFIG };
   profileForm.value = { ...EMPTY_PROFILE_CONFIG };
+  checkinForm.value = { ...EMPTY_CHECKIN_CONFIG };
   profileResults.value = [];
   profileSummary.value = null;
+  historyScan.value = null;
   dryrun.value = null;
 }
 
@@ -210,7 +232,8 @@ function switchTab(tab) {
 async function save() {
   let config;
   if (activeTab.value === "on_duty") config = { ...dutyForm.value };
-  else if (activeTab.value === "profile_collection") config = { ...profileForm.value };
+  else if (["profile_collection", "bot_collection"].includes(activeTab.value)) config = { ...profileForm.value };
+  else if (activeTab.value === "checkin_reverse") config = { ...checkinForm.value };
   else {
     try {
       config = JSON.parse(configText.value);
@@ -305,7 +328,7 @@ async function bindToSource() {
     body: JSON.stringify({ source_id: bindSourceId.value, priority: 100 }),
   });
   notify(`已绑定来源#${bindSourceId.value}（优先级 100，覆盖默认规则）`);
-  if (activeTab.value === "profile_collection") {
+  if (["profile_collection", "bot_collection", "checkin_reverse"].includes(activeTab.value)) {
     const ruleId = current.value.id;
     await loadRules();
     const fresh = rules.value.find((rule) => rule.id === ruleId);
@@ -431,8 +454,9 @@ onMounted(async () => {
   sources.value = (await api("/api/admin/sources")).items;
   dialogs.value = (await api("/api/admin/sources/dialogs")).items;
   profileRefreshTimer = setInterval(() => {
-    if (activeTab.value === "profile_collection" && current.value?.id) {
+    if (["profile_collection", "bot_collection", "checkin_reverse"].includes(activeTab.value) && current.value?.id) {
       loadProfileResults(current.value.id);
+      if (activeTab.value === "checkin_reverse") loadHistoryScan(current.value.id);
     }
   }, 30000);
 });
@@ -513,7 +537,9 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
       <button v-for="tab in [
         { value: 'listing', label: '名片抓取' },
         { value: 'on_duty', label: '在岗规则 V1' },
-        { value: 'profile_collection', label: '资料深采 V2' },
+        { value: 'profile_collection', label: 'TG号采集V2' },
+        { value: 'bot_collection', label: 'Bot地址采集' },
+        { value: 'checkin_reverse', label: '签到来源反查 V2' },
       ]"
         :key="tab.value" @click="switchTab(tab.value)"
         class="rounded-lg px-4 py-2 text-sm"
@@ -686,11 +712,15 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
             <Trash2 class="size-4" />
           </button>
         </div>
+        <template v-if="['profile_collection', 'bot_collection'].includes(activeTab)">
         <label class="flex items-center gap-2 text-xs text-slate-400">
-          <input v-model="current.is_active" type="checkbox" class="size-4 accent-violet-500" />启用 V2 试采规则
+          <input v-model="current.is_active" type="checkbox" class="size-4 accent-violet-500" />启用 {{ activeTab === 'bot_collection' ? 'Bot地址采集' : 'TG号采集V2' }}
         </label>
-        <div class="rounded-xl border border-violet-800/50 bg-violet-950/20 p-4 text-xs leading-relaxed text-slate-300">
-          V2 与 V1 独立运行。频道关联后，频道内任意发送者的消息都可作为候选；采集结果先进入试采区，验证通过后再替换旧卡片。
+        <div v-if="activeTab === 'profile_collection'" class="rounded-xl border border-violet-800/50 bg-violet-950/20 p-4 text-xs leading-relaxed text-slate-300">
+          TG号采集V2 独立运行。输入一个或多个 TG 号提交后，按个人简介和关联公开频道采集；结果进入专属审核页，不覆盖已有卡片。
+        </div>
+        <div v-else class="rounded-xl border border-violet-800/50 bg-violet-950/20 p-4 text-xs leading-relaxed text-slate-300">
+          只读取 TG 个人名片中的 Bot 联系地址并回填相同 TG 号的卡片；不扫描关联频道。提交支持单个或多个 TG 号，任务遵守账号冷却。
         </div>
         <div class="grid gap-3 rounded-xl border border-slate-800 bg-slate-900/50 p-4 sm:grid-cols-2">
           <label class="text-xs text-slate-400">先检查最近消息数
@@ -730,6 +760,19 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
             排除 Telegram 头像
           </label>
         </div>
+        </template>
+        <template v-else>
+          <label class="flex items-center gap-2 text-xs text-slate-400">
+            <input v-model="current.is_active" type="checkbox" class="size-4 accent-sky-500" />启用签到来源反查规则
+          </label>
+          <div class="rounded-xl border border-sky-800/50 bg-sky-950/20 p-4 text-xs leading-relaxed text-slate-300">
+            每日签到命中 TG 号后，自动在绑定的签到来源中搜索精确账号。命中消息及相册媒体进入「签到补采审核」；识别到重复身份时进入「疑似重复」。
+          </div>
+          <label class="block text-xs text-slate-400">签到来源频道/群组用户名
+            <input v-model="checkinForm.source_username" placeholder="例如 nbtgzb 或 NBXMWBGJ"
+              class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
+          </label>
+        </template>
       </section>
 
       <section v-if="activeTab === 'listing'" class="lg:col-span-5 space-y-3 lg:overflow-y-auto">
@@ -812,10 +855,32 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
         </div>
       </section>
       <section v-else class="space-y-3 lg:col-span-5 lg:overflow-y-auto">
-        <div class="rounded-xl border border-violet-800/50 bg-violet-950/20 p-4">
-          <h3 class="text-sm font-semibold">V2 试采策略</h3>
+        <div v-if="activeTab === 'checkin_reverse'" class="rounded-xl border border-sky-800/50 bg-sky-950/20 p-4">
+          <h3 class="text-sm font-semibold">签到来源反查 V2</h3>
+          <p class="mt-2 text-xs leading-relaxed text-slate-400">从绑定的今日签到规则自动接收 TG 号，在指定公开来源中搜索精确账号。命中消息及相册媒体进入「签到补采审核」；重复身份进入「疑似重复」。</p>
+          <div v-if="historyScan" class="mt-3 space-y-2 rounded-lg border border-sky-900/70 bg-slate-950/50 p-3 text-xs">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <span class="font-medium text-sky-200">历史资料池 @{{ historyScan.source_username }} · {{ historyScan.status }}</span>
+              <button @click="loadHistoryScan()" class="rounded border border-slate-700 px-2 py-1 text-slate-300">刷新</button>
+            </div>
+            <div class="grid grid-cols-2 gap-2 sm:grid-cols-3">
+              <span>已扫描 {{ historyScan.scanned_count }}</span>
+              <span>候选 {{ historyScan.candidate_count }}</span>
+              <span>入库 {{ historyScan.stored_count }}</span>
+              <span>自动上架 {{ historyScan.published_count }}</span>
+              <span>待审核 {{ historyScan.review_count }}</span>
+              <span v-if="historyScan.cursor_msg_id">断点消息 #{{ historyScan.cursor_msg_id }}</span>
+            </div>
+            <p class="text-slate-400">{{ historyScan.progress_note }}<span v-if="historyScan.last_scanned_at"> · 最近扫描 {{ new Date(historyScan.last_scanned_at).toLocaleString('zh-CN') }}</span></p>
+            <p v-if="historyScan.next_attempt_at" class="text-amber-300">账号冷却/队列等待至 {{ new Date(historyScan.next_attempt_at).toLocaleString('zh-CN') }}</p>
+            <p v-if="historyScan.error" class="text-rose-300">{{ historyScan.error }}</p>
+          </div>
+          <p v-else class="mt-3 text-xs text-amber-300">此规则尚未绑定启用的签到来源扫描队列。</p>
+        </div>
+        <div v-if="activeTab === 'profile_collection'" class="rounded-xl border border-violet-800/50 bg-violet-950/20 p-4">
+          <h3 class="text-sm font-semibold">TG号采集V2 策略</h3>
           <p class="mt-2 text-xs leading-relaxed text-slate-400">
-            先读个人简介关联消息和置顶，并补读置顶后的 5 条；频道最近更新时间超过 60 天则跳过。资料不足时扫描频道最近消息，最多 100 条、最多保存 6 张照片；照片 OCR 按文字量识别简介。有照片不取视频。试采数据独立保存，不会覆盖 V1 卡片。
+            先读个人简介关联消息和置顶，并补读置顶后的 5 条；不限制关联频道的更新时间。资料不足时扫描频道最近消息，最多 100 条、最多保存 6 张照片；照片 OCR 按文字量识别简介。有照片不取视频。结果进入专属审核页，不覆盖已上架卡片。
           </p>
         </div>
         <div v-if="current.id" class="flex flex-wrap gap-2 rounded-xl border border-slate-800 bg-slate-900/50 p-3">
@@ -830,15 +895,17 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
             <RefreshCw class="size-3.5" />刷新试采结果
           </button>
         </div>
-        <div v-if="current.id" class="flex flex-wrap gap-2 rounded-xl border border-slate-800 bg-slate-900/50 p-3">
-          <input v-model="profileUsername" placeholder="输入 Telegram 用户名或 t.me 链接"
-            class="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs" />
-          <button @click="enqueueProfileUsername" class="rounded-lg bg-sky-600 px-3 py-2 text-xs font-medium hover:bg-sky-500">
-            加入采集队列
-          </button>
-          <button @click="requeueIneffectiveProfiles" class="rounded-lg border border-amber-700/60 px-3 py-2 text-xs text-amber-300 hover:bg-amber-900/30">
-            重采无有效资料
-          </button>
+        <div v-if="current.id && ['profile_collection', 'bot_collection'].includes(activeTab)" class="space-y-2 rounded-xl border border-slate-800 bg-slate-900/50 p-3">
+          <select v-model="profileSourceId" class="w-full rounded-lg border border-slate-700 bg-slate-950 px-2 py-2 text-xs">
+            <option :value="null" disabled>选择 TG 查询账号来源…</option>
+            <option v-for="s in collectionSources" :key="s.id" :value="s.id">{{ s.title || `来源#${s.id}` }}</option>
+          </select>
+          <textarea v-model="profileUsernames" rows="3" placeholder="输入一个或多个 TG 号；每行一个，也可用逗号分隔"
+            class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs"></textarea>
+          <div class="flex flex-wrap gap-2">
+            <button @click="enqueueProfileUsername" class="rounded-lg bg-sky-600 px-3 py-2 text-xs font-medium hover:bg-sky-500">提交采集</button>
+            <button v-if="activeTab === 'profile_collection'" @click="requeueIneffectiveProfiles" class="rounded-lg border border-amber-700/60 px-3 py-2 text-xs text-amber-300 hover:bg-amber-900/30">重采无有效资料</button>
+          </div>
         </div>
         <div v-if="current.id && profileSummary" class="space-y-3 rounded-xl border border-violet-800/50 bg-violet-950/20 p-3">
           <div class="flex flex-wrap items-center justify-between gap-2 text-xs">

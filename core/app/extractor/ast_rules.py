@@ -73,6 +73,8 @@ def extract_fields(rule: dict, text: str, src: str = "regex") -> tuple:
     for name in FIELDS:
         value = _first_match(cfg.get(name), text)
         if value:
+            if name in {"nickname", "district"}:
+                value = value.strip().lstrip("#").strip()
             # usernames are always stored bare ("abaoggio"); a pattern
             # that captures the "@" must not leak into the stored value
             if name == "username":

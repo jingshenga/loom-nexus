@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 
 import asyncpg
 
@@ -26,6 +27,8 @@ SQL_POLICY = sqlres.load("settings_get_num.sql")
 SQL_POLICY_ENABLED = sqlres.load("settings_get.sql")
 SQL_MEDIA_FLAGS = sqlres.load("media_ocr_set_flags.sql")
 SQL_LISTING_SYNC_MEDIA = sqlres.load("listing_sync_media.sql")
+SQL_HISTORY_SOURCE = sqlres.load("history_scan_source.sql")
+SQL_CREATE_HISTORY_LISTING = sqlres.load("upsert_history_scan.sql")
 
 FALLBACK_RULE = {"gate": {}, "extract": {}, "lifecycle_terms": []}
 
@@ -72,12 +75,38 @@ def _decode_jsonb(value, fallback):
         return fallback
 
 
+def extract_custom_fields(text: str, definitions: list) -> dict:
+    """Extract configured fields from text lines using each field's aliases."""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    found = {}
+    for definition in definitions:
+        aliases_value = definition["aliases"] or []
+        if isinstance(aliases_value, str):
+            aliases_value = _decode_jsonb(aliases_value, [])
+        aliases = [definition["field_key"], *aliases_value]
+        for line in lines:
+            for alias in aliases:
+                match = re.search(
+                    rf"{re.escape(str(alias))}\s*[:：=\-]?\s*(.+)$",
+                    line, re.IGNORECASE,
+                )
+                if match:
+                    value = match.group(1).strip()
+                    if value:
+                        found[definition["field_key"]] = value
+                        break
+            if definition["field_key"] in found:
+                break
+    return found
+
+
 class Extractor:
-    def __init__(self, pool: asyncpg.Pool, media_dir: str, ocr_enabled: bool, ocr_worker=None):
+    def __init__(self, pool: asyncpg.Pool, media_dir: str, ocr_enabled: bool, ocr_worker=None, media_ocr_processor=None):
         self._pool = pool
         self._media_dir = media_dir
         self._ocr_enabled = ocr_enabled
         self._ocr = ocr_worker or OcrWorker()
+        self._media_ocr_processor = media_ocr_processor
 
     async def run(self, stop: asyncio.Event, batch_size: int, idle_s: float) -> None:
         logger.info(
@@ -100,6 +129,7 @@ class Extractor:
             rule = FALLBACK_RULE
         media = _decode_jsonb(row["media_json"], [])
         try:
+            history_source = await self._pool.fetchval(SQL_HISTORY_SOURCE, row["source_id"])
             for item in media:
                 if item.get("kind") != "photo" or item.get("ocr_status") in (
                     "processing", "done", "failed",
@@ -132,11 +162,32 @@ class Extractor:
                 return
 
             fields, evidence = ast_rules.extract_fields(rule, text)
+            field_definitions = await self._pool.fetch(
+                "SELECT field_key,aliases,extraction_source,required_for_publish "
+                "FROM listing_field_definitions WHERE is_active"
+            )
+            custom_fields = extract_custom_fields(
+                text,
+                [row for row in field_definitions if row["extraction_source"] == "telegram"],
+            )
+            if history_source:
+                evidence["collection_method"] = "checkin_history_scan"
+                evidence["review_bucket"] = "checkin_supplement"
+                if not fields.get("username"):
+                    match = re.search(r"(?:TG|电报)\s*[:：]?\s*@?([A-Za-z][A-Za-z0-9_]{3,31})", text, re.I)
+                    if match:
+                        fields["username"] = match.group(1).lower()
             ocr_cfg = (rule.get("ocr") or {})
             missing = [
                 key for key in (ocr_cfg.get("trigger_when_missing") or [])
                 if key == "price" and "price_amount" not in fields
             ]
+            missing.extend(
+                row["field_key"] for row in field_definitions
+                if row["extraction_source"] == "ocr" and not custom_fields.get(row["field_key"])
+            )
+            if not text.strip():
+                missing.append("description")
             if (
                 self._ocr_enabled and ocr_cfg.get("enabled")
                 and missing and any(m.get("path") for m in media)
@@ -147,8 +198,22 @@ class Extractor:
                     if m.get("path") and str(m.get("kind")) == "photo"
                 ]
                 if paths:
-                    ocr_texts = await self._ocr.read_texts(paths)
+                    if self._media_ocr_processor is not None:
+                        ocr_texts, ocr_pending = await self._media_ocr_processor.read_raw_texts(raw_id, [
+                            m["path"] for m in media
+                            if m.get("path") and str(m.get("kind")) == "photo"
+                        ])
+                    else:
+                        ocr_texts = await self._ocr.read_texts(paths)
+                        ocr_pending = False
+                    if ocr_pending:
+                        await self._mark(raw_id, "new")
+                        return
                     if ocr_texts:
+                        custom_fields.update(extract_custom_fields(
+                            "\n".join(ocr_texts),
+                            [row for row in field_definitions if row["extraction_source"] == "ocr"],
+                        ))
                         ocr_fields, ocr_evidence = ast_rules.extract_fields(
                             rule, " ".join(ocr_texts), src="ocr",
                         )
@@ -159,28 +224,49 @@ class Extractor:
                             "raw %s ocr fallback read %d line(s) from %d image(s)",
                             raw_id, len(ocr_texts), len(paths),
                         )
+                    refreshed_media = await self._pool.fetchval(
+                        "SELECT media_json FROM raw_messages WHERE id=$1", raw_id,
+                    )
+                    media = _decode_jsonb(refreshed_media, media)
 
             has_structure = any(
                 k in fields
                 for k in ("nickname", "price_amount", "district", "username")
             )
-            if not has_structure:
+            if not has_structure and not (history_source and (text.strip() or media)):
                 await self._mark(raw_id, "dropped")
                 logger.info("raw %s dropped (no fields extracted)", raw_id)
                 return
-
-            confidence = score_confidence(fields, evidence, len(media))
-            ocr_used = any(v.get("src") == "ocr" for v in evidence.values())
+            if not has_structure and history_source:
+                confidence = 0.0
+            else:
+                confidence = score_confidence(fields, evidence, len(media))
+            ocr_used = any(
+                isinstance(value, dict) and value.get("src") == "ocr"
+                for value in evidence.values()
+            )
             auto_enabled, threshold = await _load_policy(self._pool)
+            description = text.strip()
+            ocr_intro = "\n".join(ocr_texts).strip() if "ocr_texts" in locals() else ""
+            if ocr_intro:
+                marker = "图片识别内容：" + ocr_intro
+                if marker not in description:
+                    description = "\n\n".join(part for part in (description, marker) if part)
+            complete_for_publish = await self._pool.fetchval(
+                "SELECT listing_meets_publish_requirements($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb)",
+                fields.get("nickname") or "", fields.get("price_amount"), description,
+                fields.get("username") or "", fields.get("bot_url") or "",
+                json.dumps(media), json.dumps(custom_fields, ensure_ascii=False),
+            )
             # below-threshold or OCR-sourced data needs human review;
             # above-threshold regex-clean data publishes directly
             should_publish = (
-                auto_enabled and not ocr_used and confidence >= threshold
+                auto_enabled and complete_for_publish and not ocr_used and confidence >= threshold
             )
             if ocr_used:
                 confidence = min(confidence, 0.79)  # cap OCR confidence
             rows = await self._pool.fetch(
-                SQL_CREATE_LISTING,
+                SQL_CREATE_HISTORY_LISTING if history_source else SQL_CREATE_LISTING,
                 raw_id,
                 None,  # sender is the channel bot, NOT the contact; the
                        # contact identity is the extracted username
@@ -189,7 +275,7 @@ class Extractor:
                 fields.get("district"),
                 fields.get("price_amount"),
                 fields.get("price_currency") or "CNY",
-                text,
+                description,
                 json.dumps(media),
                 json.dumps(evidence, ensure_ascii=False),
                 confidence,
@@ -201,6 +287,12 @@ class Extractor:
             await self._pool.execute(
                 SQL_LISTING_SYNC_MEDIA, result["listing_id"], raw_id,
             )
+            if custom_fields:
+                await self._pool.execute(
+                    "UPDATE listings SET custom_fields=COALESCE(custom_fields,'{}'::jsonb)||$2::jsonb, "
+                    "updated_at=NOW() WHERE id=$1 AND NOT (manual_fields ? 'custom_fields')",
+                    result["listing_id"], json.dumps(custom_fields, ensure_ascii=False),
+                )
             await self._mark(raw_id, "done")
             extra = ""
             if result["conflicted"]:

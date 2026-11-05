@@ -36,6 +36,8 @@ EXPECTED_TABLES = (
     "outbox_jobs",
     "profile_collection_jobs",
     "profile_collection_results",
+    "checkin_history_scans",
+    "checkin_identity_index",
     "raw_messages",
     "source_rule_bindings",
     "user_favorites",

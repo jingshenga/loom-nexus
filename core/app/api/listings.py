@@ -117,6 +117,7 @@ def _row_to_item(row, display_filters=None, is_admin=True) -> dict:
         "district": row["district"],
         "price_amount": float(row["price_amount"]) if row["price_amount"] is not None else None,
         "price_currency": row["price_currency"],
+        "bot_url": row["bot_url"] if "bot_url" in row.keys() else "",
         "description": description,
         "media": media,
         "published_at": row["published_at"].isoformat() if row["published_at"] else None,

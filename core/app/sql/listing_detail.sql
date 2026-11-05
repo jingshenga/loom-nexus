@@ -1,4 +1,4 @@
-SELECT l.id, rm.source_id, l.nickname, l.district, l.price_amount, l.price_currency,
+SELECT l.id, rm.source_id, l.nickname, l.district, l.price_amount, l.price_currency, l.bot_url,
        l.description, l.media_json, l.contact_username, l.confidence,
        l.published_at, COALESCE(cp.is_online, FALSE) AS is_online,
        COALESCE(cp.status_tier, 'unknown') AS presence_tier,

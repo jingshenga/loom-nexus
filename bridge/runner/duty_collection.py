@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from runner import backfill, hub, sqlres
 from runner.duty import entity_urls, listing_contact_username, profile_usernames
@@ -34,6 +34,16 @@ SQL_PROFILE_FINISH = sqlres.load("profile_collection_finish.sql")
 SQL_PROFILE_DEFER = sqlres.load("profile_collection_defer.sql")
 SQL_PROFILE_RESULT = sqlres.load("profile_collection_result.sql")
 SQL_PROFILE_OCR_ENQUEUE = sqlres.load("profile_collection_ocr_enqueue.sql")
+SQL_PROFILE_PROGRESS = sqlres.load("profile_collection_progress.sql")
+SQL_PROFILE_LISTING = sqlres.load("profile_collection_listing.sql")
+SQL_CHECKIN_INDEX_USERNAME = sqlres.load("checkin_index_by_username.sql")
+SQL_CHECKIN_INDEX_NICKNAME = sqlres.load("checkin_index_by_nickname.sql")
+
+
+async def _profile_progress(pool, job, stage, current=None, total=None, note=""):
+    await pool.execute(
+        SQL_PROFILE_PROGRESS, job["job_id"], stage, current, total, str(note)[:240],
+    )
 
 
 def _matches_username(message, username: str) -> bool:
@@ -41,6 +51,34 @@ def _matches_username(message, username: str) -> bool:
     if listing_contact_username(message) == wanted:
         return True
     return wanted in profile_usernames(message)
+
+
+def _explicit_profile_field(text: str, labels: str) -> str | None:
+    match = re.search(
+        rf"(?:{labels})\s*[】\]]?\s*[:：=]\s*#?([^\s,，|｜\n#]+)",
+        text or "",
+        re.I,
+    )
+    value = match.group(1).strip(" \t#.,，。；;:：") if match else ""
+    return value or None
+
+
+async def _find_checkin_matches(client, entity, username: str):
+    matches = []
+    async for message in client.iter_messages(entity, search=username, limit=20):
+        if _matches_username(message, username):
+            if not _is_obvious_promo((message.raw_text or "").strip()):
+                matches.append(message)
+    if not matches:
+        # Telegram's server-side search can omit messages that remain visible
+        # in channel history (for example, usernames represented by entities).
+        # Keep the fallback bounded to one recent page to avoid scanning large
+        # check-in channels for every account.
+        async for message in client.iter_messages(entity, limit=100):
+            if _matches_username(message, username):
+                if not _is_obvious_promo((message.raw_text or "").strip()):
+                    matches.append(message)
+    return matches
 
 
 async def _find_message(client, job):
@@ -141,6 +179,7 @@ def _flood_wait_seconds(exc: Exception) -> int:
 
 TG_PROFILE_LINK_RE = re.compile(r"https?://t\.me/([A-Za-z0-9_]+)(?:/(\d+))?", re.I)
 TG_MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])@([A-Za-z][A-Za-z0-9_]{3,31})\b", re.I)
+TG_BOT_USERNAME_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_]{1,28}bot)\b", re.I)
 PROMO_MARKER_RE = re.compile(
     r"博彩|彩票|贷款|返利|刷单|高回报|招商|加盟|优惠券|代购|推广|扫码|兼职日结"
 )
@@ -192,7 +231,9 @@ def _has_profile_content(message) -> bool:
 def _profile_links(text: str) -> list[tuple[str, str | None]]:
     links = [(m.group(1), m.group(2)) for m in TG_PROFILE_LINK_RE.finditer(text or "")]
     links.extend((name, None) for name in TG_MENTION_RE.findall(text or ""))
-    return list(dict.fromkeys(links))
+    links.extend((name, None) for name in TG_BOT_USERNAME_RE.findall(text or ""))
+    unique = list(dict.fromkeys(links))
+    return sorted(unique, key=lambda item: not item[0].lower().endswith("bot"))
 
 
 def _entity_url(entity, fallback: str | None = None) -> str | None:
@@ -252,28 +293,36 @@ async def _profile_channel(pool, client, job, full, user, about, saved_channel_u
                 pass
 
     links = _profile_links(about or "")
-    resolved_link = False
+    lookup_failures = 0
+    resolved_non_bots = 0
     for name, msg_id in links[:8]:
         link = f"https://t.me/{name}" + (f"/{msg_id}" if msg_id else "")
-        if name.lower().endswith("bot") and not bot_url:
-            bot_url = link
-        if channel is not None or resolved_link:
-            continue
         try:
             entity = await _rate_limited_entity(pool, client, job["account_id"], name)
-            resolved_link = True
         except Exception as exc:
             if _is_flood_wait(exc):
                 raise
+            lookup_failures += 1
             continue
         if getattr(entity, "bot", False):
-            bot_url = bot_url or link
+            bot_url = bot_url or _entity_url(entity, link)
         elif channel is None and isinstance(entity, (Channel, Chat)):
             channel = entity
             channel_url = _entity_url(entity, link)
+        else:
+            resolved_non_bots += 1
+        if bot_url and channel:
+            break
 
     if getattr(user, "bot", False):
         bot_url = bot_url or f"https://t.me/{user.username}"
+    if job.get("rule_type") == "bot_collection":
+        logger.info(
+            "bot profile lookup (job=%s candidates=%s lookup_failures=%s "
+            "resolved_non_bots=%s found=%s)",
+            job["job_id"], min(len(links), 8), lookup_failures,
+            resolved_non_bots, bool(bot_url),
+        )
     return channel, channel_url, bot_url, personal_id, full_user
 
 
@@ -378,7 +427,6 @@ async def _collect_profile_listing(pool, client, job) -> tuple[str, int | None, 
 
     pinned_text = next((text.split("：\n", 1)[1] for text in texts if text.startswith("频道置顶消息：\n")), None)
     if not bot_url:
-        resolved_link = False
         related_text = "\n".join([about, *(msg.raw_text or "" for msg in messages)])
         links = _profile_links(related_text)
         for msg in messages:
@@ -386,21 +434,20 @@ async def _collect_profile_listing(pool, client, job) -> tuple[str, int | None, 
                 match = TG_PROFILE_LINK_RE.search(url)
                 if match:
                     links.append((match.group(1), match.group(2)))
-        for name, msg_id in dict.fromkeys(links):
-            if name.lower().endswith("bot"):
-                bot_url = f"https://t.me/{name}" + (f"/{msg_id}" if msg_id else "")
-                break
-            if channel is not None or resolved_link:
-                continue
+        links = sorted(
+            dict.fromkeys(links),
+            key=lambda item: not item[0].lower().endswith("bot"),
+        )
+        for name, msg_id in links[:8]:
+            link = f"https://t.me/{name}" + (f"/{msg_id}" if msg_id else "")
             try:
                 linked = await _rate_limited_entity(pool, client, job["account_id"], name)
-                resolved_link = True
             except Exception as exc:
                 if _is_flood_wait(exc):
                     raise
                 continue
             if getattr(linked, "bot", False):
-                bot_url = f"https://t.me/{name}" + (f"/{msg_id}" if msg_id else "")
+                bot_url = _entity_url(linked, link)
                 break
     await _save_profile(
         pool, job, user, about, channel, channel_url, bot_url,
@@ -446,28 +493,178 @@ async def _collect_profile_listing(pool, client, job) -> tuple[str, int | None, 
     return "fetched", None, None
 
 
-async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
-    """Collect a V2 result into its isolated trial table; never writes a listing."""
-    from telethon.tl.functions.users import GetFullUserRequest
-
-    user = await _rate_limited_entity(pool, client, job["account_id"], job["contact_username"])
-    if not getattr(user, "id", None) or not hasattr(user, "first_name"):
-        raise RuntimeError("Telegram username did not resolve to a user profile")
-    full = await client(GetFullUserRequest(user))
-    full_user = full.full_user
-    about = (getattr(full_user, "about", None) or "").strip()
-    channel, channel_url, bot_url, _, full_user = await _profile_channel(
-        pool, client, job, full, user, about, "", "",
+async def _persist_profile_result(pool, job, peer_id, profile_url, channel_url,
+                                  bot_url, description, media, evidence, cfg):
+    await _profile_progress(pool, job, "save_result", 0, 1, "写入资料结果并排入 OCR 与审核")
+    rows = await pool.fetch(
+        SQL_PROFILE_RESULT, job["job_id"], peer_id, job["contact_username"],
+        profile_url, channel_url or "", bot_url or "", description,
+        json.dumps(backfill.order_media(media), ensure_ascii=False),
+        json.dumps(evidence, ensure_ascii=False), json.dumps(cfg, ensure_ascii=False),
     )
+    result_id = rows[0]["id"]
+    await pool.execute(SQL_PROFILE_OCR_ENQUEUE, result_id, json.dumps(media, ensure_ascii=False))
+    bucket = "checkin_supplement" if job["rule_type"] == "checkin_reverse" else "tg_profile_v2"
+    await pool.fetch(SQL_PROFILE_LISTING, job["job_id"], bucket)
+
+
+async def _collect_checkin_source(pool, client, job, cfg):
+    source_username = str(cfg.get("source_username") or "").strip().lstrip("@")
+    if not source_username:
+        raise RuntimeError("签到反查规则缺少来源频道用户名")
+    if job["target_msg_id"] is None:
+        indexed = await pool.fetch(
+            SQL_CHECKIN_INDEX_USERNAME, job["source_id"], job["contact_username"],
+        )
+        if indexed:
+            return "skipped", f"资料库已按 TG 号命中卡片 #{indexed[0]['listing_id']}"
+        nickname = str(job["contact_nickname"] or "").strip()
+        if nickname:
+            indexed = await pool.fetch(
+                SQL_CHECKIN_INDEX_NICKNAME, job["source_id"], nickname,
+            )
+            if len(indexed) == 1:
+                return "skipped", f"资料库已按唯一昵称命中卡片 #{indexed[0]['listing_id']}"
+    entity = await _rate_limited_entity(
+        pool, client, job["account_id"], source_username,
+    )
+    matches = []
+    if job["target_msg_id"] is not None and job["target_peer_id"] is not None:
+        from telethon import utils
+
+        if int(job["target_peer_id"]) == int(utils.get_peer_id(entity)):
+            target = await client.get_messages(entity, ids=job["target_msg_id"])
+            if target and _matches_username(target, job["contact_username"]):
+                matches = [target]
+    if not matches:
+        matches = await _find_checkin_matches(
+            client, entity, job["contact_username"],
+        )
+    if not matches:
+        return "not_found", "签到来源中没有找到包含该 TG 号的消息"
+    matches.sort(
+        key=lambda message: message.date or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+
+    primary = matches[0]
+    parts = await _fetch_album(client, entity, primary)
+    channel_name = getattr(entity, "username", None) or source_username
+    media = []
+    video_candidates = []
+    for part in parts:
+        kind = _profile_media_kind(part)
+        if kind == "photo" and sum(item["kind"] == "photo" for item in media) < 6:
+            entries = await backfill.save_media(
+                part, job["source_id"], stable_prefix=f"checkin_v2_{job['job_id']}_{part.id}",
+                force_kind="photo",
+            )
+            media.extend({**item, "message_id": int(part.id)} for item in entries if item.get("kind") == "photo")
+        elif kind == "video":
+            video_candidates.append(part)
+    if not any(item["kind"] == "photo" for item in media):
+        for part in video_candidates[:2]:
+            entries = await backfill.save_media(
+                part, job["source_id"], stable_prefix=f"checkin_v2_{job['job_id']}_{part.id}",
+                force_kind="video",
+            )
+            media.extend({**item, "message_id": int(part.id)} for item in entries if item.get("kind") == "video")
+    description = (primary.raw_text or "").strip()
+    if not description and not media:
+        return "not_found", "命中消息没有可用文字或媒体"
+    source_url = f"https://t.me/{channel_name}/{primary.id}"
+    nickname = _explicit_profile_field(description, "老师昵称|昵称|姓名|艺名")
+    district = _explicit_profile_field(description, "位置|地区|区域|城区")
+    evidence = {
+        "collection_method": "daily_checkin_source_username_search",
+        "review_bucket": "checkin_supplement",
+        "nickname": nickname or "",
+        "district": district or "",
+        "profile_url": f"https://t.me/{job['contact_username']}",
+        "source_messages": [{
+            "url": source_url, "message_id": int(primary.id),
+            "posted_at": primary.date.isoformat() if primary.date else None,
+            "matched_by": "exact_contact_username_in_message",
+        }],
+        "matched_message_count": len(matches),
+        "avatar_used": False,
+    }
+    await _persist_profile_result(
+        pool, job, None, evidence["profile_url"], f"https://t.me/{channel_name}",
+        "", description, media, evidence, cfg,
+    )
+    return "fetched", None
+
+
+async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
+    """Collect a bounded Telegram profile result and stage it for admin review."""
     cfg = job["config_json"]
     if isinstance(cfg, str):
         cfg = json.loads(cfg)
     cfg = cfg if isinstance(cfg, dict) else {}
+    if job["rule_type"] == "checkin_reverse":
+        return await _collect_checkin_source(pool, client, job, cfg)
+    from telethon.tl.functions.users import GetFullUserRequest
+
+    await _profile_progress(pool, job, "resolve_profile", 0, 1, "解析 Telegram 用户名")
+    user = await _rate_limited_entity(pool, client, job["account_id"], job["contact_username"])
+    if not getattr(user, "id", None) or not hasattr(user, "first_name"):
+        raise RuntimeError("Telegram username did not resolve to a user profile")
+    full = await client(GetFullUserRequest(user))
+    await _profile_progress(pool, job, "resolve_profile", 1, 1, "已读取个人资料")
+    full_user = full.full_user
+    about = (getattr(full_user, "about", None) or "").strip()
+    await _profile_progress(pool, job, "resolve_channel", 0, 1, "解析个人简介中的关联频道")
+    channel, channel_url, bot_url, _, full_user = await _profile_channel(
+        pool, client, job, full, user, about, "", "",
+    )
+    if job["rule_type"] == "bot_collection":
+        profile_url = f"https://t.me/{user.username or job['contact_username']}"
+        await pool.execute(
+            "INSERT INTO bot_collection_results(job_id,contact_username,profile_url,bot_url) "
+            "VALUES($1,$2,$3,$4) ON CONFLICT(job_id) DO UPDATE SET "
+            "contact_username=EXCLUDED.contact_username, profile_url=EXCLUDED.profile_url, "
+            "bot_url=EXCLUDED.bot_url, collected_at=NOW()",
+            job["job_id"], job["contact_username"], profile_url, bot_url or "",
+        )
+        if bot_url:
+            await pool.execute(
+                "UPDATE listings l SET bot_url=CASE WHEN l.manual_fields ? 'bot_url' "
+                "THEN l.bot_url ELSE $2 END, updated_at=NOW(), "
+                "status=CASE WHEN l.status IN ('pending','published') AND "
+                "listing_meets_publish_requirements(l.nickname,l.price_amount,l.description, "
+                "l.contact_username,CASE WHEN l.manual_fields ? 'bot_url' THEN l.bot_url ELSE $2 END, "
+                "l.media_json,l.custom_fields) "
+                "AND NOT EXISTS (SELECT 1 FROM jsonb_each(COALESCE(l.evidence_json,'{}'::jsonb)) e "
+                "WHERE e.value->>'src'='ocr') THEN 'published' "
+                "WHEN l.status='published' THEN 'pending' ELSE l.status END, "
+                "published_at=CASE WHEN l.status IN ('pending','published') AND "
+                "listing_meets_publish_requirements(l.nickname,l.price_amount,l.description, "
+                "l.contact_username,CASE WHEN l.manual_fields ? 'bot_url' THEN l.bot_url ELSE $2 END, "
+                "l.media_json,l.custom_fields) "
+                "AND NOT EXISTS (SELECT 1 FROM jsonb_each(COALESCE(l.evidence_json,'{}'::jsonb)) e "
+                "WHERE e.value->>'src'='ocr') "
+                "THEN COALESCE(l.published_at,NOW()) "
+                "WHEN l.status='published' THEN NULL ELSE l.published_at END "
+                "WHERE lower(l.contact_username)=lower($1)",
+                job["contact_username"], bot_url,
+            )
+            return "fetched", None
+        await pool.execute(
+            "UPDATE listings SET status='pending', published_at=NULL, updated_at=NOW() "
+            "WHERE lower(contact_username)=lower($1) AND status='published' "
+            "AND NOT (manual_fields ? 'bot_url') AND NULLIF(BTRIM(bot_url),'') IS NULL",
+            job["contact_username"],
+        )
+        return "not_found", "Telegram 个人名片中未找到 Bot 地址"
+    await _profile_progress(
+        pool, job, "resolve_channel", 1, 1,
+        f"关联频道：{channel_url or '未找到，使用个人公开资料'}",
+    )
     recent_window = max(1, min(10, int(cfg.get("recent_window", 10))))
     scan_limit = max(recent_window, min(100, int(cfg.get("max_scan_messages", 100))))
     photo_limit = max(1, min(MAX_PROFILE_V2_PHOTOS, int(cfg.get("max_photos", 6))))
     video_limit = max(0, min(MAX_PROFILE_VIDEOS, int(cfg.get("max_videos", 2))))
-    stale_days = max(1, min(180, int(cfg.get("stale_channel_days", 60))))
     followup_limit = max(1, min(5, int(cfg.get("pinned_followup_messages", 5))))
     min_chars = max(1, int(cfg.get("intro_min_chars", 30)))
     min_lines = max(1, int(cfg.get("intro_min_lines", 3)))
@@ -480,6 +677,7 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
     if channel is not None:
         channel_name = (getattr(channel, "username", None) or "").lower()
         channel_label = channel_url or _entity_url(channel) or "关联频道"
+        await _profile_progress(pool, job, "check_source", 0, 1, f"读取频道最新消息：{channel_label}")
         latest = None
         try:
             async for latest in client.iter_messages(channel, limit=1):
@@ -494,11 +692,7 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
             if latest_at.tzinfo is None:
                 latest_at = latest_at.replace(tzinfo=timezone.utc)
             channel_last_message_at = latest_at
-            if latest_at < datetime.now(timezone.utc) - timedelta(days=stale_days):
-                return "stale_source", (
-                    f"频道最近消息早于 {stale_days} 天，按规则跳过：{channel_label} "
-                    f"（最近更新 {latest_at.date().isoformat()}）"
-                )
+        await _profile_progress(pool, job, "check_source", 1, 1, "频道可访问，继续读取资料")
         for link_name, message_id in _profile_links(about):
             if message_id and link_name.lower() == channel_name:
                 try:
@@ -511,10 +705,12 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
                         raise
         try:
             from telethon.tl.types import InputMessagesFilterPinned
+            await _profile_progress(pool, job, "read_pins", 0, 3, "读取频道置顶消息")
             async for msg in client.iter_messages(channel, filter=InputMessagesFilterPinned, limit=3):
                 messages.append(msg)
                 pinned_ids.add(int(msg.id))
                 scanned += 1
+            await _profile_progress(pool, job, "read_pins", len(pinned_ids), 3, f"已读取置顶消息 {len(pinned_ids)}/3")
         except Exception as exc:
             if _is_flood_wait(exc):
                 raise
@@ -522,6 +718,7 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
         if pinned_ids:
             anchor_id = max(pinned_ids)
             try:
+                await _profile_progress(pool, job, "read_followup", 0, followup_limit, "补读置顶消息后续内容")
                 async for msg in client.iter_messages(
                     channel, min_id=anchor_id, limit=min(followup_limit, max(0, scan_limit - scanned)),
                 ):
@@ -529,6 +726,10 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
                         messages.append(msg)
                         pinned_followup_ids.add(int(msg.id))
                         scanned += 1
+                await _profile_progress(
+                    pool, job, "read_followup", len(pinned_followup_ids), followup_limit,
+                    f"已补读置顶后续 {len(pinned_followup_ids)} 条",
+                )
             except Exception as exc:
                 if _is_flood_wait(exc):
                     raise
@@ -547,6 +748,7 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
         if len(re.sub(r"\s+", "", intro)) < min_chars or pinned_photos < min(photo_limit, 6):
             recent = []
             try:
+                await _profile_progress(pool, job, "scan_recent", 0, recent_window, "资料不足，扫描最近消息")
                 async for msg in client.iter_messages(
                     channel, limit=min(recent_window, max(0, scan_limit - scanned)),
                 ):
@@ -556,15 +758,25 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
                     raise
                 logger.info("V2 recent channel scan unavailable (user=%s): %s", user.id, exc)
             scanned += len(recent)
+            await _profile_progress(
+                pool, job, "scan_recent", len(recent), recent_window,
+                f"最近消息已读 {len(recent)} 条",
+            )
             messages.extend(recent)
             intro = about or "\n".join((m.raw_text or "").strip() for m in messages if _has_profile_content(m))
             recent_photos = sum(bool(msg.photo) for msg in messages)
             if (len(re.sub(r"\s+", "", intro)) < min_chars or recent_photos < min(photo_limit, 6)) and scanned < scan_limit and recent:
                 remaining = scan_limit - scanned
                 try:
+                    await _profile_progress(pool, job, "scan_archive", scanned, scan_limit, f"补扫历史消息，当前累计 {scanned}/{scan_limit} 条")
                     async for msg in client.iter_messages(channel, limit=remaining, offset_id=min(m.id for m in recent)):
                         messages.append(msg)
                         scanned += 1
+                        if scanned % 10 == 0 or scanned >= scan_limit:
+                            await _profile_progress(
+                                pool, job, "scan_archive", scanned, scan_limit,
+                                f"历史消息已读 {scanned}/{scan_limit} 条",
+                            )
                 except Exception as exc:
                     if _is_flood_wait(exc):
                         raise
@@ -586,7 +798,8 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
     text_parts = [f"个人简介：\n{about}"] if about else []
     media, video_candidates, sources = [], [], []
     channel_username = getattr(channel, "username", None) if channel is not None else None
-    for msg in unique:
+    await _profile_progress(pool, job, "collect_media", 0, len(unique), f"筛选 {len(unique)} 条匹配消息的媒体")
+    for message_index, msg in enumerate(unique, start=1):
         parts = await _fetch_album(client, channel, msg) if channel is not None else [msg]
         anchor = next((part for part in parts if (part.raw_text or "").strip()), msg)
         raw_text = (anchor.raw_text or "").strip()
@@ -615,6 +828,11 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
                 media.extend({**item, "message_id": int(part.id)} for item in entries if item.get("kind") == "photo")
             elif media_kind == "video":
                 video_candidates.append(part)
+        if message_index % 5 == 0 or message_index == len(unique):
+            await _profile_progress(
+                pool, job, "collect_media", message_index, len(unique),
+                f"媒体处理 {message_index}/{len(unique)} 条消息",
+            )
 
     if not any(item["kind"] == "photo" for item in media):
         for part in video_candidates[:video_limit]:
@@ -627,13 +845,21 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
     if not description and not media:
         return "not_found", "No usable profile, linked-channel, or media content found"
 
+    display_name = " ".join(
+        x for x in (getattr(user, "first_name", None), getattr(user, "last_name", None)) if x
+    ).strip()
+    nickname = _explicit_profile_field(
+        about, "老师昵称|昵称|姓名|艺名",
+    ) or display_name
+    district = _explicit_profile_field(
+        f"{about}\n{description}", "位置|地区|区域|城区",
+    )
     evidence = {
         "collection_method": "profile -> linked channel pins and next 5 -> recent 10 -> older/gallery messages",
         "profile_url": f"https://t.me/{user.username or job['contact_username']}",
         "source_messages": sources,
         "scan_count": scanned,
         "scan_limit": scan_limit,
-        "stale_channel_days": stale_days,
         "channel_last_message_at": channel_last_message_at.isoformat() if channel_last_message_at else None,
         "pinned_followup_message_ids": sorted(pinned_followup_ids),
         "filtered_promo_count": filtered_count,
@@ -643,15 +869,14 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
         "intro_min_chars": min_chars,
         "intro_min_lines": min_lines,
         "any_sender_in_linked_channel": True,
+        "nickname": nickname or "",
+        "district": district or "",
+        "review_bucket": "tg_profile_v2",
     }
-    rows = await pool.fetch(
-        SQL_PROFILE_RESULT, job["job_id"], int(user.id), job["contact_username"],
-        evidence["profile_url"], channel_url or "", bot_url or "", description,
-        json.dumps(backfill.order_media(media), ensure_ascii=False),
-        json.dumps(evidence, ensure_ascii=False), json.dumps(cfg, ensure_ascii=False),
+    await _persist_profile_result(
+        pool, job, int(user.id), evidence["profile_url"], channel_url or "",
+        bot_url or "", description, media, evidence, cfg,
     )
-    result_id = rows[0]["id"]
-    await pool.execute(SQL_PROFILE_OCR_ENQUEUE, result_id, json.dumps(media, ensure_ascii=False))
     return "fetched", None
 
 

@@ -1,4 +1,4 @@
-SELECT l.contact_username
+SELECT l.contact_username, l.nickname
 FROM ingest_sources s
 JOIN raw_messages rm ON rm.source_id = s.id
 JOIN listings l ON l.source_msg_id = rm.id

@@ -8,4 +8,4 @@ FROM duty_collection_jobs j
 JOIN ingest_rules r ON r.rule_type = 'profile_collection' AND r.is_active
 JOIN source_rule_bindings b ON b.rule_id = r.id AND b.source_id = j.source_id
 WHERE j.id = $1::bigint
-ON CONFLICT (rule_id, duty_date, lower(contact_username)) DO NOTHING;
+ON CONFLICT DO NOTHING;

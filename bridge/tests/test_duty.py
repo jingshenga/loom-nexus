@@ -15,7 +15,8 @@ from runner.duty import (
     profile_usernames,
 )
 from runner.duty_collection import (
-    _flood_wait_seconds, _is_flood_wait, _profile_media_kind,
+    _find_checkin_matches, _flood_wait_seconds, _is_flood_wait,
+    _profile_links, _profile_media_kind,
 )
 
 
@@ -96,6 +97,14 @@ class DutyProcessTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DutyRuleTests(unittest.TestCase):
+    def test_bot_lookup_includes_bare_bot_suffix_candidates(self):
+        candidates = _profile_links(
+            "Bot地址 xiaomubot\n备用 @service_bot\nhttps://t.me/shopbot"
+        )
+        self.assertIn(("xiaomubot", None), candidates)
+        self.assertIn(("service_bot", None), candidates)
+        self.assertIn(("shopbot", None), candidates)
+
     def test_business_day_rolls_at_four(self):
         zone = ZoneInfo("Asia/Shanghai")
         before = datetime(2026, 10, 28, 3, 59, tzinfo=zone)
@@ -182,6 +191,47 @@ class DutyRuleTests(unittest.TestCase):
             file=SimpleNamespace(mime_type="image/jpeg", ext=".jpg"),
         )
         self.assertEqual(_profile_media_kind(message), "video")
+
+
+class CheckinSearchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_history_fallback_finds_exact_username_missed_by_search(self):
+        hit = FakeMessage("签到资料 @lemony88", sender_id=1)
+
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            async def iter_messages(self, entity, **kwargs):
+                self.calls.append(kwargs)
+                if "search" not in kwargs:
+                    yield hit
+
+        client = Client()
+        matches = await _find_checkin_matches(client, object(), "lemony88")
+
+        self.assertEqual(matches, [hit])
+        self.assertEqual(client.calls, [
+            {"search": "lemony88", "limit": 20},
+            {"limit": 100},
+        ])
+
+    async def test_history_fallback_is_skipped_after_search_hit(self):
+        hit = FakeMessage("签到资料 @lemony88", sender_id=1)
+
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            async def iter_messages(self, entity, **kwargs):
+                self.calls.append(kwargs)
+                if "search" in kwargs:
+                    yield hit
+
+        client = Client()
+        matches = await _find_checkin_matches(client, object(), "lemony88")
+
+        self.assertEqual(matches, [hit])
+        self.assertEqual(client.calls, [{"search": "lemony88", "limit": 20}])
 
 
 if __name__ == "__main__":

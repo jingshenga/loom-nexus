@@ -23,6 +23,7 @@ services:
       # first-boot schema bootstrap: the official entrypoint runs *.sql once,
       # on the empty cluster, with ON_ERROR_STOP=1
       - ./scripts/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+      - ./scripts/migrations/2026-10-31-account-force-disconnect.sql:/docker-entrypoint-initdb.d/15-account-force-disconnect.sql:ro
       - ./scripts/migrations/2026-10-31-ocr-classifier-training.sql:/docker-entrypoint-initdb.d/20-ocr-classifier.sql:ro
       # rolling daily logical backups on the bind mount (weekday files,
       # 7-day rotation); survives any pgdata loss and restores the whole

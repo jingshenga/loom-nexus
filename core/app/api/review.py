@@ -5,6 +5,7 @@ import io
 import json
 import re
 import uuid
+from datetime import date
 from pathlib import Path
 from typing import Literal
 from PIL import Image
@@ -35,6 +36,9 @@ SQL_DUTY_RECOVERY = sqlres.load("duty_recovery_queue.sql")
 SQL_DUTY_RECOVERY_UPDATE = sqlres.load("duty_recovery_update.sql")
 SQL_DUTY_MANUAL_LISTING = sqlres.load("duty_manual_listing.sql")
 SQL_DUTY_SCAN_ENQUEUE = sqlres.load("duty_recovery_scan_enqueue.sql")
+SQL_HISTORY_SOURCES = sqlres.load("history_library_sources.sql")
+SQL_HISTORY_MESSAGES = sqlres.load("history_library_messages.sql")
+SQL_HISTORY_TOTAL = sqlres.load("history_library_total.sql")
 
 
 def _decode(value, fallback):
@@ -82,15 +86,24 @@ async def queue(
     status: str = "pending", limit: int = 30, offset: int = 0,
     nickname: str = None, source: str = None, media: str = None,
     sort: Literal["newest", "oldest"] = "newest", bucket: str = None,
+    collected_from: date | None = None, collected_to: date | None = None,
+    min_media: int | None = None, max_media: int | None = None,
 ) -> dict:
     pool = db.get_pool()
     if pool is None:
         raise HTTPException(status_code=503, detail="database unavailable")
     if media not in {None, "photo", "video"}:
         raise HTTPException(status_code=400, detail="invalid media filter")
+    if min_media is not None and min_media < 0 or max_media is not None and max_media < 0:
+        raise HTTPException(status_code=400, detail="media count must be non-negative")
+    if min_media is not None and max_media is not None and min_media > max_media:
+        raise HTTPException(status_code=400, detail="minimum media count exceeds maximum")
+    if collected_from and collected_to and collected_from > collected_to:
+        raise HTTPException(status_code=400, detail="collection date range is invalid")
     rows = await pool.fetch(
         SQL_QUEUE, status, limit, offset, nickname or None,
         source or None, media, sort, bucket or None,
+        collected_from, collected_to, min_media, max_media,
     )
     items = []
     for r in rows:
@@ -101,12 +114,14 @@ async def queue(
             "price_amount": float(r["price_amount"]) if r["price_amount"] is not None else None,
             "price_currency": r["price_currency"],
             "description": r["description"],
+            "custom_fields": _decode(r["custom_fields"], {}),
             "media": _decode(r["media_json"], []),
             "evidence": _decode(r["evidence_json"], {}),
             "confidence": float(r["confidence"]) if r["confidence"] is not None else None,
             "status": r["status"],
             "contact_peer_id": r["contact_peer_id"],
             "contact_username": r["contact_username"],
+            "bot_url": r["bot_url"],
             "created_at": r["created_at"].isoformat(),
             "source_text": r["raw_text"],
             "source_title": r["source_title"],
@@ -117,7 +132,7 @@ async def queue(
 
 @router.get("/duplicates")
 async def duplicate_candidates() -> dict:
-    """List active cards with matching non-Telegram profile content."""
+    """List cards with matching Telegram identities, profile content, or history nicknames."""
     pool = db.get_pool()
     if pool is None:
         raise HTTPException(status_code=503, detail="database unavailable")
@@ -143,7 +158,8 @@ async def duplicate_candidates() -> dict:
                 if row[f"{prefix}_posted_at"] else None,
         }
 
-    return {"items": [{"left": card(row, "left"), "right": card(row, "right")}
+    return {"items": [{"left": card(row, "left"), "right": card(row, "right"),
+                        "match_reason": row["match_reason"]}
                        for row in rows]}
 
 
@@ -169,7 +185,8 @@ async def decide_duplicate(
             rows = await conn.fetch(
                 "SELECT l.id, l.status, l.created_at, l.nickname, l.district, "
                 "l.price_amount, l.price_currency, l.contact_peer_id, l.profile_collection_job_id, "
-                "l.contact_username, COALESCE(NULLIF(rm.raw_text, ''), l.description, '') AS source_text "
+                "l.contact_username, l.source_msg_id, "
+                "COALESCE(NULLIF(rm.raw_text, ''), l.description, '') AS source_text "
                 "FROM listings l LEFT JOIN raw_messages rm ON rm.id=l.source_msg_id "
                 "WHERE l.id = ANY($1::bigint[]) ORDER BY l.id FOR UPDATE OF l",
                 [left_id, right_id],
@@ -203,12 +220,20 @@ async def decide_duplicate(
                 and signature(first["source_text"]) != ""
                 and not same_identity
             )
+            history_candidate = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM raw_messages rm "
+                "JOIN checkin_history_scans hs ON hs.source_id=rm.source_id "
+                "WHERE rm.id = ANY($1::bigint[]))",
+                [first["source_msg_id"], second["source_msg_id"]],
+            )
             same_nickname = (
                 (first["profile_collection_job_id"] is not None
-                 or second["profile_collection_job_id"] is not None)
+                 or second["profile_collection_job_id"] is not None
+                 or history_candidate)
                 and first["nickname"] is not None
                 and second["nickname"] is not None
-                and first["nickname"].strip().casefold() == second["nickname"].strip().casefold()
+                and re.sub(r"[\s\W_]+", "", first["nickname"].casefold())
+                    == re.sub(r"[\s\W_]+", "", second["nickname"].casefold())
             )
             if not (same_identity or same_nickname or same_profile):
                 raise HTTPException(status_code=409, detail="cards are not a current duplicate candidate")
@@ -246,6 +271,43 @@ async def decide_duplicate(
             "preferred_id": latest["id"], "archived_id": archived_id}
 
 
+@router.get("/history/sources")
+async def history_library_sources() -> dict:
+    """Return the two configured check-in history pools for browsing."""
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    rows = await pool.fetch(SQL_HISTORY_SOURCES)
+    return {"items": [dict(row) for row in rows]}
+
+
+@router.get("/history")
+async def history_library(
+    source_id: int | None = None, q: str = "",
+    limit: int = 50, offset: int = 0,
+) -> dict:
+    """Search only locally stored messages from configured check-in history sources."""
+    if not 1 <= limit <= 100 or offset < 0:
+        raise HTTPException(status_code=400, detail="invalid paging parameters")
+    q = q.strip()
+    if len(q) > 120:
+        raise HTTPException(status_code=400, detail="search text is too long")
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    total = await pool.fetchval(SQL_HISTORY_TOTAL, source_id, q or None)
+    rows = await pool.fetch(SQL_HISTORY_MESSAGES, source_id, q or None, limit, offset)
+    items = []
+    for row in rows:
+        item = dict(row)
+        for key, value in item.items():
+            if hasattr(value, "isoformat"):
+                item[key] = value.isoformat()
+        item["media"] = _decode(item.pop("media_json"), [])
+        items.append(item)
+    return {"items": items, "total": total}
+
+
 class FieldEdits(BaseModel):
     nickname: str = None
     district: str = None
@@ -260,6 +322,8 @@ class ListingContentEdit(BaseModel):
     price_amount: float | None = None
     price_currency: str
     description: str
+    bot_url: str | None = None
+    custom_fields: dict | None = None
     media: list[dict]
     manual_order: bool = False
 
@@ -303,6 +367,54 @@ async def recollect(body: RecollectBody) -> dict:
             for row in jobs
         ]
     }
+
+
+@router.post("/bot-recollect")
+async def bot_recollect(body: RecollectBody) -> dict:
+    """Queue Bot-only profile reads for selected card identities."""
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    ids = sorted(set(body.ids))
+    if not ids or len(ids) > 20:
+        raise HTTPException(status_code=400, detail="select between 1 and 20 cards")
+    jobs = []
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            for listing_id in ids:
+                target = await conn.fetchrow(
+                    "SELECT l.contact_username, s.id AS source_id, s.assigned_account_id AS account_id, r.id AS rule_id "
+                    "FROM listings l "
+                    "LEFT JOIN raw_messages rm ON rm.id=l.source_msg_id "
+                    "LEFT JOIN profile_collection_jobs old_job ON old_job.id=l.profile_collection_job_id "
+                    "LEFT JOIN duty_collection_jobs duty_job ON duty_job.id=l.duty_collection_job_id "
+                    "JOIN ingest_sources s ON s.id=COALESCE(rm.source_id,old_job.source_id,duty_job.source_id) AND s.is_active "
+                    "JOIN bridge_accounts a ON a.id=s.assigned_account_id AND a.status='active' "
+                    "JOIN source_rule_bindings b ON b.source_id=s.id "
+                    "JOIN ingest_rules r ON r.id=b.rule_id AND r.rule_type='bot_collection' AND r.is_active "
+                    "WHERE l.id=$1 AND NULLIF(l.contact_username,'') IS NOT NULL "
+                    "ORDER BY b.priority DESC,r.id LIMIT 1",
+                    listing_id,
+                )
+                if target is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"卡片 #{listing_id} 没有可用 TG 号、Bot 规则或采集账号",
+                    )
+                row = await conn.fetchrow(
+                    "INSERT INTO profile_collection_jobs "
+                    "(rule_id,duty_date,source_id,account_id,contact_username,target_peer_id) "
+                    "VALUES($1,(NOW() AT TIME ZONE 'Asia/Shanghai')::date,$2,$3,$4,NULL) "
+                    "ON CONFLICT (rule_id,duty_date,lower(contact_username)) WHERE target_msg_id IS NULL "
+                    "DO UPDATE SET status=CASE WHEN profile_collection_jobs.status IN ('pending','processing','deferred') "
+                    "THEN profile_collection_jobs.status ELSE 'pending' END, "
+                    "next_attempt_at=CASE WHEN profile_collection_jobs.status='deferred' "
+                    "THEN profile_collection_jobs.next_attempt_at ELSE NULL END, error=NULL, updated_at=NOW() "
+                    "RETURNING id,status",
+                    target["rule_id"], target["source_id"], target["account_id"], target["contact_username"],
+                )
+                jobs.append({"job_id": row["id"], "listing_id": listing_id, "status": row["status"]})
+    return {"jobs": jobs, "queued": len(jobs)}
 
 
 @router.get("/recollect/status")
@@ -352,12 +464,27 @@ class DutyRecoveryUpdate(BaseModel):
     bot_url: str | None = None
 
 
+def _normalize_bot_url(value: str | None) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    match = re.fullmatch(
+        r"(?:(?:https?://)?(?:www\.)?t\.me/)?@?([A-Za-z0-9_]{1,32})",
+        value,
+        re.I,
+    )
+    if not match:
+        raise HTTPException(status_code=400, detail="Bot 地址请填写 Telegram 用户名")
+    return f"https://t.me/{match.group(1)}"
+
+
 @router.patch("/duty-recovery/{job_id}")
 async def update_duty_recovery(job_id: int, body: DutyRecoveryUpdate) -> dict:
     pool = db.get_pool()
     if pool is None:
         raise HTTPException(status_code=503, detail="database unavailable")
-    links = [value.strip() if value else None for value in (body.profile_url, body.channel_url, body.bot_url)]
+    bot_url = _normalize_bot_url(body.bot_url) or None
+    links = [value.strip() if value else None for value in (body.profile_url, body.channel_url, bot_url)]
     for value in links:
         if value and not re.fullmatch(r"https?://t\.me/[A-Za-z0-9_]+(?:/\d+)?(?:\?[^\s]*)?", value, re.I):
             raise HTTPException(status_code=400, detail="links must be Telegram t.me URLs")
@@ -436,8 +563,8 @@ async def create_manual_duty_card(job_id: int, body: ManualDutyListing) -> dict:
         media.append(_save_uploaded_photo(body.image_data, body.image_mime))
 
     source_url = body.source_url.strip()
-    bot_url = body.bot_url.strip() or recovery["bot_url"] or ""
-    for label, value in (("source_url", source_url), ("bot_url", bot_url)):
+    bot_url = _normalize_bot_url(body.bot_url) or recovery["bot_url"] or ""
+    for label, value in (("source_url", source_url),):
         if value and not re.fullmatch(r"https?://t\.me/[A-Za-z0-9_]+(?:/\d+)?(?:\?[^\s]*)?", value, re.I):
             raise HTTPException(status_code=400, detail=f"{label} must be a Telegram link")
     evidence = {
@@ -450,7 +577,7 @@ async def create_manual_duty_card(job_id: int, body: ManualDutyListing) -> dict:
     rows = await pool.fetch(
         SQL_DUTY_MANUAL_LISTING, body.contact_peer_id or recovery["contact_peer_id"], recovery["contact_username"],
         body.nickname, body.district, body.price_amount, body.price_currency,
-        body.description, json.dumps(media), json.dumps(evidence), job_id,
+        body.description, json.dumps(media), json.dumps(evidence), bot_url, job_id,
     )
     return {"id": rows[0]["id"], "status": "pending"}
 
@@ -499,13 +626,21 @@ async def edit_content(
         async with conn.transaction():
             row = await conn.fetchrow(
                 "SELECT id, source_msg_id, nickname, district, price_amount, "
-                "price_currency, description, media_json, manual_fields FROM listings "
+                "price_currency, description, bot_url, custom_fields, media_json, manual_fields FROM listings "
                 "WHERE id=$1 FOR UPDATE",
                 listing_id,
             )
             if row is None:
                 raise HTTPException(status_code=404, detail="listing not found")
             old_media = _decode(row["media_json"], [])
+            bot_url = _normalize_bot_url(body.bot_url) if body.bot_url is not None else row["bot_url"]
+            custom_fields = body.custom_fields if body.custom_fields is not None else _decode(row["custom_fields"], {})
+            allowed_fields = await conn.fetch(
+                "SELECT field_key FROM listing_field_definitions WHERE is_active"
+            )
+            allowed_keys = {item["field_key"] for item in allowed_fields}
+            if set(custom_fields) - allowed_keys:
+                raise HTTPException(status_code=422, detail="卡片包含未定义的自定义字段")
             old_by_path = {entry.get("path"): entry for entry in old_media}
             paths = [entry.get("path") for entry in body.media if entry.get("path")]
             if len(set(paths)) != len(paths) or any(path not in old_by_path for path in paths):
@@ -541,12 +676,16 @@ async def edit_content(
                 for key in ("nickname", "district", "price_amount", "price_currency", "description")
             }
             before["media"] = old_media
+            before["bot_url"] = row["bot_url"]
+            before["custom_fields"] = _decode(row["custom_fields"], {})
             after = {
                 "nickname": body.nickname,
                 "district": body.district,
                 "price_amount": body.price_amount,
                 "price_currency": body.price_currency,
                 "description": body.description,
+                "bot_url": bot_url,
+                "custom_fields": custom_fields,
                 "media": updated_media,
             }
             manual_fields = _decode(row["manual_fields"], {})
@@ -560,6 +699,10 @@ async def edit_content(
             for field, value in edited_values.items():
                 if value != row[field]:
                     manual_fields[field] = True
+            if bot_url != row["bot_url"]:
+                manual_fields["bot_url"] = True
+            if custom_fields != _decode(row["custom_fields"], {}):
+                manual_fields["custom_fields"] = True
             if body.manual_order or any(entry.get("visibility_override") for entry in updated_media):
                 manual_fields["media"] = True
             else:
@@ -567,11 +710,11 @@ async def edit_content(
             encoded = json.dumps(updated_media, ensure_ascii=False)
             await conn.execute(
                 "UPDATE listings SET nickname=$2, district=$3, price_amount=$4, "
-                "price_currency=$5, description=$6, media_json=$7::jsonb, "
-                "manual_fields=$8::jsonb, updated_at=NOW() WHERE id=$1",
+                "price_currency=$5, description=$6, bot_url=$7, custom_fields=$8::jsonb, "
+                "media_json=$9::jsonb, manual_fields=$10::jsonb, updated_at=NOW() WHERE id=$1",
                 listing_id, body.nickname.strip(), body.district.strip(),
                 body.price_amount, body.price_currency.strip(), body.description,
-                encoded, json.dumps(manual_fields),
+                bot_url, json.dumps(custom_fields, ensure_ascii=False), encoded, json.dumps(manual_fields),
             )
             if row["source_msg_id"] is not None:
                 await conn.execute(
@@ -649,6 +792,44 @@ async def publish(listing_id: int) -> dict:
     pool = db.get_pool()
     if pool is None:
         raise HTTPException(status_code=503, detail="database unavailable")
+    listing = await pool.fetchrow(
+        "SELECT nickname,price_amount,description,contact_username,bot_url,media_json,custom_fields, "
+        "listing_meets_publish_requirements(nickname,price_amount,description,contact_username, "
+        "bot_url,media_json,custom_fields) AS ready "
+        "FROM listings WHERE id=$1",
+        listing_id,
+    )
+    if listing is None:
+        raise HTTPException(status_code=404, detail="listing not found")
+    media = _decode(listing["media_json"], [])
+    countable = [
+        item for item in media
+        if item.get("kind") in {"photo", "video"}
+        and (item.get("path") or item.get("poster"))
+        and item.get("visibility", "public") == "public"
+        and item.get("ocr_classification") not in {"info_card", "uncertain"}
+        and item.get("ocr_review_status", "not_required") != "pending"
+    ]
+    missing = [
+        label for label, value in (
+            ("昵称", listing["nickname"]), ("价格", listing["price_amount"]),
+            ("介绍", listing["description"]), ("TG号", listing["contact_username"]),
+        ) if value is None or (isinstance(value, str) and not value.strip())
+    ]
+    if len(countable) < 3:
+        missing.append(f"至少3个有效照片/视频（当前{len(countable)}个）")
+    custom_fields = _decode(listing["custom_fields"], {})
+    required_fields = await pool.fetch(
+        "SELECT field_key,label FROM listing_field_definitions "
+        "WHERE is_active AND required_for_publish ORDER BY field_key"
+    )
+    missing.extend(
+        row["label"] for row in required_fields
+        if not str(custom_fields.get(row["field_key"]) or "").strip()
+    )
+    if missing or not listing["ready"]:
+        detail = "、".join(missing) or "卡片完整度未通过"
+        raise HTTPException(status_code=409, detail="上架条件未满足：" + detail)
     rows = await pool.fetch(SQL_PUBLISH, listing_id)
     if not rows[0]["ok"]:
         raise HTTPException(status_code=409, detail="cannot publish (archived?)")

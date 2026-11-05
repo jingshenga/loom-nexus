@@ -1,5 +1,6 @@
 """Local OCR triage for image-based listing cards."""
 import logging
+import json
 import re
 import unicodedata
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 from PIL import Image
 
 from app import sqlres
+from app.extractor import ast_rules
 from app.extractor.image_classifier import predict
 
 logger = logging.getLogger("nexus-core.media-ocr")
@@ -18,6 +20,7 @@ SQL_MEDIA_FLAGS = sqlres.load("media_ocr_set_flags.sql")
 SQL_RESET = sqlres.load("media_ocr_reset_processing.sql")
 SQL_PROFILE_DISCOVER = sqlres.load("profile_collection_ocr_discover.sql")
 SQL_PROFILE_FLAGS = sqlres.load("profile_collection_ocr_flags.sql")
+SQL_ENQUEUE_RAW = sqlres.load("media_ocr_enqueue_raw.sql")
 
 ENGINE_VERSION = "rapidocr-local-v1"
 _DECORATIVE = re.compile(
@@ -263,6 +266,42 @@ class MediaOcrProcessor:
         self._media_dir = Path(media_dir).resolve()
         self._ocr = ocr_worker
 
+    async def read_raw_texts(self, raw_id: int, media_paths: list[str]) -> tuple[list[str], bool]:
+        """Reuse the persisted OCR result, or claim and process the same queue row."""
+        texts = []
+        pending = False
+        for media_path in dict.fromkeys(media_paths):
+            await self._pool.execute(SQL_ENQUEUE_RAW, raw_id, media_path)
+            row = await self._pool.fetchrow(
+                "SELECT id,status,raw_text FROM listing_media_ocr "
+                "WHERE raw_id=$1 AND media_path=$2",
+                raw_id, media_path,
+            )
+            if row is None:
+                continue
+            if row["status"] != "done":
+                claimed = await self._pool.fetchval(
+                    "UPDATE listing_media_ocr SET status='processing', attempts=attempts+1, "
+                    "updated_at=NOW() WHERE id=$1 AND status='pending' RETURNING id",
+                    row["id"],
+                )
+                if claimed:
+                    task = await self._pool.fetchrow(
+                        "SELECT id,raw_id,listing_id,profile_result_id,media_path "
+                        "FROM listing_media_ocr WHERE id=$1",
+                        row["id"],
+                    )
+                    await self._process(task)
+                    row = await self._pool.fetchrow(
+                        "SELECT status,raw_text FROM listing_media_ocr WHERE id=$1",
+                        row["id"],
+                    )
+            if row and row["status"] == "done" and row["raw_text"]:
+                texts.append(row["raw_text"])
+            elif row and row["status"] in {"pending", "processing"}:
+                pending = True
+        return texts, pending
+
     async def run(self, stop) -> None:
         import asyncio
 
@@ -343,10 +382,12 @@ class MediaOcrProcessor:
                     probabilities = {}
                     review_status = "pending" if classification in ("info_card", "uncertain") else "not_required"
                     visibility = "admin" if review_status == "pending" else "public"
+                profile_fields, profile_evidence = extract_card_fields(lines)
+                profile_evidence["class_probabilities"] = probabilities
                 await self._finish(
                     row, "done", classification, review_status, visibility,
-                    profile_text, normalize_ocr_text(profile_text), {},
-                    {"class_probabilities": probabilities}, confidence, None,
+                    profile_text, normalize_ocr_text(profile_text), profile_fields,
+                    profile_evidence, confidence, None,
                     version_id, signals,
                 )
                 return
@@ -453,5 +494,142 @@ class MediaOcrProcessor:
                 SQL_PROFILE_FLAGS, row["profile_result_id"], row["media_path"],
                 status, classification, review_status, raw_text, confidence,
             )
+            await self._sync_profile_listing(row["profile_result_id"])
         else:
             await self._pool.fetch(SQL_MEDIA_FLAGS, row["raw_id"], row["media_path"], visibility, status, classification)
+
+    async def _sync_profile_listing(self, profile_result_id: int) -> None:
+        result = await self._pool.fetchrow(
+            "SELECT r.description AS source_description,r.evidence_json,r.media_json,"
+            "j.source_id,l.id AS listing_id,l.nickname,l.price_amount,l.price_currency,"
+            "l.description,l.contact_username,l.bot_url,l.custom_fields,l.manual_fields,"
+            "l.evidence_json AS listing_evidence,l.status "
+            "FROM profile_collection_results r "
+            "JOIN profile_collection_jobs j ON j.id=r.job_id "
+            "JOIN listings l ON l.profile_collection_job_id=j.id "
+            "WHERE r.id=$1",
+            profile_result_id,
+        )
+        if result is None:
+            return
+        ocr_rows = await self._pool.fetch(
+            "SELECT status,COALESCE(human_classification,classification) AS classification,"
+            "raw_text,fields_json FROM listing_media_ocr WHERE profile_result_id=$1",
+            profile_result_id,
+        )
+        if any(row["status"] in {"pending", "processing"} for row in ocr_rows):
+            return
+
+        source_text = result["source_description"] or ""
+        ocr_text = "\n".join(row["raw_text"] for row in ocr_rows if row["raw_text"])
+        intro_text = "\n".join(
+            row["raw_text"] for row in ocr_rows
+            if row["raw_text"] and row["classification"] == "info_card"
+        )
+        intro_marker = "图片识别内容：" + intro_text.strip()
+        description = source_text.strip()
+        if intro_text and intro_marker not in description:
+            description = "\n\n".join(part for part in (description, intro_marker) if part)
+
+        listing_rule = await self._pool.fetchrow(
+            "SELECT r.config_json FROM source_rule_bindings b "
+            "JOIN ingest_rules r ON r.id=b.rule_id AND r.rule_type='listing' AND r.is_active "
+            "WHERE b.source_id=$1 ORDER BY b.priority DESC,r.id LIMIT 1",
+            result["source_id"],
+        )
+        rule = listing_rule["config_json"] if listing_rule else {}
+        if isinstance(rule, str):
+            rule = json.loads(rule)
+        text_fields, _ = ast_rules.extract_fields(rule, source_text, src="telegram")
+        image_fields, _ = ast_rules.extract_fields(rule, ocr_text, src="ocr")
+        image_field_rows = [
+            row["fields_json"] if isinstance(row["fields_json"], dict)
+            else json.loads(row["fields_json"] or "{}") for row in ocr_rows
+        ]
+        if not image_fields:
+            stage_name = next((item.get("stage_name") for item in image_field_rows if item.get("stage_name")), None)
+            if stage_name:
+                image_fields["nickname"] = stage_name
+
+        field_definitions = await self._pool.fetch(
+            "SELECT field_key,aliases,extraction_source,required_for_publish "
+            "FROM listing_field_definitions WHERE is_active"
+        )
+        from app.extractor.pipeline import extract_custom_fields
+
+        custom_fields = _decode_json(result["custom_fields"], {})
+        telegram_custom = extract_custom_fields(
+            source_text, [row for row in field_definitions if row["extraction_source"] == "telegram"],
+        )
+        ocr_custom = extract_custom_fields(
+            ocr_text, [row for row in field_definitions if row["extraction_source"] == "ocr"],
+        )
+        custom_updates = {}
+        if not _decode_json(result["manual_fields"], {}).get("custom_fields"):
+            for values in (telegram_custom, ocr_custom):
+                for key, value in values.items():
+                    if not str(custom_fields.get(key) or "").strip():
+                        custom_fields[key] = value
+                        custom_updates[key] = value
+
+        manual = _decode_json(result["manual_fields"], {})
+        nickname = result["nickname"]
+        if not manual.get("nickname") and not str(nickname or "").strip():
+            nickname = text_fields.get("nickname") or image_fields.get("nickname")
+        price_amount = result["price_amount"]
+        if not manual.get("price_amount") and price_amount is None:
+            price_amount = text_fields.get("price_amount") or image_fields.get("price_amount")
+        price_currency = result["price_currency"] or "CNY"
+        if not manual.get("price_currency"):
+            price_currency = text_fields.get("price_currency") or image_fields.get("price_currency") or price_currency
+        if manual.get("description"):
+            description = result["description"] or ""
+
+        ocr_filled = bool(
+            (not result["nickname"] and image_fields.get("nickname"))
+            or (result["price_amount"] is None and image_fields.get("price_amount") is not None)
+            or (not result["description"] and intro_text)
+            or any(
+                definition["required_for_publish"]
+                and definition["field_key"] in custom_updates
+                for definition in field_definitions
+            )
+        )
+        listing_evidence = _decode_json(result["listing_evidence"], {})
+        if ocr_filled:
+            listing_evidence["ocr_filled_fields"] = {
+                "src": "ocr", "fields": image_fields,
+                "custom_fields": {key: value for key, value in ocr_custom.items() if key in custom_updates},
+            }
+        ready = await self._pool.fetchval(
+            "SELECT listing_meets_publish_requirements($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb)",
+            nickname or "", price_amount, description, result["contact_username"],
+            result["bot_url"] or "", result["media_json"],
+            json.dumps(custom_fields, ensure_ascii=False),
+        )
+        ready = bool(ready) and not ocr_filled
+        next_status = result["status"]
+        if next_status in {"pending", "published"}:
+            if ready:
+                next_status = "published"
+            elif result["status"] == "published":
+                next_status = "pending"
+        await self._pool.execute(
+            "UPDATE listings SET nickname=$2,price_amount=$3,price_currency=$4,description=$5,"
+            "custom_fields=$6::jsonb,evidence_json=$7::jsonb,"
+            "media_json=CASE WHEN manual_fields ? 'media' THEN media_json ELSE $8::jsonb END,"
+            "status=$9,published_at=CASE WHEN $9='published' THEN COALESCE(published_at,NOW()) "
+            "WHEN status='published' THEN NULL ELSE published_at END,updated_at=NOW() WHERE id=$1",
+            result["listing_id"], nickname, price_amount, price_currency, description,
+            json.dumps(custom_fields, ensure_ascii=False),
+            json.dumps(listing_evidence, ensure_ascii=False), result["media_json"], next_status,
+        )
+
+
+def _decode_json(value, fallback):
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(value) if value is not None else fallback
+    except (TypeError, ValueError):
+        return fallback

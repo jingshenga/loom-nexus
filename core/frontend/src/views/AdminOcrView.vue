@@ -48,6 +48,13 @@ function categoryName(code) {
   }[code] || code || "未分类");
 }
 
+function predictionCategoryName(item) {
+  const version = versions.value.find((entry) => entry.id === item.classifier_version_id);
+  const code = item.predicted_classification || item.classification;
+  if (version?.policy?.classification_mode === "card_binary" && code === "other") return "非资料卡";
+  return categoryName(code);
+}
+
 function confidenceText(item) {
   return item.confidence !== null && item.confidence !== undefined && Number.isFinite(Number(item.confidence))
     ? `${Math.round(Number(item.confidence) * 100)}%` : "";
@@ -360,7 +367,7 @@ async function reclassifySelected() {
         <button @click="select(item)" class="block w-full text-left">
           <div class="relative aspect-[3/4] overflow-hidden bg-black">
             <img :src="mediaUrl(item.media_path)" class="h-full w-full object-contain" :alt="item.nickname || 'OCR 图片'" loading="lazy" />
-            <span class="absolute right-1 top-1 max-w-[75%] truncate rounded bg-black/75 px-1.5 py-1 text-[10px] font-medium text-white">{{ categoryName(item.predicted_classification || item.classification) }}</span>
+            <span class="absolute right-1 top-1 max-w-[75%] truncate rounded bg-black/75 px-1.5 py-1 text-[10px] font-medium text-white">{{ predictionCategoryName(item) }}</span>
             <span v-if="confidenceText(item)" class="absolute bottom-1 right-1 rounded bg-emerald-600/90 px-2 py-1 text-xs font-semibold text-white shadow" :title="item.confidence_source === 'model' ? `模型置信度 · V${item.classifier_version_id}` : '旧规则估值，尚未由训练模型校准'">{{ confidenceText(item) }}</span>
           </div>
           <div class="space-y-1 p-2">
