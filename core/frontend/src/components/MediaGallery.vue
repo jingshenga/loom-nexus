@@ -136,7 +136,7 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
         class="relative size-16 shrink-0 overflow-hidden rounded-lg border transition"
         :class="i === active ? 'border-sky-400' : 'border-slate-800 opacity-60 hover:opacity-100'"
       >
-        <img v-if="m.kind === 'photo' || m.poster" :src="mediaUrl(m.kind === 'photo' ? m.path : m.poster)" class="size-full object-cover" loading="lazy" />
+        <img v-if="m.kind === 'photo' || m.poster" :src="mediaUrl(m.kind === 'photo' ? m.path : m.poster, { thumbnail: true })" class="size-full object-cover" loading="lazy" />
         <div v-else class="flex size-full items-center justify-center bg-slate-900 text-slate-400">
           <Clapperboard class="size-5" />
         </div>

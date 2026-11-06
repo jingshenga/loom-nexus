@@ -23,6 +23,7 @@ router = APIRouter(
 )
 
 SQL_QUEUE = sqlres.load("review_queue.sql")
+SQL_REVIEW_DETAIL = sqlres.load("review_detail.sql")
 SQL_DUPLICATE_CANDIDATES = sqlres.load("duplicate_candidates.sql")
 SQL_PUBLISH = sqlres.load("publish.sql")
 SQL_REJECT = sqlres.load("reject.sql")
@@ -52,6 +53,17 @@ def _decode(value, fallback):
         return json.loads(value)
     except (TypeError, ValueError):
         return fallback
+
+
+def _publishable_media_count(media: list) -> int:
+    return sum(
+        1 for item in media
+        if item.get("kind") in {"photo", "video"}
+        and (item.get("path") or item.get("poster"))
+        and item.get("visibility", "public") == "public"
+        and item.get("ocr_classification") not in {"info_card", "uncertain"}
+        and item.get("ocr_review_status", "not_required") != "pending"
+    )
 
 
 def _save_uploaded_photo(image_data: str, image_mime: str) -> dict:
@@ -107,6 +119,10 @@ async def queue(
     )
     items = []
     for r in rows:
+        media = _decode(r["media_json"], [])
+        cover = next((entry for entry in media if entry.get("kind") == "photo"), None)
+        if cover is None:
+            cover = next((entry for entry in media if entry.get("kind") == "video" and entry.get("poster")), None)
         items.append({
             "id": r["id"],
             "nickname": r["nickname"],
@@ -115,7 +131,8 @@ async def queue(
             "price_currency": r["price_currency"],
             "description": r["description"],
             "custom_fields": _decode(r["custom_fields"], {}),
-            "media": _decode(r["media_json"], []),
+            "media": [cover] if cover else [],
+            "media_count": len(media),
             "evidence": _decode(r["evidence_json"], {}),
             "confidence": float(r["confidence"]) if r["confidence"] is not None else None,
             "status": r["status"],
@@ -128,6 +145,31 @@ async def queue(
             "source_posted_at": r["raw_posted_at"].isoformat() if r["raw_posted_at"] else None,
         })
     return {"items": items}
+
+
+@router.get("/queue/{listing_id}")
+async def review_detail(listing_id: int) -> dict:
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    row = await pool.fetchrow(SQL_REVIEW_DETAIL, listing_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="review card not found")
+    return {
+        "id": row["id"], "nickname": row["nickname"], "district": row["district"],
+        "price_amount": float(row["price_amount"]) if row["price_amount"] is not None else None,
+        "price_currency": row["price_currency"], "description": row["description"],
+        "custom_fields": _decode(row["custom_fields"], {}),
+        "media": _decode(row["media_json"], []),
+        "effective_media_count": _publishable_media_count(_decode(row["media_json"], [])),
+        "evidence": _decode(row["evidence_json"], {}),
+        "confidence": float(row["confidence"]) if row["confidence"] is not None else None,
+        "status": row["status"], "contact_peer_id": row["contact_peer_id"],
+        "contact_username": row["contact_username"], "bot_url": row["bot_url"],
+        "created_at": row["created_at"].isoformat(), "source_text": row["raw_text"],
+        "source_title": row["source_title"],
+        "source_posted_at": row["raw_posted_at"].isoformat() if row["raw_posted_at"] else None,
+    }
 
 
 @router.get("/duplicates")
@@ -164,7 +206,8 @@ async def duplicate_candidates() -> dict:
 
 
 class DuplicateDecision(BaseModel):
-    decision: Literal["keep_latest", "keep_both"]
+    decision: Literal["keep_latest", "keep_selected", "merge_selected", "keep_both"]
+    keep_listing_id: int | None = None
 
 
 @router.post("/duplicates/{first_id}/{second_id}")
@@ -175,6 +218,10 @@ async def decide_duplicate(
     """Record an admin decision; retaining the latest archives the older card."""
     if first_id == second_id:
         raise HTTPException(status_code=400, detail="two different cards are required")
+    if body.decision in {"keep_selected", "merge_selected"} and body.keep_listing_id not in {first_id, second_id}:
+        raise HTTPException(status_code=400, detail="selected card must belong to this duplicate pair")
+    if body.decision not in {"keep_selected", "merge_selected"} and body.keep_listing_id is not None:
+        raise HTTPException(status_code=400, detail="keep_listing_id is only valid for a selected-card decision")
     left_id, right_id = sorted((first_id, second_id))
     pool = db.get_pool()
     if pool is None:
@@ -185,7 +232,8 @@ async def decide_duplicate(
             rows = await conn.fetch(
                 "SELECT l.id, l.status, l.created_at, l.nickname, l.district, "
                 "l.price_amount, l.price_currency, l.contact_peer_id, l.profile_collection_job_id, "
-                "l.contact_username, l.source_msg_id, "
+                "l.contact_username, l.source_msg_id, l.bot_url, l.description, l.custom_fields, "
+                "l.media_json, l.manual_fields, "
                 "COALESCE(NULLIF(rm.raw_text, ''), l.description, '') AS source_text "
                 "FROM listings l LEFT JOIN raw_messages rm ON rm.id=l.source_msg_id "
                 "WHERE l.id = ANY($1::bigint[]) ORDER BY l.id FOR UPDATE OF l",
@@ -205,9 +253,8 @@ async def decide_duplicate(
                 first["contact_peer_id"] is not None
                 and first["contact_peer_id"] == second["contact_peer_id"]
             ) or (
-                (first["contact_peer_id"] is None or second["contact_peer_id"] is None)
-                and (first["contact_username"] or "").casefold()
-                    == (second["contact_username"] or "").casefold()
+                bool(first["contact_username"] and second["contact_username"])
+                and first["contact_username"].casefold() == second["contact_username"].casefold()
             )
             same_profile = (
                 first["nickname"] is not None
@@ -238,10 +285,107 @@ async def decide_duplicate(
             if not (same_identity or same_nickname or same_profile):
                 raise HTTPException(status_code=409, detail="cards are not a current duplicate candidate")
 
+            merge_info = {"fields_filled": [], "conflicts": [], "media_added": 0}
+            if body.decision == "merge_selected":
+                target_id = body.keep_listing_id
+                source_id = second_id if target_id == first_id else first_id
+                target = next(row for row in rows if row["id"] == target_id)
+                source = next(row for row in rows if row["id"] == source_id)
+                if target["status"] == "archived":
+                    raise HTTPException(status_code=409, detail="an archived card cannot be the merge target")
+
+                scalar_fields = (
+                    ("contact_peer_id", "TG 数字 ID"), ("contact_username", "TG号"),
+                    ("nickname", "昵称"), ("district", "区域"),
+                    ("price_amount", "价格"), ("price_currency", "价格币种"),
+                    ("description", "介绍"), ("bot_url", "Bot地址"),
+                )
+                updates = {}
+                manual_fields = _decode(target["manual_fields"], {})
+                for field, label in scalar_fields:
+                    target_value, source_value = target[field], source[field]
+                    target_empty = target_value is None or (isinstance(target_value, str) and not target_value.strip())
+                    source_empty = source_value is None or (isinstance(source_value, str) and not source_value.strip())
+                    if target_empty and not source_empty:
+                        updates[field] = source_value
+                        manual_fields[field] = True
+                        merge_info["fields_filled"].append(label)
+                    elif not target_empty and not source_empty and target_value != source_value:
+                        # A default CNY value should not block a missing price from its source card.
+                        if field == "price_currency" and target["price_amount"] is None and source["price_amount"] is not None:
+                            updates[field] = source_value
+                            manual_fields[field] = True
+                            if label not in merge_info["fields_filled"]:
+                                merge_info["fields_filled"].append(label)
+                        else:
+                            merge_info["conflicts"].append(label)
+
+                target_custom = _decode(target["custom_fields"], {})
+                source_custom = _decode(source["custom_fields"], {})
+                merged_custom = dict(target_custom)
+                for key, source_value in source_custom.items():
+                    target_value = target_custom.get(key)
+                    target_empty = target_value is None or (isinstance(target_value, str) and not target_value.strip())
+                    source_empty = source_value is None or (isinstance(source_value, str) and not source_value.strip())
+                    if target_empty and not source_empty:
+                        merged_custom[key] = source_value
+                        merge_info["fields_filled"].append(f"自定义字段：{key}")
+                    elif not target_empty and not source_empty and target_value != source_value:
+                        merge_info["conflicts"].append(f"自定义字段：{key}")
+                if merged_custom != target_custom:
+                    updates["custom_fields"] = json.dumps(merged_custom, ensure_ascii=False)
+                    manual_fields["custom_fields"] = True
+
+                target_media = _decode(target["media_json"], [])
+                source_media = _decode(source["media_json"], [])
+
+                def media_key(item):
+                    for key in ("file_unique_id", "file_id", "path"):
+                        value = item.get(key)
+                        if value:
+                            return (key, str(value))
+                    return ("json", json.dumps(item, sort_keys=True, ensure_ascii=False))
+
+                existing_media = {media_key(item) for item in target_media}
+                merged_media = list(target_media)
+                for item in source_media:
+                    key = media_key(item)
+                    if key in existing_media:
+                        continue
+                    imported = dict(item)
+                    imported.pop("manual_order", None)
+                    merged_media.append(imported)
+                    existing_media.add(key)
+                    merge_info["media_added"] += 1
+                if merge_info["media_added"]:
+                    updates["media_json"] = json.dumps(merged_media, ensure_ascii=False)
+                    manual_fields["media"] = True
+
+                if manual_fields != _decode(target["manual_fields"], {}):
+                    updates["manual_fields"] = json.dumps(manual_fields, ensure_ascii=False)
+                if updates:
+                    assignments = []
+                    values = [target_id]
+                    for field, value in updates.items():
+                        values.append(value)
+                        cast = "::jsonb" if field in {"custom_fields", "media_json", "manual_fields"} else ""
+                        assignments.append(f"{field}=${len(values)}{cast}")
+                    await conn.execute(
+                        f"UPDATE listings SET {', '.join(assignments)}, updated_at=NOW() WHERE id=$1",
+                        *values,
+                    )
+                if target["status"] == "duplicate_pending":
+                    await conn.execute(
+                        "UPDATE listings SET status='pending', updated_at=NOW() WHERE id=$1",
+                        target_id,
+                    )
+
             latest = max(rows, key=lambda row: (row["created_at"], row["id"]))
             archived_id = None
-            if body.decision == "keep_latest":
-                archived_id = next(row["id"] for row in rows if row["id"] != latest["id"])
+            kept_id = latest["id"] if body.decision == "keep_latest" else body.keep_listing_id
+            if body.decision in {"keep_latest", "keep_selected", "merge_selected"}:
+                kept_id = kept_id or latest["id"]
+                archived_id = next(row["id"] for row in rows if row["id"] != kept_id)
                 await conn.execute(
                     "UPDATE listings SET status='archived', updated_at=NOW() "
                     "WHERE id=$1 AND status IN ('published', 'pending', 'duplicate_pending')",
@@ -250,7 +394,7 @@ async def decide_duplicate(
                 await conn.execute(
                     "UPDATE listings SET status='pending', updated_at=NOW() "
                     "WHERE id=$1 AND status='duplicate_pending'",
-                    latest["id"],
+                    kept_id,
                 )
             else:
                 await conn.execute(
@@ -260,15 +404,17 @@ async def decide_duplicate(
                 )
             await conn.execute(
                 "INSERT INTO listing_duplicate_decisions "
-                "(left_listing_id, right_listing_id, decision, decided_by) "
-                "VALUES ($1, $2, $3, $4) "
+                "(left_listing_id, right_listing_id, decision, decided_by, kept_listing_id) "
+                "VALUES ($1, $2, $3, $4, $5) "
                 "ON CONFLICT (left_listing_id, right_listing_id) DO UPDATE SET "
                 "decision=EXCLUDED.decision, decided_by=EXCLUDED.decided_by, "
-                "decided_at=NOW()",
+                "kept_listing_id=EXCLUDED.kept_listing_id, decided_at=NOW()",
                 left_id, right_id, body.decision, current_user_id(authorization),
+                kept_id if body.decision in {"keep_latest", "keep_selected", "merge_selected"} else None,
             )
     return {"ok": True, "decision": body.decision,
-            "preferred_id": latest["id"], "archived_id": archived_id}
+            "preferred_id": kept_id if body.decision != "keep_both" else None,
+            "archived_id": archived_id, **merge_info}
 
 
 @router.get("/history/sources")
@@ -802,22 +948,15 @@ async def publish(listing_id: int) -> dict:
     if listing is None:
         raise HTTPException(status_code=404, detail="listing not found")
     media = _decode(listing["media_json"], [])
-    countable = [
-        item for item in media
-        if item.get("kind") in {"photo", "video"}
-        and (item.get("path") or item.get("poster"))
-        and item.get("visibility", "public") == "public"
-        and item.get("ocr_classification") not in {"info_card", "uncertain"}
-        and item.get("ocr_review_status", "not_required") != "pending"
-    ]
+    effective_media_count = _publishable_media_count(media)
     missing = [
         label for label, value in (
             ("昵称", listing["nickname"]), ("价格", listing["price_amount"]),
             ("介绍", listing["description"]), ("TG号", listing["contact_username"]),
         ) if value is None or (isinstance(value, str) and not value.strip())
     ]
-    if len(countable) < 3:
-        missing.append(f"至少3个有效照片/视频（当前{len(countable)}个）")
+    if effective_media_count < 3:
+        missing.append(f"至少3个有效照片/视频（当前{effective_media_count}个）")
     custom_fields = _decode(listing["custom_fields"], {})
     required_fields = await pool.fetch(
         "SELECT field_key,label FROM listing_field_definitions "

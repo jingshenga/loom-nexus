@@ -44,6 +44,7 @@ const recoveryForm = ref({ contact_peer_id: "", profile_url: "", channel_url: ""
 const manualForm = ref({ nickname: "", district: "", price_amount: "", price_currency: "CNY", description: "", source_url: "", media: [] });
 let timer = null;
 let recollectTimer = null;
+let flashTimer = null;
 let recollectJobIds = [];
 let pollingRecollect = false;
 const RECOLLECT_STORAGE_KEY = "nexus-admin-recollect-jobs";
@@ -109,18 +110,19 @@ async function deleteCurrent() {
   await removeCards([current.value.id]);
 }
 
-function select(item) {
-  current.value = item;
-  mediaManualOrder.value = (item.media || []).some((media) => Number.isInteger(media.manual_order));
+async function select(item) {
+  const detail = await api(`/api/admin/review/queue/${item.id}`);
+  current.value = detail;
+  mediaManualOrder.value = (detail.media || []).some((media) => Number.isInteger(media.manual_order));
   form.value = {
-    nickname: item.nickname || "",
-    district: item.district || "",
-    price_amount: item.price_amount,
-    price_currency: item.price_currency || "",
-    description: item.description || "",
-    bot_url: item.bot_url || "",
-    custom_fields: JSON.parse(JSON.stringify(item.custom_fields || {})),
-    media: JSON.parse(JSON.stringify(item.media || [])),
+    nickname: detail.nickname || "",
+    district: detail.district || "",
+    price_amount: detail.price_amount,
+    price_currency: detail.price_currency || "",
+    description: detail.description || "",
+    bot_url: detail.bot_url || "",
+    custom_fields: JSON.parse(JSON.stringify(detail.custom_fields || {})),
+    media: JSON.parse(JSON.stringify(detail.media || [])),
   };
 }
 
@@ -232,20 +234,33 @@ function newestCard(pair) {
     new Date(b.collected_at) - new Date(a.collected_at) || b.id - a.id)[0];
 }
 
-async function decideDuplicate(decision) {
+async function decideDuplicate(decision, keepListingId = null) {
   const pair = selectedDuplicate.value;
   if (!pair || duplicateSaving.value) return;
   const ids = [pair.left.id, pair.right.id].sort((a, b) => a - b);
+  if (decision === "merge_selected") {
+    const sourceId = keepListingId === pair.left.id ? pair.right.id : pair.left.id;
+    const confirmed = window.confirm(
+      `将卡片 #${sourceId} 合并到 #${keepListingId}。只补齐目标卡片的空字段，冲突字段不覆盖；重复媒体会跳过。来源卡片会归档保留，不删除。继续吗？`,
+    );
+    if (!confirmed) return;
+  }
   duplicateSaving.value = true;
   try {
-    await api(`/api/admin/review/duplicates/${ids[0]}/${ids[1]}`, {
+    const result = await api(`/api/admin/review/duplicates/${ids[0]}/${ids[1]}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ decision }),
+      body: JSON.stringify({ decision, keep_listing_id: keepListingId }),
     });
-    notify(decision === "keep_latest"
-      ? `已保留最新采集卡片 #${newestCard(pair).id}，较早卡片已归档`
-      : "已记录为不同账号，保留两张卡片");
+    if (decision === "merge_selected") {
+      const filled = (result.fields_filled || []).join("、");
+      const conflicts = (result.conflicts || []).join("、");
+      notify(`已合并到 #${keepListingId}，并入 ${result.media_added || 0} 个媒体${filled ? `；补齐：${filled}` : ""}${conflicts ? `；冲突未覆盖：${conflicts}，目标卡 #${keepListingId} 可继续编辑，来源卡 #${result.archived_id} 已归档保留` : `；来源卡 #${result.archived_id} 已归档保留`}`);
+    } else {
+      notify(decision === "keep_both"
+        ? "已记录为不同账号，保留两张卡片"
+        : `已保留卡片 #${keepListingId || newestCard(pair).id}，另一张已归档`);
+    }
     await loadDuplicatePairs();
     await loadQueue();
   } catch (e) {
@@ -456,7 +471,8 @@ async function botRecollectSelected() {
 
 function notify(msg) {
   flash.value = msg;
-  setTimeout(() => (flash.value = ""), 2500);
+  clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => (flash.value = ""), 3500);
 }
 
 async function saveEdits() {
@@ -536,7 +552,8 @@ onMounted(async () => {
     if (activeWorkbench.value === "duty") loadDutyRecovery();
     else if (activeWorkbench.value === "duplicates") loadDuplicatePairs();
     else if (["review", "checkin", "tgprofile"].includes(activeWorkbench.value)) loadQueue();
-  }, 15000);
+  }, 60000);
+  document.addEventListener("visibilitychange", onReviewVisibilityChange);
   try {
     recollectJobIds = JSON.parse(sessionStorage.getItem(RECOLLECT_STORAGE_KEY) || "[]");
     if (recollectJobIds.length) {
@@ -549,14 +566,26 @@ onMounted(async () => {
 });
 onUnmounted(() => {
   window.removeEventListener("keydown", onKey);
+  document.removeEventListener("visibilitychange", onReviewVisibilityChange);
   clearInterval(timer);
   clearInterval(recollectTimer);
+  clearTimeout(flashTimer);
 });
+
+function onReviewVisibilityChange() {
+  if (document.visibilityState !== "visible") return;
+  if (["review", "checkin", "tgprofile"].includes(activeWorkbench.value)) loadQueue();
+  else if (activeWorkbench.value === "duty") loadDutyRecovery();
+  else if (activeWorkbench.value === "duplicates") loadDuplicatePairs();
+}
 </script>
 
 <template>
   <div class="space-y-3">
   <AdminTabs />
+    <div v-if="flash" role="status" aria-live="polite" class="pointer-events-none fixed right-4 top-4 z-[100] max-w-[min(28rem,calc(100vw-2rem))] rounded-lg border border-emerald-700/60 bg-slate-950/95 px-4 py-3 text-sm text-emerald-200 shadow-xl backdrop-blur">
+      {{ flash }}
+    </div>
 
     <div class="flex gap-2">
       <button @click="setWorkbench('review')" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'review' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">审核队列</button>
@@ -728,7 +757,6 @@ onUnmounted(() => {
       <span v-if="recollectStatus" class="text-xs text-sky-300">{{ recollectStatus }}</span>
       <button @click="toggleFieldSettings" class="rounded-lg border border-slate-700 px-3 py-1 text-xs text-slate-300">自定义字段</button>
       <span class="text-xs text-slate-500">Ctrl+Enter 快捷发布</span>
-      <span v-if="flash" class="ml-auto rounded bg-emerald-600/20 px-3 py-1 text-xs text-emerald-300">{{ flash }}</span>
     </div>
 
     <section v-if="showFieldSettings" class="my-3 space-y-3 rounded-xl border border-slate-800 bg-slate-900 p-3">
@@ -749,7 +777,7 @@ onUnmounted(() => {
         <article v-for="item in queue" :key="item.id" class="relative min-w-0 overflow-hidden rounded-lg border border-slate-800 bg-slate-900 hover:border-slate-600">
           <button @click="select(item)" class="block w-full text-left">
             <div class="relative aspect-[3/4] bg-black">
-              <img v-if="item.media?.length" :src="mediaUrl(item.media.find((m) => m.kind === 'photo')?.path || item.media[0].poster || item.media[0].path)" class="size-full object-contain" loading="lazy" />
+              <img v-if="item.media?.length" :src="mediaUrl(item.media.find((m) => m.kind === 'photo')?.path || item.media[0].poster || item.media[0].path, { thumbnail: true })" class="size-full object-contain" loading="lazy" />
               <span v-else class="flex size-full items-center justify-center text-xs text-slate-600">无图片</span>
             </div>
             <div class="space-y-1 p-2">
@@ -776,6 +804,7 @@ onUnmounted(() => {
           <div class="text-right text-xs"><div class="text-sky-300">采集于 {{ new Date(current.created_at).toLocaleString('zh-CN') }}</div><div v-if="current.source_posted_at" class="mt-1 text-slate-500">原消息 {{ new Date(current.source_posted_at).toLocaleString('zh-CN') }}</div></div>
         </div>
         <div class="flex flex-wrap gap-2 text-sm text-slate-300"><span v-if="current.district" class="rounded bg-slate-800 px-2 py-1">{{ current.district }}</span><span class="rounded bg-slate-800 px-2 py-1">{{ current.price_amount ?? "价格待核" }} {{ current.price_currency || "" }}</span><span v-if="current.contact_peer_id" class="rounded bg-slate-800 px-2 py-1">TG ID {{ current.contact_peer_id }}</span></div>
+        <div class="flex flex-wrap gap-2 text-xs text-slate-400"><span class="rounded bg-slate-900 px-2 py-1">媒体 {{ current.media?.length || 0 }} 个 · 可计入上架 {{ current.effective_media_count || 0 }}/3</span><span v-if="(current.media || []).some(item => item.ocr_classification === 'uncertain')" class="rounded bg-amber-950/60 px-2 py-1 text-amber-200">含 AI 未确认媒体；未人工确认前不计入</span></div>
         <AdminMediaGrid v-model:media="form.media" editable @order-change="mediaManualOrder = true" />
         <details class="rounded-lg border border-slate-800 bg-slate-950/60 p-3"><summary class="cursor-pointer text-sm text-slate-300">查看原始消息</summary><p class="mt-3 whitespace-pre-wrap text-sm leading-relaxed text-slate-400">{{ current.source_text || "（无正文）" }}</p></details>
         <details class="rounded-lg border border-slate-800 bg-slate-950/60 p-3"><summary class="cursor-pointer text-sm text-slate-300">修订卡片字段</summary>
@@ -815,9 +844,20 @@ onUnmounted(() => {
             <details class="rounded border border-slate-800 p-2"><summary class="cursor-pointer text-xs text-slate-400">查看原始消息</summary><p class="mt-2 whitespace-pre-wrap text-xs leading-relaxed text-slate-500">{{ card.source_text || card.description || '（无正文）' }}</p></details>
           </article>
         </div>
-        <div class="sticky bottom-0 flex flex-col gap-2 border-t border-slate-800 bg-slate-950/95 py-3 backdrop-blur sm:flex-row">
-          <button @click="decideDuplicate('keep_latest')" :disabled="duplicateSaving" class="flex-1 rounded-lg bg-sky-600 px-3 py-2.5 text-sm font-medium hover:bg-sky-500 disabled:opacity-50">确认重复，保留最新并归档较早卡片</button>
-          <button @click="decideDuplicate('keep_both')" :disabled="duplicateSaving" class="flex-1 rounded-lg border border-slate-600 px-3 py-2.5 text-sm text-slate-200 hover:bg-slate-800 disabled:opacity-50">不同账号，保留两张</button>
+        <div class="sticky bottom-0 flex flex-col gap-2 border-t border-slate-800 bg-slate-950/95 py-3 backdrop-blur">
+          <div class="grid gap-2 sm:grid-cols-2">
+            <div v-for="card in [selectedDuplicate.left, selectedDuplicate.right]" :key="`actions-${card.id}`" class="grid gap-2">
+              <button @click="decideDuplicate('keep_selected', card.id)" :disabled="duplicateSaving"
+                class="rounded-lg bg-sky-700 px-3 py-2 text-sm font-medium hover:bg-sky-600 disabled:opacity-50">
+                仅保留 #{{ card.id }}，归档 #{{ card.id === selectedDuplicate.left.id ? selectedDuplicate.right.id : selectedDuplicate.left.id }}{{ card.id === newestCard(selectedDuplicate).id ? ' · 最新采集' : '' }}
+              </button>
+              <button @click="decideDuplicate('merge_selected', card.id)" :disabled="duplicateSaving"
+                class="rounded-lg border border-emerald-700 px-3 py-2 text-sm font-medium text-emerald-300 hover:bg-emerald-950/40 disabled:opacity-50">
+                合并到 #{{ card.id }}，归档另一张
+              </button>
+            </div>
+          </div>
+          <button @click="decideDuplicate('keep_both')" :disabled="duplicateSaving" class="rounded-lg border border-slate-600 px-3 py-2.5 text-sm text-slate-200 hover:bg-slate-800 disabled:opacity-50">不同账号，保留两张</button>
         </div>
       </section>
       <section v-else class="flex items-center justify-center rounded-xl border border-slate-800 text-slate-600 lg:col-span-8">选择一组疑似重复卡片</section>

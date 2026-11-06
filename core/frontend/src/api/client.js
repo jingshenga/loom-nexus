@@ -18,11 +18,12 @@ export async function api(path, options = {}) {
 
 // media files sit behind the login gate; <img> cannot send headers so
 // the bearer token rides along as a query parameter
-export function mediaUrl(path) {
+export function mediaUrl(path, { thumbnail = false } = {}) {
   if (!path) return "";
   const session = useSession();
-  const sep = path.includes("?") ? "&" : "?";
-  return session.token
-    ? `/media/${path}${sep}t=${encodeURIComponent(session.token)}`
-    : `/media/${path}`;
+  const params = new URLSearchParams();
+  if (session.token) params.set("t", session.token);
+  if (thumbnail) params.set("thumb", "1");
+  const suffix = params.size ? `?${params}` : "";
+  return `/media/${path}${suffix}`;
 }

@@ -102,7 +102,7 @@ def _visible_media(media, is_admin: bool) -> list:
     return sorted(items, key=order)
 
 
-def _row_to_item(row, display_filters=None, is_admin=True) -> dict:
+def _row_to_item(row, display_filters=None, is_admin=True, include_full_media=False) -> dict:
     patterns = (display_filters or {}).get(row["source_id"])
     tier = row["presence_tier"] if "presence_tier" in row.keys() else None
     # the full description (incl. the card summary line) is admin-only;
@@ -119,7 +119,8 @@ def _row_to_item(row, display_filters=None, is_admin=True) -> dict:
         "price_currency": row["price_currency"],
         "bot_url": row["bot_url"] if "bot_url" in row.keys() else "",
         "description": description,
-        "media": media,
+        "media": media if include_full_media else media[:1],
+        "media_count": len(media),
         "published_at": row["published_at"].isoformat() if row["published_at"] else None,
         "online": tier == "online",
         "online_tier": tier or "unknown",
@@ -171,7 +172,7 @@ async def listing_detail(
         raise HTTPException(status_code=404, detail="not found or not published")
     identity = bearer_identity(authorization)
     filters = await _compiled_display_filters(pool)
-    item = _row_to_item(rows[0], filters, bool(identity and identity[1]))
+    item = _row_to_item(rows[0], filters, bool(identity and identity[1]), include_full_media=True)
     # the raw handle stays admin-only; regular users reach the contact
     # through the proxied chat instead
     item["contact_username"] = (

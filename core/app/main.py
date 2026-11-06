@@ -1,6 +1,9 @@
 """nexus-core entrypoint: FastAPI app with health API and static hosting."""
 import asyncio
 import os
+import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -98,10 +101,31 @@ async def spa_fallback(request, exc):
 # login token (?t=...) since <img> tags cannot send headers
 MEDIA_DIR = Path(get_settings().media_dir)
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+THUMB_DIR = MEDIA_DIR / ".thumbnails"
+_thumb_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="media-thumb")
+
+
+def _make_thumbnail(source: Path) -> Path:
+    from PIL import Image, ImageOps
+
+    key = hashlib.sha256(str(source.relative_to(MEDIA_DIR.resolve())).encode()).hexdigest()
+    target = THUMB_DIR / key[:2] / f"{key}.webp"
+    if target.is_file():
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{key}.{threading.get_ident()}.tmp")
+    with Image.open(source) as original:
+        image = ImageOps.exif_transpose(original)
+        image.thumbnail((480, 600), Image.Resampling.LANCZOS)
+        if image.mode not in {"RGB", "RGBA"}:
+            image = image.convert("RGB")
+        image.save(temporary, "WEBP", quality=80, method=4)
+    temporary.replace(target)
+    return target
 
 
 @app.get("/media/{file_path:path}")
-async def media_file(file_path: str, t: str = ""):
+async def media_file(file_path: str, t: str = "", thumb: bool = False):
     from fastapi.responses import FileResponse
     from fastapi import HTTPException as _HTTPException
 
@@ -129,11 +153,16 @@ async def media_file(file_path: str, t: str = ""):
         if restricted:
             raise _HTTPException(status_code=403, detail="admin-only media")
     target = (MEDIA_DIR / file_path).resolve()
-    if not str(target).startswith(str(MEDIA_DIR.resolve()) + os.sep):
+    if not str(target).startswith(str(MEDIA_DIR.resolve()) + os.sep) or ".thumbnails" in Path(file_path).parts:
         raise _HTTPException(status_code=404, detail="not found")
     if not target.is_file():
         raise _HTTPException(status_code=404, detail="not found")
-    return FileResponse(target)
+    if thumb:
+        try:
+            target = await asyncio.get_running_loop().run_in_executor(_thumb_pool, _make_thumbnail, target)
+        except Exception as exc:
+            raise _HTTPException(status_code=415, detail="thumbnail unavailable") from exc
+    return FileResponse(target, headers={"Cache-Control": "private, max-age=86400"})
 
 # Static SPA hosting (built by the frontend stage into /app/static).
 STATIC_DIR = Path(get_settings().static_dir)

@@ -11,12 +11,12 @@ const props = defineProps({
 const emit = defineEmits(["toggle-favorite"]);
 // cover = best photo (already score-ordered server-side) or a video
 // with a poster frame; focus drives the face-aware cover crop
-const cover = () =>
+const cover = () => props.item.cover ||
   (props.item.media || []).find((m) => m.kind === "photo") ||
   (props.item.media || []).find((m) => m.kind === "video" && m.poster) ||
   null;
 const isPosterCover = () => cover() && cover().kind === "video";
-const mediaCount = () => (props.item.media || []).length;
+const mediaCount = () => props.item.media_count ?? (props.item.media || []).length;
 const focusStyle = () => {
   const c = cover() || {};
   return {
@@ -57,7 +57,7 @@ async function toggleFavorite() {
       <!-- cover crop keeps the detected face in frame via object-position -->
       <img
         v-if="cover()"
-        :src="mediaUrl(isPosterCover() ? cover().poster : cover().path)" :alt="item.nickname"
+        :src="mediaUrl(isPosterCover() ? cover().poster : cover().path, { thumbnail: true })" :alt="item.nickname"
         class="size-full object-cover" :style="focusStyle()" loading="lazy"
       />
       <div v-else class="flex size-full items-center justify-center text-slate-600">

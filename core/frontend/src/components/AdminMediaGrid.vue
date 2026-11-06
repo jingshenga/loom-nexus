@@ -118,6 +118,11 @@ function mediaSrc(item) {
   return mediaUrl(item.kind === "photo" ? item.path : item.poster);
 }
 
+function mediaThumbSrc(item) {
+  if (item.preview_url) return item.preview_url;
+  return mediaUrl(item.kind === "photo" ? item.path : item.poster, { thumbnail: true });
+}
+
 function stepPreview(delta) {
   if (!items.value.length) return;
   previewIndex.value = (previewIndex.value + delta + items.value.length) % items.value.length;
@@ -157,10 +162,15 @@ function onTouchEnd(event) {
         :class="draggingIndex === index ? 'opacity-40' : ''"
         :draggable="editable && selected.length === 0" @dragstart="onDragStart(index, $event)" @dragover.prevent @drop.prevent="onDrop(index)" @dragend="draggingIndex = -1">
         <button class="size-full" @click="previewIndex = index" :aria-label="`预览第 ${index + 1} 张图片`">
-          <img v-if="item.kind === 'photo' || item.poster" :src="mediaSrc(item)" class="size-full object-contain" loading="lazy" />
+          <img v-if="item.kind === 'photo' || item.poster" :src="mediaThumbSrc(item)" class="size-full object-contain" loading="lazy" />
           <span v-else class="flex size-full items-center justify-center text-slate-400"><Clapperboard class="size-8" /></span>
         </button>
-        <span v-if="item.kind === 'photo' && item.visibility !== 'public'" class="absolute bottom-1 left-1 rounded bg-black/75 px-1.5 py-0.5 text-[10px] text-slate-100">仅管理员</span>
+        <div class="absolute bottom-1 left-1 flex flex-col items-start gap-0.5">
+          <span v-if="item.ocr_classification === 'uncertain'" class="rounded bg-amber-950/90 px-1.5 py-0.5 text-[10px] text-amber-200">AI待确认</span>
+          <span v-else-if="item.ocr_classification === 'info_card'" class="rounded bg-sky-950/90 px-1.5 py-0.5 text-[10px] text-sky-200">介绍图</span>
+          <span v-if="item.ocr_review_status === 'pending'" class="rounded bg-amber-950/90 px-1.5 py-0.5 text-[10px] text-amber-200">OCR待核</span>
+          <span v-if="item.kind === 'photo' && item.visibility !== 'public'" class="rounded bg-black/75 px-1.5 py-0.5 text-[10px] text-slate-100">仅管理员</span>
+        </div>
         <span v-if="editable" class="absolute left-1 top-1 rounded bg-black/70 px-1 text-[10px] text-white">{{ index + 1 }}</span>
         <input v-if="editable" type="checkbox" :checked="selected.includes(index)" @click.stop="toggle(index)"
           class="absolute right-1 top-1 size-5 cursor-pointer accent-sky-500" :aria-label="`选择第 ${index + 1} 张`" />
