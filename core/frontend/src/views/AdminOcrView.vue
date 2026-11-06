@@ -1,13 +1,18 @@
 <script setup>
 import AdminTabs from "../components/AdminTabs.vue";
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import { api, mediaUrl } from "../api/client";
 import { Check, RotateCw, X, ImageIcon, CheckSquare, Square, X as CloseIcon } from "lucide-vue-next";
 
 const items = ref([]);
+const route = useRoute();
+const router = useRouter();
+const listingId = ref(Number(route.query.listing_id) > 0 ? Number(route.query.listing_id) : null);
+const mediaPaths = ref((Array.isArray(route.query.media_path) ? route.query.media_path : [route.query.media_path]).filter(Boolean));
 const current = ref(null);
 const modalOpen = ref(false);
-const status = ref("pending");
+const status = ref(route.query.status === "all" ? "all" : "pending");
 const offset = ref(0);
 const total = ref(0);
 const pageSize = 60;
@@ -132,6 +137,8 @@ async function load() {
     status: status.value, limit: String(pageSize), offset: String(offset.value),
     sort: confidenceSort.value,
   });
+  if (listingId.value) params.set("listing_id", String(listingId.value));
+  mediaPaths.value.forEach((path) => params.append("media_path", path));
   if (categoryFilter.value) params.set("category", categoryFilter.value);
   if (confidenceRange.value) {
     const [low, high] = confidenceRange.value.split(":");
@@ -164,6 +171,24 @@ function changeStatus() {
   modalOpen.value = false;
   load();
 }
+
+function clearListingFilter() {
+  const query = { ...route.query };
+  delete query.listing_id;
+  delete query.media_path;
+  delete query.status;
+  router.replace({ query });
+}
+
+watch(() => [route.query.listing_id, route.query.media_path, route.query.status], ([value, paths, requestedStatus]) => {
+  const id = Number(value);
+  listingId.value = Number.isInteger(id) && id > 0 ? id : null;
+  mediaPaths.value = (Array.isArray(paths) ? paths : [paths]).filter(Boolean);
+  status.value = requestedStatus === "all" ? "all" : "pending";
+  offset.value = 0;
+  clearSelection();
+  load();
+});
 
 function changePage(delta) {
   const lastOffset = Math.max(0, Math.floor((total.value - 1) / pageSize) * pageSize);
@@ -358,6 +383,10 @@ async function reclassifySelected() {
         <button :disabled="offset + pageSize >= total || busy" @click="changePage(1)" class="rounded border border-slate-700 px-2 py-1 text-xs text-slate-300 disabled:opacity-40">下一页</button>
       </div>
       <span v-if="flash" class="w-full rounded bg-emerald-600/20 px-3 py-1 text-xs text-emerald-300">{{ flash }}</span>
+    </div>
+    <div v-if="listingId" class="flex flex-wrap items-center gap-2 rounded-lg border border-sky-800/70 bg-sky-950/30 px-3 py-2 text-sm text-sky-200">
+      <span>当前只显示卡片 #{{ listingId }} 的 {{ mediaPaths.length || "全部" }} 张指定 OCR 图片</span>
+      <button @click="clearListingFilter" class="ml-auto rounded border border-sky-700 px-2 py-1 text-xs hover:bg-sky-900">清除卡片筛选</button>
     </div>
 
     <div v-if="items.length" class="grid grid-cols-3 gap-2 sm:grid-cols-4 lg:grid-cols-6 2xl:grid-cols-8">

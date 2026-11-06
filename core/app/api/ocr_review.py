@@ -1,7 +1,7 @@
 """Admin-only review queue for locally classified OCR card images."""
 import json
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app import db
@@ -100,6 +100,8 @@ async def queue(
     status: str = "pending", limit: int = 60, offset: int = 0,
     category: str | None = None, confidence_min: float | None = None,
     confidence_max: float | None = None, sort: str = "newest",
+    listing_id: int | None = None,
+    media_path: list[str] = Query(default=[]),
 ) -> dict:
     if status not in {"all", "pending", "confirmed", "not_card", "failed"}:
         raise HTTPException(status_code=400, detail="invalid OCR queue status")
@@ -114,17 +116,25 @@ async def queue(
         raise HTTPException(status_code=400, detail="invalid minimum confidence")
     if confidence_max is not None and not 0 <= confidence_max <= 1:
         raise HTTPException(status_code=400, detail="invalid maximum confidence")
+    if listing_id is not None and listing_id <= 0:
+        raise HTTPException(status_code=400, detail="invalid listing id")
     if confidence_min is not None and confidence_max is not None and confidence_min > confidence_max:
         raise HTTPException(status_code=400, detail="minimum confidence exceeds maximum")
     filters = (
         " AND ($4::text IS NULL OR COALESCE(o.human_classification,o.classification)=$4) "
         " AND ($5::numeric IS NULL OR COALESCE(o.predicted_confidence,o.confidence)>=$5) "
         " AND ($6::numeric IS NULL OR COALESCE(o.predicted_confidence,o.confidence)<=$6) "
+        " AND ($8::bigint IS NULL OR o.listing_id=$8 OR EXISTS ("
+        "SELECT 1 FROM listings lf WHERE lf.id=$8 AND lf.source_msg_id=o.raw_id)) "
+        " AND (cardinality($9::text[]) = 0 OR o.media_path = ANY($9::text[])) "
     )
     count_filters = (
         " AND ($2::text IS NULL OR COALESCE(o.human_classification,o.classification)=$2) "
         " AND ($3::numeric IS NULL OR COALESCE(o.predicted_confidence,o.confidence)>=$3) "
         " AND ($4::numeric IS NULL OR COALESCE(o.predicted_confidence,o.confidence)<=$4) "
+        " AND ($5::bigint IS NULL OR o.listing_id=$5 OR EXISTS ("
+        "SELECT 1 FROM listings lf WHERE lf.id=$5 AND lf.source_msg_id=o.raw_id)) "
+        " AND (cardinality($6::text[]) = 0 OR o.media_path = ANY($6::text[])) "
     )
     rows = await pool.fetch(
         "SELECT o.id, o.raw_id, o.listing_id, o.media_path, o.status, "
@@ -151,7 +161,7 @@ async def queue(
         "CASE WHEN $7='confidence_desc' THEN COALESCE(o.predicted_confidence,o.confidence) END DESC NULLS LAST, "
         "CASE WHEN $7='oldest' THEN o.id END ASC, CASE WHEN $7='newest' THEN o.id END DESC, o.id "
         "LIMIT GREATEST(1,$2::int) OFFSET GREATEST(0,$3::int)",
-        status, limit, offset, category, confidence_min, confidence_max, sort,
+        status, limit, offset, category, confidence_min, confidence_max, sort, listing_id, media_path,
     )
     total = await pool.fetchval(
         "SELECT count(*) FROM listing_media_ocr o "
@@ -159,7 +169,7 @@ async def queue(
         " WHEN $1='confirmed' THEN o.review_status='confirmed' "
         " WHEN $1='not_card' THEN o.review_status='not_card' "
         " WHEN $1='failed' THEN o.status='failed' ELSE TRUE END " + count_filters,
-        status, category, confidence_min, confidence_max,
+        status, category, confidence_min, confidence_max, listing_id, media_path,
     )
     items = []
     for row in rows:

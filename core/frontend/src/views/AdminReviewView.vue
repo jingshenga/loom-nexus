@@ -126,6 +126,12 @@ async function select(item) {
   };
 }
 
+function uncertainMediaPaths() {
+  return (current.value?.media || [])
+    .filter((item) => item.ocr_classification === "uncertain" && item.path)
+    .map((item) => item.path);
+}
+
 async function loadQueue(resetPage = false) {
   if (resetPage) pageOffset.value = 0;
   const bucket = activeWorkbench.value === "checkin" ? "checkin_supplement"
@@ -804,7 +810,7 @@ function onReviewVisibilityChange() {
           <div class="text-right text-xs"><div class="text-sky-300">采集于 {{ new Date(current.created_at).toLocaleString('zh-CN') }}</div><div v-if="current.source_posted_at" class="mt-1 text-slate-500">原消息 {{ new Date(current.source_posted_at).toLocaleString('zh-CN') }}</div></div>
         </div>
         <div class="flex flex-wrap gap-2 text-sm text-slate-300"><span v-if="current.district" class="rounded bg-slate-800 px-2 py-1">{{ current.district }}</span><span class="rounded bg-slate-800 px-2 py-1">{{ current.price_amount ?? "价格待核" }} {{ current.price_currency || "" }}</span><span v-if="current.contact_peer_id" class="rounded bg-slate-800 px-2 py-1">TG ID {{ current.contact_peer_id }}</span></div>
-        <div class="flex flex-wrap gap-2 text-xs text-slate-400"><span class="rounded bg-slate-900 px-2 py-1">媒体 {{ current.media?.length || 0 }} 个 · 可计入上架 {{ current.effective_media_count || 0 }}/3</span><span v-if="(current.media || []).some(item => item.ocr_classification === 'uncertain')" class="rounded bg-amber-950/60 px-2 py-1 text-amber-200">含 AI 未确认媒体；未人工确认前不计入</span></div>
+        <div class="flex flex-wrap gap-2 text-xs text-slate-400"><span class="rounded bg-slate-900 px-2 py-1">媒体 {{ current.media?.length || 0 }} 个 · 可计入上架 {{ current.effective_media_count || 0 }}/3</span><RouterLink v-if="uncertainMediaPaths().length" :to="{ path: '/admin/ocr', query: { listing_id: current.id, media_path: uncertainMediaPaths(), status: 'all' } }" class="rounded bg-amber-950/60 px-2 py-1 text-amber-200 hover:bg-amber-900">含 AI 未确认媒体 · 点击直接核对 →</RouterLink></div>
         <AdminMediaGrid v-model:media="form.media" editable @order-change="mediaManualOrder = true" />
         <details class="rounded-lg border border-slate-800 bg-slate-950/60 p-3"><summary class="cursor-pointer text-sm text-slate-300">查看原始消息</summary><p class="mt-3 whitespace-pre-wrap text-sm leading-relaxed text-slate-400">{{ current.source_text || "（无正文）" }}</p></details>
         <details class="rounded-lg border border-slate-800 bg-slate-950/60 p-3"><summary class="cursor-pointer text-sm text-slate-300">修订卡片字段</summary>
