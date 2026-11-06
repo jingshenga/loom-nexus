@@ -474,6 +474,7 @@ class ListingContentEdit(BaseModel):
     price_amount: float | None = None
     price_currency: str
     description: str
+    contact_username: str | None = None
     bot_url: str | None = None
     custom_fields: dict | None = None
     media: list[dict]
@@ -777,7 +778,7 @@ async def edit_content(
     async with pool.acquire() as conn:
         async with conn.transaction():
             row = await conn.fetchrow(
-                "SELECT id, source_msg_id, nickname, district, price_amount, "
+                "SELECT id, source_msg_id, nickname, district, price_amount, contact_username, "
                 "price_currency, description, bot_url, custom_fields, media_json, manual_fields FROM listings "
                 "WHERE id=$1 FOR UPDATE",
                 listing_id,
@@ -785,6 +786,11 @@ async def edit_content(
             if row is None:
                 raise HTTPException(status_code=404, detail="listing not found")
             old_media = _decode(row["media_json"], [])
+            contact_username = row["contact_username"]
+            if body.contact_username is not None:
+                contact_username = body.contact_username.strip().lstrip("@").lower()
+                if contact_username and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", contact_username):
+                    raise HTTPException(status_code=400, detail="TG号格式无效")
             bot_url = _normalize_bot_url(body.bot_url) if body.bot_url is not None else row["bot_url"]
             custom_fields = body.custom_fields if body.custom_fields is not None else _decode(row["custom_fields"], {})
             allowed_fields = await conn.fetch(
@@ -828,6 +834,7 @@ async def edit_content(
                 for key in ("nickname", "district", "price_amount", "price_currency", "description")
             }
             before["media"] = old_media
+            before["contact_username"] = row["contact_username"]
             before["bot_url"] = row["bot_url"]
             before["custom_fields"] = _decode(row["custom_fields"], {})
             after = {
@@ -836,6 +843,7 @@ async def edit_content(
                 "price_amount": body.price_amount,
                 "price_currency": body.price_currency,
                 "description": body.description,
+                "contact_username": contact_username,
                 "bot_url": bot_url,
                 "custom_fields": custom_fields,
                 "media": updated_media,
@@ -847,6 +855,7 @@ async def edit_content(
                 "price_amount": body.price_amount,
                 "price_currency": body.price_currency.strip(),
                 "description": body.description,
+                "contact_username": contact_username,
             }
             for field, value in edited_values.items():
                 if value != row[field]:
@@ -862,10 +871,10 @@ async def edit_content(
             encoded = json.dumps(updated_media, ensure_ascii=False)
             await conn.execute(
                 "UPDATE listings SET nickname=$2, district=$3, price_amount=$4, "
-                "price_currency=$5, description=$6, bot_url=$7, custom_fields=$8::jsonb, "
-                "media_json=$9::jsonb, manual_fields=$10::jsonb, updated_at=NOW() WHERE id=$1",
+                "price_currency=$5, description=$6, contact_username=$7, bot_url=$8, custom_fields=$9::jsonb, "
+                "media_json=$10::jsonb, manual_fields=$11::jsonb, updated_at=NOW() WHERE id=$1",
                 listing_id, body.nickname.strip(), body.district.strip(),
-                body.price_amount, body.price_currency.strip(), body.description,
+                body.price_amount, body.price_currency.strip(), body.description, contact_username,
                 bot_url, json.dumps(custom_fields, ensure_ascii=False), encoded, json.dumps(manual_fields),
             )
             if row["source_msg_id"] is not None:
@@ -945,24 +954,18 @@ async def publish(listing_id: int) -> dict:
     if pool is None:
         raise HTTPException(status_code=503, detail="database unavailable")
     listing = await pool.fetchrow(
-        "SELECT nickname,price_amount,description,contact_username,bot_url,media_json,custom_fields, "
-        "listing_meets_publish_requirements(nickname,price_amount,description,contact_username, "
-        "bot_url,media_json,custom_fields) AS ready "
+        "SELECT nickname,price_amount,description,contact_username,custom_fields "
         "FROM listings WHERE id=$1",
         listing_id,
     )
     if listing is None:
         raise HTTPException(status_code=404, detail="listing not found")
-    media = _decode(listing["media_json"], [])
-    effective_media_count = _publishable_media_count(media)
     missing = [
         label for label, value in (
             ("昵称", listing["nickname"]), ("价格", listing["price_amount"]),
             ("介绍", listing["description"]), ("TG号", listing["contact_username"]),
         ) if value is None or (isinstance(value, str) and not value.strip())
     ]
-    if effective_media_count < 3:
-        missing.append(f"至少3个有效照片/视频（当前{effective_media_count}个）")
     custom_fields = _decode(listing["custom_fields"], {})
     required_fields = await pool.fetch(
         "SELECT field_key,label FROM listing_field_definitions "
@@ -972,9 +975,8 @@ async def publish(listing_id: int) -> dict:
         row["label"] for row in required_fields
         if not str(custom_fields.get(row["field_key"]) or "").strip()
     )
-    if missing or not listing["ready"]:
-        detail = "、".join(missing) or "卡片完整度未通过"
-        raise HTTPException(status_code=409, detail="上架条件未满足：" + detail)
+    if missing:
+        raise HTTPException(status_code=409, detail="上架条件未满足：" + "、".join(missing))
     rows = await pool.fetch(SQL_PUBLISH, listing_id)
     if not rows[0]["ok"]:
         raise HTTPException(status_code=409, detail="cannot publish (archived?)")
