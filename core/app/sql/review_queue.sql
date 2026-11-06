@@ -27,6 +27,8 @@ WHERE l.status = $1::text
        WHERE m->>'kind' IN ('photo','video') AND COALESCE(m->>'path',m->>'poster','') <> '') >= $11::int)
   AND ($12::int IS NULL OR (SELECT count(*) FROM jsonb_array_elements(COALESCE(l.media_json, '[]'::jsonb)) m
        WHERE m->>'kind' IN ('photo','video') AND COALESCE(m->>'path',m->>'poster','') <> '') <= $12::int)
+  AND ($13::date IS NULL OR (rm.posted_at AT TIME ZONE 'Asia/Shanghai')::date >= $13::date)
+  AND ($14::date IS NULL OR (rm.posted_at AT TIME ZONE 'Asia/Shanghai')::date <= $14::date)
   AND ($1::text <> 'pending' OR NOT EXISTS (
       SELECT 1 FROM listings other
       WHERE other.id <> l.id
@@ -45,7 +47,17 @@ WHERE l.status = $1::text
               AND d.right_listing_id = GREATEST(l.id, other.id)
         )
   ))
-ORDER BY CASE WHEN $7::text = 'oldest' THEN l.created_at END ASC,
-         CASE WHEN $7::text <> 'oldest' THEN l.created_at END DESC,
+ORDER BY CASE WHEN $15::text = 'original' AND $7::text = 'oldest' THEN rm.posted_at END ASC NULLS LAST,
+         CASE WHEN $15::text = 'original' AND $7::text <> 'oldest' THEN rm.posted_at END DESC NULLS LAST,
+         CASE WHEN $15::text = 'collected' AND $7::text = 'oldest' THEN l.created_at END ASC,
+         CASE WHEN $15::text = 'collected' AND $7::text <> 'oldest' THEN l.created_at END DESC,
+         CASE WHEN $15::text = 'media' AND $7::text = 'oldest' THEN (SELECT count(*) FROM jsonb_array_elements(COALESCE(l.media_json, '[]'::jsonb)) m WHERE m->>'kind' IN ('photo','video') AND COALESCE(m->>'path',m->>'poster','') <> '') END ASC,
+         CASE WHEN $15::text = 'media' AND $7::text <> 'oldest' THEN (SELECT count(*) FROM jsonb_array_elements(COALESCE(l.media_json, '[]'::jsonb)) m WHERE m->>'kind' IN ('photo','video') AND COALESCE(m->>'path',m->>'poster','') <> '') END DESC,
+         CASE WHEN $16::text = 'original' AND $7::text = 'oldest' THEN rm.posted_at END ASC NULLS LAST,
+         CASE WHEN $16::text = 'original' AND $7::text <> 'oldest' THEN rm.posted_at END DESC NULLS LAST,
+         CASE WHEN $16::text = 'collected' AND $7::text = 'oldest' THEN l.created_at END ASC,
+         CASE WHEN $16::text = 'collected' AND $7::text <> 'oldest' THEN l.created_at END DESC,
+         CASE WHEN $16::text = 'media' AND $7::text = 'oldest' THEN (SELECT count(*) FROM jsonb_array_elements(COALESCE(l.media_json, '[]'::jsonb)) m WHERE m->>'kind' IN ('photo','video') AND COALESCE(m->>'path',m->>'poster','') <> '') END ASC,
+         CASE WHEN $16::text = 'media' AND $7::text <> 'oldest' THEN (SELECT count(*) FROM jsonb_array_elements(COALESCE(l.media_json, '[]'::jsonb)) m WHERE m->>'kind' IN ('photo','video') AND COALESCE(m->>'path',m->>'poster','') <> '') END DESC,
          l.id DESC
 LIMIT GREATEST(1, $2::int) OFFSET GREATEST(0, $3::int);

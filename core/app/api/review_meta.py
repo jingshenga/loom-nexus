@@ -103,6 +103,7 @@ async def queue_total(
     source: str | None = None, media: str | None = None,
     bucket: str | None = None,
     collected_from: date | None = None, collected_to: date | None = None,
+    original_from: date | None = None, original_to: date | None = None,
     min_media: int | None = None, max_media: int | None = None,
 ) -> dict:
     if status not in {"pending", "published", "rejected", "archived"}:
@@ -115,6 +116,8 @@ async def queue_total(
         raise HTTPException(status_code=400, detail="minimum media count exceeds maximum")
     if collected_from and collected_to and collected_from > collected_to:
         raise HTTPException(status_code=400, detail="collection date range is invalid")
+    if original_from and original_to and original_from > original_to:
+        raise HTTPException(status_code=400, detail="original message date range is invalid")
     total = await _pool().fetchval(
         "SELECT count(*) FROM listings l "
         "LEFT JOIN raw_messages rm ON rm.id=l.source_msg_id "
@@ -133,6 +136,8 @@ async def queue_total(
         "WHERE m->>'kind'=$4::text)) "
         "AND ($6::date IS NULL OR (l.created_at AT TIME ZONE 'Asia/Shanghai')::date >= $6::date) "
         "AND ($7::date IS NULL OR (l.created_at AT TIME ZONE 'Asia/Shanghai')::date <= $7::date) "
+        "AND ($10::date IS NULL OR (rm.posted_at AT TIME ZONE 'Asia/Shanghai')::date >= $10::date) "
+        "AND ($11::date IS NULL OR (rm.posted_at AT TIME ZONE 'Asia/Shanghai')::date <= $11::date) "
         "AND ($8::int IS NULL OR (SELECT count(*) FROM jsonb_array_elements(COALESCE(l.media_json,'[]'::jsonb)) m "
         "WHERE m->>'kind' IN ('photo','video') AND COALESCE(m->>'path',m->>'poster','') <> '') >= $8::int) "
         "AND ($9::int IS NULL OR (SELECT count(*) FROM jsonb_array_elements(COALESCE(l.media_json,'[]'::jsonb)) m "
@@ -151,6 +156,6 @@ async def queue_total(
         "WHERE d.left_listing_id=LEAST(l.id,other.id) AND d.right_listing_id=GREATEST(l.id,other.id))"
         "))",
         status, nickname or None, source or None, media, bucket or None,
-        collected_from, collected_to, min_media, max_media,
+        collected_from, collected_to, min_media, max_media, original_from, original_to,
     )
     return {"total": total}

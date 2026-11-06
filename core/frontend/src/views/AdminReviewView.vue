@@ -32,8 +32,12 @@ const appliedSource = ref("");
 const mediaFilter = ref("");
 const collectedFrom = ref("");
 const collectedTo = ref("");
+const originalFrom = ref("");
+const originalTo = ref("");
 const minMedia = ref("");
 const maxMedia = ref("");
+const sortBy = ref("original");
+const sortThen = ref("none");
 const sortOrder = ref("newest");
 const recollectStatus = ref("");
 const activeWorkbench = ref("review");
@@ -145,9 +149,13 @@ async function loadQueue(resetPage = false) {
   if (mediaFilter.value) params.set("media", mediaFilter.value);
   if (collectedFrom.value) params.set("collected_from", collectedFrom.value);
   if (collectedTo.value) params.set("collected_to", collectedTo.value);
+  if (originalFrom.value) params.set("original_from", originalFrom.value);
+  if (originalTo.value) params.set("original_to", originalTo.value);
   if (minMedia.value !== "") params.set("min_media", minMedia.value);
   if (maxMedia.value !== "") params.set("max_media", maxMedia.value);
   params.set("sort", sortOrder.value);
+  params.set("sort_by", sortBy.value);
+  params.set("sort_then", sortThen.value);
   const countParams = new URLSearchParams({ status: statusTab.value });
   if (bucket) countParams.set("bucket", bucket);
   if (appliedNickname.value) countParams.set("nickname", appliedNickname.value);
@@ -155,6 +163,8 @@ async function loadQueue(resetPage = false) {
   if (mediaFilter.value) countParams.set("media", mediaFilter.value);
   if (collectedFrom.value) countParams.set("collected_from", collectedFrom.value);
   if (collectedTo.value) countParams.set("collected_to", collectedTo.value);
+  if (originalFrom.value) countParams.set("original_from", originalFrom.value);
+  if (originalTo.value) countParams.set("original_to", originalTo.value);
   if (minMedia.value !== "") countParams.set("min_media", minMedia.value);
   if (maxMedia.value !== "") countParams.set("max_media", maxMedia.value);
   const [data, count] = await Promise.all([
@@ -395,8 +405,15 @@ function clearQueueFilters() {
   mediaFilter.value = "";
   collectedFrom.value = "";
   collectedTo.value = "";
+  originalFrom.value = "";
+  originalTo.value = "";
   minMedia.value = "";
   maxMedia.value = "";
+  sortBy.value = "original";
+  sortThen.value = "none";
+  sortOrder.value = "newest";
+  statusTab.value = "pending";
+  selectedIds.value = [];
   applyMediaFilters();
 }
 
@@ -727,9 +744,17 @@ function onReviewVisibilityChange() {
       </select>
       <label class="flex items-center gap-1 text-xs text-slate-400">采集自<input v-model="collectedFrom" type="date" class="rounded border border-slate-700 bg-slate-900 px-1.5 py-1 text-xs" /></label>
       <label class="flex items-center gap-1 text-xs text-slate-400">至<input v-model="collectedTo" type="date" class="rounded border border-slate-700 bg-slate-900 px-1.5 py-1 text-xs" /></label>
+      <label class="flex items-center gap-1 text-xs text-slate-400">原消息自<input v-model="originalFrom" type="date" class="rounded border border-slate-700 bg-slate-900 px-1.5 py-1 text-xs" /></label>
+      <label class="flex items-center gap-1 text-xs text-slate-400">至<input v-model="originalTo" type="date" class="rounded border border-slate-700 bg-slate-900 px-1.5 py-1 text-xs" /></label>
       <label class="flex items-center gap-1 text-xs text-slate-400">媒体数<input v-model="minMedia" type="number" min="0" placeholder="最少" class="w-16 rounded border border-slate-700 bg-slate-900 px-1.5 py-1 text-xs" /></label>
       <label class="flex items-center gap-1 text-xs text-slate-400">至<input v-model="maxMedia" type="number" min="0" placeholder="最多" class="w-16 rounded border border-slate-700 bg-slate-900 px-1.5 py-1 text-xs" /></label>
       <button @click="applyMediaFilters" class="rounded-lg border border-slate-700 px-2 py-1 text-xs text-slate-300">应用</button>
+      <select v-model="sortBy" @change="applyMediaFilters" class="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm">
+        <option value="original">按原消息时间</option><option value="collected">按采集时间</option><option value="media">按媒体数量</option>
+      </select>
+      <select v-model="sortThen" @change="applyMediaFilters" class="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm" aria-label="次级排序">
+        <option value="none">不加次级排序</option><option value="original">再按原消息时间</option><option value="collected">再按采集时间</option><option value="media">再按媒体数量</option>
+      </select>
       <select v-model="sortOrder" @change="applyMediaFilters" class="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm">
         <option value="newest">最新优先</option><option value="oldest">最早优先</option>
       </select>
@@ -738,7 +763,7 @@ function onReviewVisibilityChange() {
         <button :disabled="pageOffset === 0" @click="changePage(-1)" class="rounded border border-slate-700 px-2 py-1 disabled:opacity-40">上一页</button>
         <button :disabled="pageOffset + pageSize >= queueTotal" @click="changePage(1)" class="rounded border border-slate-700 px-2 py-1 disabled:opacity-40">下一页</button>
       </div>
-      <button v-if="appliedNickname || appliedSource || mediaFilter || collectedFrom || collectedTo || minMedia !== '' || maxMedia !== ''" @click="clearQueueFilters"
+      <button v-if="appliedNickname || appliedSource || mediaFilter || collectedFrom || collectedTo || originalFrom || originalTo || minMedia !== '' || maxMedia !== '' || sortBy !== 'original' || sortThen !== 'none' || sortOrder !== 'newest' || statusTab !== 'pending'" @click="clearQueueFilters"
         class="rounded-lg px-2 py-1 text-xs text-slate-500 hover:text-slate-300">清除筛选</button>
       <label class="flex items-center gap-1.5 text-xs text-slate-400">
         <input type="checkbox" :checked="allSelected()" @change="toggleSelectAll" class="size-4 accent-sky-500" />

@@ -99,6 +99,9 @@ async def queue(
     nickname: str = None, source: str = None, media: str = None,
     sort: Literal["newest", "oldest"] = "newest", bucket: str = None,
     collected_from: date | None = None, collected_to: date | None = None,
+    original_from: date | None = None, original_to: date | None = None,
+    sort_by: Literal["original", "collected", "media"] = "original",
+    sort_then: Literal["none", "original", "collected", "media"] = "none",
     min_media: int | None = None, max_media: int | None = None,
 ) -> dict:
     pool = db.get_pool()
@@ -112,10 +115,13 @@ async def queue(
         raise HTTPException(status_code=400, detail="minimum media count exceeds maximum")
     if collected_from and collected_to and collected_from > collected_to:
         raise HTTPException(status_code=400, detail="collection date range is invalid")
+    if original_from and original_to and original_from > original_to:
+        raise HTTPException(status_code=400, detail="original message date range is invalid")
     rows = await pool.fetch(
         SQL_QUEUE, status, limit, offset, nickname or None,
         source or None, media, sort, bucket or None,
         collected_from, collected_to, min_media, max_media,
+        original_from, original_to, sort_by, sort_then,
     )
     items = []
     for r in rows:
