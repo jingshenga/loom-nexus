@@ -61,6 +61,8 @@ LEFT JOIN listing_duplicate_decisions d
        ON d.left_listing_id = a.id AND d.right_listing_id = b.id
 WHERE d.left_listing_id IS NULL
   AND (a.person_group_id IS NULL OR b.person_group_id IS NULL OR a.person_group_id <> b.person_group_id)
+  AND NOT (NULLIF(a.contact_username, '') IS NOT NULL
+           AND lower(a.contact_username) = lower(b.contact_username))
   AND (
       ((a.profile_collection_job_id IS NOT NULL OR b.profile_collection_job_id IS NOT NULL
         OR EXISTS (SELECT 1 FROM raw_messages h JOIN checkin_history_scans hs ON hs.source_id=h.source_id

@@ -25,6 +25,7 @@ router = APIRouter(
 SQL_QUEUE = sqlres.load("review_queue.sql")
 SQL_REVIEW_DETAIL = sqlres.load("review_detail.sql")
 SQL_DUPLICATE_CANDIDATES = sqlres.load("duplicate_candidates.sql")
+SQL_DUPLICATE_IDENTITY_GROUPS = sqlres.load("duplicate_identity_groups.sql")
 SQL_PUBLISH = sqlres.load("publish.sql")
 SQL_REJECT = sqlres.load("reject.sql")
 SQL_UPDATE = sqlres.load("update_fields.sql")
@@ -211,6 +212,30 @@ async def duplicate_candidates() -> dict:
                        for row in rows]}
 
 
+@router.get("/duplicates/identity-groups")
+async def duplicate_identity_groups() -> dict:
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    rows = await pool.fetch(SQL_DUPLICATE_IDENTITY_GROUPS)
+    groups = {}
+    for row in rows:
+        group = groups.setdefault(row["identity_key"], {
+            "identity_key": row["identity_key"],
+            "contact_peer_id": row["contact_peer_id"],
+            "contact_username": row["contact_username"], "cards": [],
+        })
+        group["cards"].append({
+            "id": row["id"], "status": row["status"], "nickname": row["nickname"],
+            "contact_username": row["contact_username"], "contact_peer_id": row["contact_peer_id"],
+            "collected_at": row["created_at"].isoformat(),
+            "posted_at": row["posted_at"].isoformat() if row["posted_at"] else None,
+            "source_title": row["source_title"],
+            "person_group_id": row["person_group_id"],
+        })
+    return {"items": list(groups.values())}
+
+
 @router.get("/person-groups")
 async def person_groups() -> dict:
     pool = db.get_pool()
@@ -354,6 +379,61 @@ async def group_duplicate_cards(first_id: int, second_id: int) -> dict:
 class DuplicateDecision(BaseModel):
     decision: Literal["keep_latest", "keep_selected", "merge_selected", "keep_both"]
     keep_listing_id: int | None = None
+
+
+class PersonGroupConfirmBody(BaseModel):
+    listing_ids: list[int]
+
+
+@router.post("/person-groups/confirm")
+async def confirm_identity_group(body: PersonGroupConfirmBody) -> dict:
+    listing_ids = sorted(set(body.listing_ids))
+    if len(listing_ids) < 2 or len(listing_ids) > 300:
+        raise HTTPException(status_code=400, detail="choose between 2 and 300 cards")
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            rows = await conn.fetch(
+                "SELECT id,nickname,contact_username,contact_peer_id "
+                "FROM listings WHERE id=ANY($1::bigint[]) ORDER BY id FOR UPDATE",
+                listing_ids,
+            )
+            if len(rows) != len(listing_ids):
+                raise HTTPException(status_code=404, detail="one or more cards were not found")
+            usernames = {row["contact_username"].strip().casefold() for row in rows
+                         if row["contact_username"] and row["contact_username"].strip()}
+            if len(usernames) != 1 or any(
+                row["contact_username"] is None
+                or row["contact_username"].strip().casefold() not in usernames
+                for row in rows
+            ):
+                raise HTTPException(status_code=409, detail="cards do not share one exact Telegram username")
+            group_ids = await conn.fetch(
+                "SELECT DISTINCT group_id FROM listing_person_group_members "
+                "WHERE listing_id=ANY($1::bigint[]) ORDER BY group_id",
+                listing_ids,
+            )
+            if group_ids:
+                group_id = group_ids[0]["group_id"]
+                for other in group_ids[1:]:
+                    await conn.execute(
+                        "UPDATE listing_person_group_members SET group_id=$1 WHERE group_id=$2",
+                        group_id, other["group_id"],
+                    )
+                    await conn.execute("DELETE FROM listing_person_groups WHERE id=$1", other["group_id"])
+            else:
+                group_id = await conn.fetchval(
+                    "INSERT INTO listing_person_groups (display_name) VALUES($1) RETURNING id",
+                    rows[0]["nickname"] or "",
+                )
+            await conn.executemany(
+                "INSERT INTO listing_person_group_members (group_id,listing_id) VALUES($1,$2) "
+                "ON CONFLICT(listing_id) DO UPDATE SET group_id=EXCLUDED.group_id",
+                [(group_id, listing_id) for listing_id in listing_ids],
+            )
+    return {"ok": True, "group_id": group_id, "member_ids": listing_ids}
 
 
 @router.post("/duplicates/{first_id}/{second_id}")

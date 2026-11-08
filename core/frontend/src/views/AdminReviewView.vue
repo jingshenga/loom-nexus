@@ -15,8 +15,10 @@ const showFieldSettings = ref(false);
 const newField = ref({ key: "", label: "", aliases: "", extraction_source: "manual", required_for_publish: false, is_active: true });
 const duplicatePairs = ref([]);
 const personGroups = ref([]);
+const identityGroups = ref([]);
 const duplicateView = ref("pairs");
 const selectedDuplicate = ref(null);
+const selectedIdentityGroup = ref(null);
 const duplicateSaving = ref(false);
 const duplicateMediaSaving = ref(false);
 const duplicateOrderIds = ref(new Set());
@@ -251,6 +253,35 @@ async function loadDuplicatePairs() {
 async function loadPersonGroups() {
   const data = await api("/api/admin/review/person-groups");
   personGroups.value = data.items;
+}
+
+async function loadIdentityGroups() {
+  const data = await api("/api/admin/review/duplicates/identity-groups");
+  identityGroups.value = data.items;
+  const selected = data.items.find((group) => group.identity_key === selectedIdentityGroup.value?.identity_key);
+  selectedIdentityGroup.value = selected || data.items[0] || null;
+}
+
+async function confirmIdentityGroup() {
+  const group = selectedIdentityGroup.value;
+  if (!group || duplicateSaving.value) return;
+  const ids = group.cards.map((card) => card.id);
+  if (!window.confirm(`确认 @${group.contact_username || group.contact_peer_id} 的 ${ids.length} 张卡片属于同一人？只建立人员组，不删除或归档卡片。`)) return;
+  duplicateSaving.value = true;
+  try {
+    const result = await api("/api/admin/review/person-groups/confirm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ listing_ids: ids }),
+    });
+    notify(`已确认并归组：${result.member_ids.map((id) => `#${id}`).join("、")}`);
+    selectedIdentityGroup.value = null;
+    await Promise.all([loadIdentityGroups(), loadDuplicatePairs(), loadPersonGroups()]);
+  } catch (e) {
+    notify(`归组失败：${e.message}`);
+  } finally {
+    duplicateSaving.value = false;
+  }
 }
 
 async function confirmSamePerson() {
@@ -891,7 +922,8 @@ function onReviewVisibilityChange() {
     <section v-else class="grid grid-cols-1 gap-4 lg:h-[calc(100dvh-190px)] lg:grid-cols-12">
       <div class="space-y-2 lg:col-span-4">
       <div class="flex gap-2">
-        <button @click="duplicateView = 'pairs'; loadDuplicatePairs()" class="rounded-lg px-3 py-1.5 text-xs" :class="duplicateView === 'pairs' ? 'bg-sky-700 text-white' : 'bg-slate-800 text-slate-300'">待核对</button>
+        <button @click="duplicateView = 'identities'; loadIdentityGroups()" class="rounded-lg px-3 py-1.5 text-xs" :class="duplicateView === 'identities' ? 'bg-sky-700 text-white' : 'bg-slate-800 text-slate-300'">同 TG 号归组</button>
+        <button @click="duplicateView = 'pairs'; loadDuplicatePairs()" class="rounded-lg px-3 py-1.5 text-xs" :class="duplicateView === 'pairs' ? 'bg-sky-700 text-white' : 'bg-slate-800 text-slate-300'">资料相似</button>
         <button @click="duplicateView = 'groups'; loadPersonGroups()" class="rounded-lg px-3 py-1.5 text-xs" :class="duplicateView === 'groups' ? 'bg-sky-700 text-white' : 'bg-slate-800 text-slate-300'">已确认人员组</button>
       </div>
       <aside v-if="duplicateView === 'pairs'" class="max-h-48 space-y-2 overflow-y-auto lg:max-h-[calc(100dvh-250px)] lg:pr-1">
@@ -904,6 +936,14 @@ function onReviewVisibilityChange() {
         </button>
         <div v-if="!filteredDuplicatePairs.length" class="py-16 text-center text-sm text-slate-500">暂无符合筛选条件的疑似重复卡片</div>
       </aside>
+      <aside v-else-if="duplicateView === 'identities'" class="max-h-48 space-y-2 overflow-y-auto lg:max-h-[calc(100dvh-250px)] lg:pr-1">
+        <button v-for="group in identityGroups" :key="group.identity_key" @click="selectedIdentityGroup = group" class="w-full rounded-lg border p-3 text-left" :class="selectedIdentityGroup?.identity_key === group.identity_key ? 'border-sky-500 bg-sky-600/10' : 'border-slate-800 bg-slate-900 hover:border-slate-600'">
+          <div class="flex items-center justify-between gap-2"><span class="font-medium">@{{ group.contact_username || group.contact_peer_id }}</span><span class="text-xs text-amber-300">{{ group.cards.length }} 张待核对</span></div>
+          <div class="mt-1 truncate text-xs text-slate-400">{{ group.cards.map((card) => `#${card.id} ${card.nickname || ''}`).join(' · ') }}</div>
+          <div class="mt-1 text-xs text-sky-300">最新原消息 {{ group.cards[0]?.posted_at ? new Date(group.cards[0].posted_at).toLocaleString('zh-CN') : '时间未知' }}</div>
+        </button>
+        <div v-if="!identityGroups.length" class="py-16 text-center text-sm text-slate-500">暂无相同 TG 号的未归组卡片</div>
+      </aside>
       <aside v-else class="max-h-48 space-y-3 overflow-y-auto lg:max-h-[calc(100dvh-250px)] lg:pr-1">
         <article v-for="group in personGroups" :key="group.id" class="rounded-lg border border-slate-800 bg-slate-900 p-3">
           <h3 class="mb-2 text-sm font-medium">{{ group.display_name || '已确认同一人' }} · {{ group.members.length }} 张</h3>
@@ -915,6 +955,17 @@ function onReviewVisibilityChange() {
         <div v-if="!personGroups.length" class="py-12 text-center text-sm text-slate-500">暂无已确认人员组</div>
       </aside>
       </div>
+      <section v-if="duplicateView === 'identities' && selectedIdentityGroup" class="space-y-4 overflow-y-auto rounded-xl border border-slate-800 bg-slate-900/50 p-4 lg:col-span-8">
+        <div class="rounded-lg border border-amber-700/40 bg-amber-950/20 p-3 text-sm text-amber-200">相同 TG 号的多张采集卡片已合并成一个核对项，按原消息时间从新到旧列出。请确认这些卡片确属同一人；确认后只建立人员组，所有原卡片仍保留。</div>
+        <div class="space-y-2">
+          <article v-for="card in selectedIdentityGroup.cards" :key="card.id" class="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+            <div class="flex flex-wrap items-center justify-between gap-2"><h3 class="font-semibold">{{ card.nickname || '未命名' }} · #{{ card.id }}</h3><span class="text-xs text-slate-400">{{ card.status }}</span></div>
+            <p class="mt-1 text-xs text-slate-400">TG：@{{ card.contact_username || '未记录' }}<span v-if="card.contact_peer_id"> · ID {{ card.contact_peer_id }}</span> · {{ card.source_title || '来源未知' }}</p>
+            <p class="mt-1 text-xs text-sky-300">原消息：{{ card.posted_at ? new Date(card.posted_at).toLocaleString('zh-CN') : '时间未知' }} · 采集：{{ new Date(card.collected_at).toLocaleString('zh-CN') }}</p>
+          </article>
+        </div>
+        <button @click="confirmIdentityGroup" :disabled="duplicateSaving" class="sticky bottom-0 w-full rounded-lg bg-emerald-800 px-3 py-3 text-sm font-medium text-emerald-100 hover:bg-emerald-700 disabled:opacity-50">确认 {{ selectedIdentityGroup.cards.length }} 张属于同一人并归组</button>
+      </section>
       <section v-if="duplicateView === 'pairs' && selectedDuplicate" class="space-y-4 overflow-y-auto rounded-xl border border-slate-800 bg-slate-900/50 p-4 lg:col-span-8">
         <div class="rounded-lg border border-amber-700/40 bg-amber-950/20 p-3 text-sm text-amber-200">候选可能由 TG 号、规范化昵称或资料内容匹配产生。请核对来源、账号、时间和媒体；系统只提供线索，不会自动合并。</div>
         <div class="grid gap-4 md:grid-cols-2">
@@ -945,6 +996,7 @@ function onReviewVisibilityChange() {
         </div>
       </section>
       <section v-else-if="duplicateView === 'pairs'" class="flex items-center justify-center rounded-xl border border-slate-800 text-slate-600 lg:col-span-8">选择一组疑似重复卡片</section>
+      <section v-else-if="duplicateView === 'identities'" class="flex items-center justify-center rounded-xl border border-slate-800 text-slate-600 lg:col-span-8">选择一个 TG 号账号簇查看采集时间</section>
       <section v-else class="flex items-center justify-center rounded-xl border border-slate-800 text-slate-600 lg:col-span-8">人员组中的卡片仍保留独立资料，可在左侧查看或移出成员</section>
     </section>
   </div>
