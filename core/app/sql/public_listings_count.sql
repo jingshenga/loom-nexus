@@ -1,5 +1,21 @@
 SELECT count(*) AS total
+FROM (
+SELECT l.id,
+       ROW_NUMBER() OVER (
+           PARTITION BY COALESCE('g:' || pgm.group_id::text, 'l:' || l.id::text)
+           ORDER BY
+               (SELECT count(*) FROM jsonb_array_elements(COALESCE(l.media_json, '[]'::jsonb)) m
+                WHERE m->>'kind' IN ('photo','video')
+                  AND COALESCE(m->>'path',m->>'poster','') <> '') DESC,
+               (COALESCE(NULLIF(BTRIM(l.description), ''), '') <> '') DESC,
+               (l.district IS NOT NULL) DESC,
+               (l.price_amount IS NOT NULL) DESC,
+               (l.bot_url IS NOT NULL AND l.bot_url <> '') DESC,
+               rm.posted_at DESC NULLS LAST, l.created_at DESC, l.id DESC
+       ) AS person_rank
 FROM listings l
+LEFT JOIN raw_messages rm ON rm.id = l.source_msg_id
+LEFT JOIN listing_person_group_members pgm ON pgm.listing_id = l.id
 LEFT JOIN contact_presence cp ON cp.contact_peer_id = l.contact_peer_id
 WHERE l.status = 'published'
   AND ($1::text IS NULL OR l.nickname ILIKE '%' || $1 || '%'
@@ -15,4 +31,6 @@ WHERE l.status = 'published'
           - CASE WHEN $6::text = 'yesterday' THEN 1 ELSE 0 END
       )
         AND ds.contact_usernames ? lower(l.contact_username)
-  ));
+  ))
+) people
+WHERE person_rank = 1;

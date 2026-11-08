@@ -5,6 +5,8 @@ WITH clock AS (
 ), filtered AS (
     SELECT l.id, rm.source_id, l.nickname, l.district, l.price_amount, l.price_currency, l.bot_url,
            l.description, l.media_json, l.confidence, l.published_at, l.created_at,
+           rm.posted_at,
+           pgm.group_id AS person_group_id,
            COALESCE(cp.is_online, FALSE) AS is_online,
            COALESCE(cp.status_tier, 'unknown') AS presence_tier,
            CASE WHEN $9::text = 'yesterday' THEN 'yesterday'
@@ -31,6 +33,7 @@ WITH clock AS (
     FROM listings l
     LEFT JOIN raw_messages rm ON rm.id = l.source_msg_id
     LEFT JOIN contact_presence cp ON cp.contact_peer_id = l.contact_peer_id
+    LEFT JOIN listing_person_group_members pgm ON pgm.listing_id = l.id
     CROSS JOIN clock c
     WHERE l.status = 'published'
       AND ($1::text IS NULL OR l.nickname ILIKE '%' || $1 || '%'
@@ -45,11 +48,27 @@ WITH clock AS (
               - CASE WHEN $9::text = 'yesterday' THEN 1 ELSE 0 END
             AND ds.contact_usernames ? lower(l.contact_username)
       ))
+), ranked AS (
+    SELECT *, ROW_NUMBER() OVER (
+        PARTITION BY COALESCE('g:' || person_group_id::text, 'l:' || id::text)
+        ORDER BY
+            on_duty_today DESC,
+            (SELECT count(*) FROM jsonb_array_elements(COALESCE(media_json, '[]'::jsonb)) m
+             WHERE m->>'kind' IN ('photo','video')
+               AND COALESCE(m->>'path',m->>'poster','') <> '') DESC,
+            (COALESCE(NULLIF(BTRIM(description), ''), '') <> '') DESC,
+            (district IS NOT NULL) DESC,
+            (price_amount IS NOT NULL) DESC,
+            (bot_url IS NOT NULL AND bot_url <> '') DESC,
+            posted_at DESC NULLS LAST, created_at DESC, id DESC
+    ) AS person_rank
+    FROM filtered
 )
 SELECT id, source_id, nickname, district, price_amount, price_currency,
        description, media_json, confidence, published_at, is_online, bot_url,
        presence_tier, duty_label, favorited
-FROM filtered
+FROM ranked
+WHERE person_rank = 1
 ORDER BY (on_duty_today AND newly_collected) DESC,
          on_duty_today DESC, newly_collected DESC, created_at DESC, id DESC
 LIMIT GREATEST(1, $5::int) OFFSET GREATEST(0, $6::int);

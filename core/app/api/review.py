@@ -211,6 +211,146 @@ async def duplicate_candidates() -> dict:
                        for row in rows]}
 
 
+@router.get("/person-groups")
+async def person_groups() -> dict:
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    rows = await pool.fetch(
+        "SELECT g.id AS group_id, g.display_name, l.id, l.nickname, l.status, "
+        "l.contact_username, l.created_at, rm.posted_at, s.title AS source_title "
+        "FROM listing_person_groups g "
+        "JOIN listing_person_group_members m ON m.group_id=g.id "
+        "JOIN listings l ON l.id=m.listing_id "
+        "LEFT JOIN raw_messages rm ON rm.id=l.source_msg_id "
+        "LEFT JOIN ingest_sources s ON s.id=rm.source_id "
+        "ORDER BY g.id, rm.posted_at DESC NULLS LAST, l.created_at DESC, l.id DESC"
+    )
+    groups = {}
+    for row in rows:
+        group = groups.setdefault(row["group_id"], {
+            "id": row["group_id"], "display_name": row["display_name"], "members": [],
+        })
+        group["members"].append({
+            "id": row["id"], "nickname": row["nickname"], "status": row["status"],
+            "contact_username": row["contact_username"],
+            "collected_at": row["created_at"].isoformat(),
+            "posted_at": row["posted_at"].isoformat() if row["posted_at"] else None,
+            "source_title": row["source_title"],
+        })
+    return {"items": list(groups.values())}
+
+
+@router.delete("/person-groups/{group_id}/members/{listing_id}")
+async def remove_person_group_member(group_id: int, listing_id: int) -> dict:
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            deleted = await conn.fetchval(
+                "DELETE FROM listing_person_group_members "
+                "WHERE group_id=$1 AND listing_id=$2 RETURNING listing_id",
+                group_id, listing_id,
+            )
+            if deleted is None:
+                raise HTTPException(status_code=404, detail="group member not found")
+            remaining = await conn.fetchval(
+                "SELECT count(*) FROM listing_person_group_members WHERE group_id=$1", group_id,
+            )
+            if remaining < 2:
+                await conn.execute("DELETE FROM listing_person_groups WHERE id=$1", group_id)
+    return {"ok": True}
+
+
+@router.post("/duplicates/{first_id}/{second_id}/group")
+async def group_duplicate_cards(first_id: int, second_id: int) -> dict:
+    """Confirm two candidate cards are one person and join their groups."""
+    if first_id == second_id:
+        raise HTTPException(status_code=400, detail="two different cards are required")
+    left_id, right_id = sorted((first_id, second_id))
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            rows = await conn.fetch(
+                "SELECT l.id,l.nickname,l.district,l.price_amount,l.price_currency,"
+                "l.contact_peer_id,l.contact_username,l.profile_collection_job_id,l.source_msg_id,"
+                "COALESCE(NULLIF(rm.raw_text,''),l.description,'') AS source_text "
+                "FROM listings l LEFT JOIN raw_messages rm ON rm.id=l.source_msg_id "
+                "WHERE l.id=ANY($1::bigint[]) ORDER BY l.id FOR UPDATE OF l",
+                [left_id, right_id],
+            )
+            if len(rows) != 2:
+                raise HTTPException(status_code=404, detail="card not found")
+            first, second = rows
+            same_identity = (
+                first["contact_peer_id"] is not None
+                and first["contact_peer_id"] == second["contact_peer_id"]
+            ) or (
+                bool(first["contact_username"] and second["contact_username"])
+                and first["contact_username"].casefold() == second["contact_username"].casefold()
+            )
+            def signature(value: str) -> str:
+                value = re.sub(r"https?://\S+|@[A-Za-z0-9_]+", " ", value, flags=re.I)
+                return re.sub(r"\s+", "", value.casefold())
+            same_profile = (
+                first["nickname"] and second["nickname"]
+                and first["nickname"].strip().casefold() == second["nickname"].strip().casefold()
+                and first["district"] == second["district"]
+                and first["price_amount"] == second["price_amount"]
+                and first["price_currency"] == second["price_currency"]
+                and signature(first["source_text"]) == signature(second["source_text"])
+                and signature(first["source_text"]) != ""
+                and not same_identity
+            )
+            history_candidate = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM raw_messages rm "
+                "JOIN checkin_history_scans hs ON hs.source_id=rm.source_id "
+                "WHERE rm.id=ANY($1::bigint[]))",
+                [first["source_msg_id"], second["source_msg_id"]],
+            )
+            same_nickname = (
+                (first["profile_collection_job_id"] is not None
+                 or second["profile_collection_job_id"] is not None or history_candidate)
+                and first["nickname"] and second["nickname"]
+                and re.sub(r"[\s\W_]+", "", first["nickname"].casefold())
+                    == re.sub(r"[\s\W_]+", "", second["nickname"].casefold())
+            )
+            if not (same_identity or same_profile or same_nickname):
+                raise HTTPException(status_code=409, detail="cards are not current duplicate candidates")
+
+            group_ids = await conn.fetch(
+                "SELECT DISTINCT group_id FROM listing_person_group_members "
+                "WHERE listing_id=ANY($1::bigint[]) ORDER BY group_id",
+                [left_id, right_id],
+            )
+            if not group_ids:
+                group_id = await conn.fetchval(
+                    "INSERT INTO listing_person_groups (display_name) VALUES($1) RETURNING id",
+                    first["nickname"] or second["nickname"] or "",
+                )
+            else:
+                group_id = group_ids[0]["group_id"]
+                for other in group_ids[1:]:
+                    await conn.execute(
+                        "UPDATE listing_person_group_members SET group_id=$1 WHERE group_id=$2",
+                        group_id, other["group_id"],
+                    )
+                    await conn.execute("DELETE FROM listing_person_groups WHERE id=$1", other["group_id"])
+            await conn.execute(
+                "INSERT INTO listing_person_group_members (group_id,listing_id) "
+                "VALUES($1,$2),($1,$3) ON CONFLICT(listing_id) DO UPDATE SET group_id=EXCLUDED.group_id",
+                group_id, left_id, right_id,
+            )
+            member_ids = await conn.fetch(
+                "SELECT listing_id FROM listing_person_group_members WHERE group_id=$1 ORDER BY listing_id",
+                group_id,
+            )
+    return {"ok": True, "group_id": group_id, "member_ids": [row["listing_id"] for row in member_ids]}
+
+
 class DuplicateDecision(BaseModel):
     decision: Literal["keep_latest", "keep_selected", "merge_selected", "keep_both"]
     keep_listing_id: int | None = None

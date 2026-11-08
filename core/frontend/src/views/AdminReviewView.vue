@@ -14,6 +14,8 @@ const fieldDefinitions = ref([]);
 const showFieldSettings = ref(false);
 const newField = ref({ key: "", label: "", aliases: "", extraction_source: "manual", required_for_publish: false, is_active: true });
 const duplicatePairs = ref([]);
+const personGroups = ref([]);
+const duplicateView = ref("pairs");
 const selectedDuplicate = ref(null);
 const duplicateSaving = ref(false);
 const duplicateMediaSaving = ref(false);
@@ -244,6 +246,39 @@ async function loadDuplicatePairs() {
     pair.left.id === selectedDuplicate.value?.left.id
     && pair.right.id === selectedDuplicate.value?.right.id);
   selectedDuplicate.value = selected || data.items[0] || null;
+}
+
+async function loadPersonGroups() {
+  const data = await api("/api/admin/review/person-groups");
+  personGroups.value = data.items;
+}
+
+async function confirmSamePerson() {
+  const pair = selectedDuplicate.value;
+  if (!pair || duplicateSaving.value) return;
+  duplicateSaving.value = true;
+  try {
+    const ids = [pair.left.id, pair.right.id].sort((a, b) => a - b);
+    const result = await api(`/api/admin/review/duplicates/${ids[0]}/${ids[1]}/group`, { method: "POST" });
+    notify(`已归入同一人员组：${result.member_ids.map((id) => `#${id}`).join("、")}`);
+    await Promise.all([loadDuplicatePairs(), loadPersonGroups()]);
+  } catch (e) {
+    notify(`归组失败：${e.message}`);
+  } finally {
+    duplicateSaving.value = false;
+  }
+}
+
+async function removePersonGroupMember(group, member) {
+  if (!window.confirm(`将 #${member.id} 从“${group.display_name || "同一人"}”组中移出？卡片本身不会删除。`)) return;
+  try {
+    await api(`/api/admin/review/person-groups/${group.id}/members/${member.id}`, { method: "DELETE" });
+    await loadPersonGroups();
+    await loadDuplicatePairs();
+    notify(`已将 #${member.id} 移出人员组`);
+  } catch (e) {
+    notify(`移出失败：${e.message}`);
+  }
 }
 
 function newestCard(pair) {
@@ -854,7 +889,12 @@ function onReviewVisibilityChange() {
     </div>
     </template>
     <section v-else class="grid grid-cols-1 gap-4 lg:h-[calc(100dvh-190px)] lg:grid-cols-12">
-      <aside class="max-h-48 space-y-2 overflow-y-auto lg:col-span-4 lg:max-h-none lg:pr-1">
+      <div class="space-y-2 lg:col-span-4">
+      <div class="flex gap-2">
+        <button @click="duplicateView = 'pairs'; loadDuplicatePairs()" class="rounded-lg px-3 py-1.5 text-xs" :class="duplicateView === 'pairs' ? 'bg-sky-700 text-white' : 'bg-slate-800 text-slate-300'">待核对</button>
+        <button @click="duplicateView = 'groups'; loadPersonGroups()" class="rounded-lg px-3 py-1.5 text-xs" :class="duplicateView === 'groups' ? 'bg-sky-700 text-white' : 'bg-slate-800 text-slate-300'">已确认人员组</button>
+      </div>
+      <aside v-if="duplicateView === 'pairs'" class="max-h-48 space-y-2 overflow-y-auto lg:max-h-[calc(100dvh-250px)] lg:pr-1">
         <button v-for="pair in filteredDuplicatePairs" :key="`${pair.left.id}-${pair.right.id}`" @click="selectedDuplicate = pair"
           class="w-full rounded-lg border p-3 text-left" :class="selectedDuplicate?.left.id === pair.left.id && selectedDuplicate?.right.id === pair.right.id ? 'border-sky-500 bg-sky-600/10' : 'border-slate-800 bg-slate-900 hover:border-slate-600'">
           <div class="flex items-center justify-between gap-2"><span class="font-medium">{{ pair.left.nickname || pair.right.nickname || '疑似重复资料' }}</span><span class="rounded bg-amber-500/15 px-2 py-0.5 text-[11px] text-amber-300">待人工核对</span></div>
@@ -864,7 +904,18 @@ function onReviewVisibilityChange() {
         </button>
         <div v-if="!filteredDuplicatePairs.length" class="py-16 text-center text-sm text-slate-500">暂无符合筛选条件的疑似重复卡片</div>
       </aside>
-      <section v-if="selectedDuplicate" class="space-y-4 overflow-y-auto rounded-xl border border-slate-800 bg-slate-900/50 p-4 lg:col-span-8">
+      <aside v-else class="max-h-48 space-y-3 overflow-y-auto lg:max-h-[calc(100dvh-250px)] lg:pr-1">
+        <article v-for="group in personGroups" :key="group.id" class="rounded-lg border border-slate-800 bg-slate-900 p-3">
+          <h3 class="mb-2 text-sm font-medium">{{ group.display_name || '已确认同一人' }} · {{ group.members.length }} 张</h3>
+          <div v-for="member in group.members" :key="member.id" class="flex items-center justify-between gap-2 border-t border-slate-800 py-2 text-xs">
+            <div class="min-w-0"><p class="truncate text-slate-200">{{ member.nickname || group.display_name || '未命名' }} · #{{ member.id }} <span class="text-slate-500">{{ member.status }}</span></p><p class="truncate text-slate-500">@{{ member.contact_username || '未记录' }} · {{ member.source_title || '来源未知' }}</p></div>
+            <button @click="removePersonGroupMember(group, member)" class="shrink-0 rounded border border-rose-900 px-2 py-1 text-rose-300">移出</button>
+          </div>
+        </article>
+        <div v-if="!personGroups.length" class="py-12 text-center text-sm text-slate-500">暂无已确认人员组</div>
+      </aside>
+      </div>
+      <section v-if="duplicateView === 'pairs' && selectedDuplicate" class="space-y-4 overflow-y-auto rounded-xl border border-slate-800 bg-slate-900/50 p-4 lg:col-span-8">
         <div class="rounded-lg border border-amber-700/40 bg-amber-950/20 p-3 text-sm text-amber-200">候选可能由 TG 号、规范化昵称或资料内容匹配产生。请核对来源、账号、时间和媒体；系统只提供线索，不会自动合并。</div>
         <div class="grid gap-4 md:grid-cols-2">
           <article v-for="card in [selectedDuplicate.left, selectedDuplicate.right]" :key="card.id" class="min-w-0 space-y-3 rounded-lg border border-slate-800 bg-slate-950/50 p-3">
@@ -877,6 +928,7 @@ function onReviewVisibilityChange() {
           </article>
         </div>
         <div class="sticky bottom-0 flex flex-col gap-2 border-t border-slate-800 bg-slate-950/95 py-3 backdrop-blur">
+          <button @click="confirmSamePerson" :disabled="duplicateSaving" class="rounded-lg border border-emerald-600 bg-emerald-950/40 px-3 py-2.5 text-sm font-medium text-emerald-200 hover:bg-emerald-900/50 disabled:opacity-50">确认是同一人并归入人员组（卡片均保留）</button>
           <div class="grid gap-2 sm:grid-cols-2">
             <div v-for="card in [selectedDuplicate.left, selectedDuplicate.right]" :key="`actions-${card.id}`" class="grid gap-2">
               <button @click="decideDuplicate('keep_selected', card.id)" :disabled="duplicateSaving"
@@ -892,7 +944,8 @@ function onReviewVisibilityChange() {
           <button @click="decideDuplicate('keep_both')" :disabled="duplicateSaving" class="rounded-lg border border-slate-600 px-3 py-2.5 text-sm text-slate-200 hover:bg-slate-800 disabled:opacity-50">不同账号，保留两张</button>
         </div>
       </section>
-      <section v-else class="flex items-center justify-center rounded-xl border border-slate-800 text-slate-600 lg:col-span-8">选择一组疑似重复卡片</section>
+      <section v-else-if="duplicateView === 'pairs'" class="flex items-center justify-center rounded-xl border border-slate-800 text-slate-600 lg:col-span-8">选择一组疑似重复卡片</section>
+      <section v-else class="flex items-center justify-center rounded-xl border border-slate-800 text-slate-600 lg:col-span-8">人员组中的卡片仍保留独立资料，可在左侧查看或移出成员</section>
     </section>
   </div>
 </template>

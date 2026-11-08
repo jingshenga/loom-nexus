@@ -30,6 +30,8 @@ EXPECTED_TABLES = (
     "listings",
     "listing_media_ocr",
     "listing_duplicate_decisions",
+    "listing_person_groups",
+    "listing_person_group_members",
     "ocr_classification_categories",
     "ocr_classification_labels",
     "ocr_classifier_versions",
