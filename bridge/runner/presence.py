@@ -126,7 +126,10 @@ async def run_presence(pool: asyncpg.Pool, stop: asyncio.Event) -> None:
                 )
                 tiers = {}
                 for username, entity in resolved:
-                    tier = _tier(statuses.get(entity.id, entity.status))
+                    status = statuses.get(entity.id)
+                    if status is None:
+                        status = getattr(entity, "status", None)
+                    tier = _tier(status)
                     tiers[tier] = tiers.get(tier, 0) + 1
                     await pool.fetch(SQL_UPSERT, entity.id, username, tier)
                 logger.info(
