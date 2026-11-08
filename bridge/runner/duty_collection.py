@@ -180,6 +180,11 @@ def _flood_wait_seconds(exc: Exception) -> int:
 TG_PROFILE_LINK_RE = re.compile(r"https?://t\.me/([A-Za-z0-9_]+)(?:/(\d+))?", re.I)
 TG_MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])@([A-Za-z][A-Za-z0-9_]{3,31})\b", re.I)
 TG_BOT_USERNAME_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_]{1,28}bot)\b", re.I)
+BOT_PROFILE_CANDIDATE_RE = re.compile(
+    r"(?:机器人|🤖|双向|仆人)[^\n@A-Za-z0-9_]{0,20}"
+    r"(?:https?://t\.me/|t\.me/|@)?([A-Za-z][A-Za-z0-9_]{4,31})\b",
+    re.I,
+)
 PROMO_MARKER_RE = re.compile(
     r"博彩|彩票|贷款|返利|刷单|高回报|招商|加盟|优惠券|代购|推广|扫码|兼职日结"
 )
@@ -229,11 +234,34 @@ def _has_profile_content(message) -> bool:
 
 
 def _profile_links(text: str) -> list[tuple[str, str | None]]:
-    links = [(m.group(1), m.group(2)) for m in TG_PROFILE_LINK_RE.finditer(text or "")]
-    links.extend((name, None) for name in TG_MENTION_RE.findall(text or ""))
-    links.extend((name, None) for name in TG_BOT_USERNAME_RE.findall(text or ""))
-    unique = list(dict.fromkeys(links))
-    return sorted(unique, key=lambda item: not item[0].lower().endswith("bot"))
+    text = text or ""
+    matches = [
+        (match.group(1), match.group(2), match.start())
+        for match in TG_PROFILE_LINK_RE.finditer(text)
+    ]
+    matches.extend((match.group(1), None, match.start()) for match in TG_MENTION_RE.finditer(text))
+    matches.extend((match.group(1), None, match.start()) for match in TG_BOT_USERNAME_RE.finditer(text))
+
+    marked_usernames = set()
+    for match in BOT_PROFILE_CANDIDATE_RE.finditer(text):
+        username = match.group(1)
+        marked_usernames.add(username.lower())
+        matches.append((username, None, match.start(1)))
+
+    unique = {}
+    for name, message_id, position in matches:
+        unique.setdefault((name, message_id), position)
+    return [
+        (name, message_id)
+        for name, message_id in sorted(
+            unique,
+            key=lambda item: (
+                item[0].lower() not in marked_usernames,
+                not item[0].lower().endswith("bot"),
+                unique[item],
+            ),
+        )
+    ]
 
 
 def _entity_url(entity, fallback: str | None = None) -> str | None:

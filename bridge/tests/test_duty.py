@@ -105,6 +105,18 @@ class DutyRuleTests(unittest.TestCase):
         self.assertIn(("service_bot", None), candidates)
         self.assertIn(("shopbot", None), candidates)
 
+    def test_profile_bot_signals_prioritize_linked_username(self):
+        for signal in ("机器人", "🤖", "双向", "仆人"):
+            with self.subTest(signal=signal):
+                candidates = _profile_links(
+                    f"频道 @public_channel\n{signal}：@contact_helper"
+                )
+                self.assertEqual(candidates[0], ("contact_helper", None))
+
+    def test_profile_bot_signals_can_introduce_plain_username_candidate(self):
+        candidates = _profile_links("双向服务：helpercontact")
+        self.assertEqual(candidates[0], ("helpercontact", None))
+
     def test_business_day_rolls_at_four(self):
         zone = ZoneInfo("Asia/Shanghai")
         before = datetime(2026, 10, 28, 3, 59, tzinfo=zone)
