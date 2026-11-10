@@ -1,0 +1,6 @@
+*.tar
+*.tar.gz
+*.dump
+*.sql.gz
+.env
+*.session
