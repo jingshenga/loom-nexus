@@ -560,7 +560,7 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
         </button>
       </aside>
 
-      <section v-if="activeTab === 'listing'" class="lg:col-span-5 space-y-3 lg:overflow-y-auto">
+      <section v-if="activeTab === 'listing' && current" class="lg:col-span-5 space-y-3 lg:overflow-y-auto">
         <div v-if="boundGroups().length" class="flex flex-wrap items-center gap-2 text-xs">
           <span class="text-slate-500">已绑定群组：</span>
           <span v-for="b in boundGroups()" :key="b.source_id"
@@ -613,7 +613,7 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
         </details>
       </section>
 
-      <section v-else-if="activeTab === 'on_duty'" class="space-y-3 lg:col-span-5 lg:overflow-y-auto">
+      <section v-else-if="activeTab === 'on_duty' && current" class="space-y-3 lg:col-span-5 lg:overflow-y-auto">
         <div v-if="boundGroups().length" class="flex flex-wrap items-center gap-2 text-xs">
           <span class="text-slate-500">已绑定群组：</span>
           <span v-for="b in boundGroups()" :key="b.source_id"
@@ -698,7 +698,7 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
         </details>
       </section>
 
-      <section v-else class="space-y-3 lg:col-span-5 lg:overflow-y-auto">
+      <section v-else-if="current" class="space-y-3 lg:col-span-5 lg:overflow-y-auto">
         <div class="flex items-center gap-2">
           <input v-model="current.rule_name" placeholder="规则名称"
             class="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
@@ -775,7 +775,7 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
         </template>
       </section>
 
-      <section v-if="activeTab === 'listing'" class="lg:col-span-5 space-y-3 lg:overflow-y-auto">
+      <section v-if="activeTab === 'listing' && current" class="lg:col-span-5 space-y-3 lg:overflow-y-auto">
         <div class="space-y-2 rounded-xl border border-slate-800 bg-slate-900/50 p-3">
           <div class="flex items-center gap-2 text-sm font-medium"><Sparkles class="size-4 text-sky-400" />样本输入</div>
           <textarea v-model="sampleText" rows="5" placeholder="粘贴样本消息，多条用 --- 分隔"
@@ -834,7 +834,7 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
           </div>
         </div>
       </section>
-      <section v-else-if="activeTab === 'on_duty'" class="space-y-3 lg:col-span-5 lg:overflow-y-auto">
+      <section v-else-if="activeTab === 'on_duty' && current" class="space-y-3 lg:col-span-5 lg:overflow-y-auto">
         <div class="rounded-xl border border-slate-800 bg-slate-900/50 p-4">
           <h3 class="text-sm font-semibold">当前同步状态</h3>
           <div class="mt-3 grid grid-cols-2 gap-2 text-sm sm:grid-cols-3">
@@ -854,7 +854,7 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
           网关只接收绑定群内指定 Bot 的匹配榜单。其他聊天、抽奖、积分、相册不会下载媒体，也不会写入原始消息表。
         </div>
       </section>
-      <section v-else class="space-y-3 lg:col-span-5 lg:overflow-y-auto">
+      <section v-else-if="current" class="space-y-3 lg:col-span-5 lg:overflow-y-auto">
         <div v-if="activeTab === 'checkin_reverse'" class="rounded-xl border border-sky-800/50 bg-sky-950/20 p-4">
           <h3 class="text-sm font-semibold">签到来源反查 V2</h3>
           <p class="mt-2 text-xs leading-relaxed text-slate-400">从绑定的今日签到规则自动接收 TG 号，在指定公开来源中搜索精确账号。命中消息及相册媒体进入「签到补采审核」；重复身份进入「疑似重复」。</p>
