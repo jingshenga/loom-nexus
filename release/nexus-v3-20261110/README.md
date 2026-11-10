@@ -20,3 +20,7 @@ Run `sha256sum -c A/bridge/SHA256SUMS` from `A/bridge` and `sha256sum -c BC/SHA2
 - The pre-deploy dump and config bundle remain in the NAS-only `release-backups/v3-predeploy-20261110T073109` directory. Its checksum manifest and isolated restore were verified. No production secrets or database data are included here.
 
 Migrations are ordered by filename in `BC/scripts/migrations/`. The schema initialization fix under `BC/schema-init/` is for initialization/recovery only; do not apply it over an existing production database.
+
+## Source revision
+
+The exact A/B+C overlay payloads are in source commit `90651f819dd52720d9e4fc24ef61a83c373d9e2c` on branch `codex/nexus-v3-production-20261110`. The follow-up provenance commit only records this pointer.
