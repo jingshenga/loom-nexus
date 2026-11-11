@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-BASE_IMAGE="${NEXUS_CORE_BASE_IMAGE:-nexus-core:v3-lifecycle-router-shadow-20261110}"
-EXPECTED_BASE_ID="${NEXUS_CORE_BASE_IMAGE_ID:-sha256:9a6b125ee195a46a7ebd3ab3deca13e108053b321c16f40001acbc33a90ceb7e}"
+BASE_IMAGE="${NEXUS_CORE_BASE_IMAGE:-nexus-core:active-router-release-ba9a175}"
+EXPECTED_BASE_ID="${NEXUS_CORE_BASE_IMAGE_ID:-sha256:16240edf79ab7e262048a5b70e12e58bbe88edcd70dda203eac4dfce8d987d70}"
 CANDIDATE_IMAGE="${NEXUS_CORE_CANDIDATE_IMAGE:-nexus-core:active-router-release}"
 
 die() { printf 'BLOCKED: %s\n' "$*" >&2; exit 1; }

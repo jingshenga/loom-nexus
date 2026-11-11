@@ -1,4 +1,6 @@
+import json
 import unittest
+from pathlib import Path
 
 from app.extractor.rule_config import validate_match_mode, validate_rule_config
 from app.extractor.rule_router import (
@@ -172,6 +174,19 @@ class RuleRouter2ATests(unittest.TestCase):
             "gate": {}, "extract": {}, "ocr": {}, "lifecycle_terms": [],
         })
         self.assertFalse(result["changed"])
+
+    def test_sanitized_source2_promotions_remain_unmatched_review_candidates(self):
+        fixture = Path(__file__).parent / "fixtures" / "source2_active_gate_samples.json"
+        samples = json.loads(fixture.read_text())["samples"]
+        binding = self.binding(3, r"@([A-Za-z0-9_]{5,32})")
+        binding["config_json"]["gate"] = {"require_any_keywords": ["艺名", "价格", "位置"]}
+
+        for sample in samples:
+            with self.subTest(sample=sample["name"]):
+                result = resolve_active_listing([binding], sample["text"])
+                self.assertEqual(result["reason"], sample["expected_reason"])
+                self.assertIsNone(result["selected"])
+                self.assertEqual(result["conflicts"], [])
 
     def test_business_key_ignores_rule_version(self):
         key_a = business_candidate_key(10, 20, "listing", "alphauser")

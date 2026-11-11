@@ -1,0 +1,27 @@
+{
+  "source_id": 2,
+  "sample_kind": "sanitized_production_shapes",
+  "samples": [
+    {
+      "name": "telegram_search_promotion",
+      "text": "Telegram 搜索工具帮助查找群组、频道、视频和音乐；入口 t.me/sample_channel?start=sample_token",
+      "media_kind": "photo",
+      "ocr_review_only": true,
+      "expected_reason": "no_match"
+    },
+    {
+      "name": "board_discount_promotion_a",
+      "text": "SampleName（@sample_user）上榜前三天全天优惠 P优惠1 PP优惠2",
+      "media_kind": "photo",
+      "ocr_review_only": true,
+      "expected_reason": "no_match"
+    },
+    {
+      "name": "board_discount_promotion_b",
+      "text": "SampleName（@sample_user）全天优惠一张！",
+      "media_kind": "photo",
+      "ocr_review_only": true,
+      "expected_reason": "no_match"
+    }
+  ]
+}
