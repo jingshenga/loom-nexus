@@ -6,6 +6,11 @@ from app.extractor import ast_rules
 from app.extractor.rule_config import MAX_RULE_TEXT, validate_rule_config
 
 
+def normalize_telegram_identity(value):
+    """Treat absent, empty, @-prefixed, and case-varied TG names consistently."""
+    return str(value or "").strip().lstrip("@").casefold()
+
+
 def business_candidate_key(source_id, platform_msg_id, purpose, target_identity=""):
     """Stable key intentionally independent of rule/config version."""
     payload = json.dumps(
@@ -69,7 +74,7 @@ def evaluate_candidate(binding, text, sender_peer_id=None):
         **trace, "supported": True, "matched": matched,
         "reason": "match" if matched else "no_structure",
         "fields": fields, "evidence": evidence, "lifecycle": lifecycle,
-        "identity": (fields.get("username") or "").strip().lower(),
+        "identity": normalize_telegram_identity(fields.get("username")),
         "missing_fields": missing,
         "ocr_would_be_considered": bool(
             (config.get("ocr") or {}).get("enabled")
@@ -242,7 +247,8 @@ def shadow_compare(bindings, text, sender_peer_id=None, legacy_config=None):
     changed = any(
         item.get("conflicts") or (
             item["purpose"] == "listing" and (
-                (item.get("selected") or {}).get("identity", "") != actual_identity
+                normalize_telegram_identity((item.get("selected") or {}).get("identity"))
+                != normalize_telegram_identity(actual_identity)
                 or (item.get("selected") or {}).get("fields", {}) != actual_fields
                 or bool(item.get("selected")) != bool(actual and actual.get("matched"))
             )

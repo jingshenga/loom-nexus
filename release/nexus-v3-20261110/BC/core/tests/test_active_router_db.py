@@ -120,6 +120,10 @@ class ActiveRouterDatabaseTests(unittest.TestCase):
                               "WHERE q.raw_id=102;").strip()
         self.assertEqual(result, "duplicate_pending:null:published:1")
 
+    @unittest.skipUnless(
+        (ROOT / "scripts/shadow_guard_sidecar.py").is_file(),
+        "Shadow guard sidecar is distributed outside the Core release overlay",
+    )
     def test_shadow_guard_metrics_sql_runs_against_postgresql_and_keeps_source_scope(self):
         base = f"SET search_path TO {self.schema};"
         self.run_sql(base + "TRUNCATE rule_active_review_events,rule_active_review_queue,"

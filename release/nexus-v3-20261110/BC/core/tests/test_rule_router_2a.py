@@ -5,6 +5,7 @@ from app.extractor.rule_router import (
     active_source_allowed,
     business_candidate_key,
     legacy_selected,
+    normalize_telegram_identity,
     resolve_active_listing,
     resolve_group,
     shadow_compare,
@@ -162,6 +163,15 @@ class RuleRouter2ATests(unittest.TestCase):
         )
         self.assertTrue(result["changed"])
         self.assertEqual(bindings[0], before)
+
+    def test_shadow_identity_diff_normalizes_missing_empty_at_and_case(self):
+        self.assertEqual(normalize_telegram_identity(None), normalize_telegram_identity(""))
+        self.assertEqual(normalize_telegram_identity(" @AlphaUser "), "alphauser")
+        bindings = [self.binding(1, r"never[:：]([A-Za-z0-9_]{5,32})")]
+        result = shadow_compare(bindings, "无身份字段", legacy_config={
+            "gate": {}, "extract": {}, "ocr": {}, "lifecycle_terms": [],
+        })
+        self.assertFalse(result["changed"])
 
     def test_business_key_ignores_rule_version(self):
         key_a = business_candidate_key(10, 20, "listing", "alphauser")

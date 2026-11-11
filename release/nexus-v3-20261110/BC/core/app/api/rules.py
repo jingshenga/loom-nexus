@@ -18,6 +18,7 @@ from app.config import get_settings
 from app.extractor import ast_rules
 from app.extractor.rule_config import PARSER_BY_TYPE, validate_rule_config, validate_match_mode
 from app.extractor.rule_router import business_candidate_key, config_hash, shadow_compare
+from app.extractor.rule_router import active_source_allowed
 
 router = APIRouter(
     prefix="/api/admin/rules", tags=["admin-rules"],
@@ -120,7 +121,7 @@ class RollbackBody(BaseModel):
 
 
 class RouterModeBody(BaseModel):
-    mode: Literal["legacy", "shadow"]
+    mode: Literal["legacy", "shadow", "active"]
 
 
 class RouterDryRunBody(BaseModel):
@@ -436,13 +437,21 @@ async def router_management() -> dict:
     errors = {}
     for row in error_rows:
         errors.setdefault(row["source_id"], []).append(dict(row))
+    settings = get_settings()
+    allowed_ids = sorted({int(value.strip()) for value in settings.active_router_source_ids.split(",")
+                          if value.strip().isdigit()})
+    active_available = (
+        settings.active_router_enabled and not settings.active_router_kill_switch
+        and len(allowed_ids) == 1
+    )
     return {"items": [{**dict(row),
                        "bindings": _decode_jsonb(row["bindings"], []),
                        "last_shadow": _decode_jsonb(row["last_shadow"], None),
                        "last_mode_event": _decode_jsonb(row["last_mode_event"], None),
                        "recent_errors": errors.get(row["source_id"], [])}
                       for row in rows],
-            "active_mode_available": False}
+            "active_mode_available": active_available,
+            "active_source_ids": allowed_ids if active_available else []}
 
 
 @router.get("/active-review-queue")
@@ -593,8 +602,23 @@ async def set_source_router_mode(source_id: int, body: RouterModeBody,
                                  authorization: str = Header(default="")) -> dict:
     pool = _pool()
     actor_id = current_user_id(authorization)
+    settings = get_settings()
+    allowed_ids = {int(value.strip()) for value in settings.active_router_source_ids.split(",")
+                   if value.strip().isdigit()}
+    if body.mode == "active" and (
+        not settings.active_router_enabled or settings.active_router_kill_switch
+        or allowed_ids != {source_id}
+        or not active_source_allowed(
+            source_id, enabled=settings.active_router_enabled,
+            allowed_source_ids=settings.active_router_source_ids,
+            kill_switch=settings.active_router_kill_switch,
+        )
+    ):
+        raise HTTPException(status_code=409, detail="Active 未获准：需开启全局开关、关闭急停并仅白名单此来源")
     async with pool.acquire() as conn:
         async with conn.transaction():
+            if body.mode == "active":
+                await conn.fetchval("SELECT pg_advisory_xact_lock($1)", 814271002)
             row = await conn.fetchrow(
                 "SELECT router_mode FROM ingest_sources WHERE id=$1 FOR UPDATE", source_id,
             )
@@ -602,6 +626,13 @@ async def set_source_router_mode(source_id: int, body: RouterModeBody,
                 raise HTTPException(status_code=404, detail="source not found")
             previous = row["router_mode"]
             if previous != body.mode:
+                if body.mode == "active":
+                    active_rows = await conn.fetch(
+                        "SELECT id FROM ingest_sources WHERE router_mode='active' AND id<>$1 FOR UPDATE",
+                        source_id,
+                    )
+                    if active_rows:
+                        raise HTTPException(status_code=409, detail="已有其他来源处于 Active；同一时间只允许一个试点")
                 await conn.execute("UPDATE ingest_sources SET router_mode=$2 WHERE id=$1", source_id, body.mode)
                 await conn.execute(
                     "INSERT INTO rule_router_mode_events(source_id,previous_mode,new_mode,actor_user_id) "

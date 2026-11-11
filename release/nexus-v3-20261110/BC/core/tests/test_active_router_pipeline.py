@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from app.extractor import pipeline
+from app.extractor.pipeline import _shadow_safe_prediction
 
 
 class ActiveRouterPipelineTests(unittest.IsolatedAsyncioTestCase):
@@ -36,15 +37,42 @@ class ActiveRouterPipelineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_mode_and_flags_fail_closed_to_legacy(self):
         with patch.object(pipeline, "get_settings", return_value=self.settings(active_router_enabled=False)):
+            route = await self.extractor._active_route(self.message)
+        self.assertEqual(route["review_reason"], "active_router_disabled")
+        self.pool.fetchval.assert_awaited_once()
+
+    async def test_non_active_source_keeps_legacy_path(self):
+        self.pool.fetchval.return_value = "legacy"
+        with patch.object(pipeline, "get_settings", return_value=self.settings()):
             self.assertIsNone(await self.extractor._active_route(self.message))
-        self.pool.fetchval.assert_not_awaited()
+
+    async def test_six_none_empty_shadow_identity_diffs_are_not_real_differences(self):
+        actual = {"fields": {}, "identity": None}
+        results = [_shadow_safe_prediction({"selected": None}, actual) for _ in range(6)]
+        self.assertEqual(sum(item["identity_diff"] for item in results), 0)
 
     async def test_allowlisted_active_source_uses_bound_version_and_fields(self):
         with patch.object(pipeline, "get_settings", return_value=self.settings()):
             route = await self.extractor._active_route(self.message)
         self.assertEqual(route["fields"]["username"], "alphauser")
         self.assertEqual(route["rule_config"], self.rule)
+        self.assertEqual(route["review_reason"], "human_review_required")
+        self.assertTrue(route["result"]["selected"])
         self.pool.fetch.assert_awaited_once_with(pipeline.SQL_SHADOW_BINDINGS, 2)
+
+    async def test_valid_active_candidate_is_queued_without_listing_creation(self):
+        route = {"review_reason": "human_review_required", "fields": {"username": "alphauser"},
+                 "evidence": {}, "rule_config": self.rule,
+                 "result": {"selected": {"fields": {"username": "alphauser"},
+                                          "identity": "alphauser", "rule_ids": [7]}, "trace": []}}
+        with patch.object(self.extractor, "_active_route", new=AsyncMock(return_value=route)), \
+             patch.object(self.extractor, "_enqueue_active_review", new=AsyncMock()) as enqueue, \
+             patch.object(self.extractor, "_record_shadow_if_enabled", new=AsyncMock()):
+            await self.extractor._process_one({**self.message, "rule_config": self.rule, "media_json": []})
+        enqueue.assert_awaited_once()
+        self.assertEqual(self.pool.fetch.await_args.args, (pipeline.SQL_MARK, 15, "dropped"))
+        self.assertFalse(any(call.args and call.args[0] == pipeline.SQL_CREATE_LISTING
+                             for call in self.pool.fetch.await_args_list))
 
     async def test_conflicting_identity_is_queued_without_raw_text(self):
         second = {**self.binding, "rule_id": 8, "rule_version_id": 81,

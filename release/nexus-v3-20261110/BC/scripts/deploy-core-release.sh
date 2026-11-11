@@ -87,15 +87,16 @@ environment = core.get("environment", {})
 def environment_value(name):
     value = environment.get(name)
     return value.get("value") if isinstance(value, dict) else value
-assert str(environment_value("NEXUS_ACTIVE_ROUTER_ENABLED")).lower() in {"0", "false"}, "Active Router global gate must stay off"
-assert not environment_value("NEXUS_ACTIVE_ROUTER_SOURCE_IDS"), "Active Router source allowlist must stay empty"
-assert str(environment_value("NEXUS_ACTIVE_ROUTER_KILL_SWITCH")).lower() in {"1", "true"}, "Active Router kill switch must stay on"
+enabled = str(environment_value("NEXUS_ACTIVE_ROUTER_ENABLED")).lower() in {"1", "true"}
+allowed = [part.strip() for part in str(environment_value("NEXUS_ACTIVE_ROUTER_SOURCE_IDS") or "").split(",") if part.strip()]
+kill = str(environment_value("NEXUS_ACTIVE_ROUTER_KILL_SWITCH")).lower() in {"1", "true"}
+assert (not enabled and not allowed and kill) or (enabled and len(allowed) == 1 and not kill), "Active must be fully off or armed for exactly one source with kill switch off"
 image_id = subprocess.check_output(["docker", "image", "inspect", "--format", "{{.Id}}", core["image"]], text=True).strip()
 assert image_id == sys.argv[2], "Compose image does not resolve to the running Core baseline"
 PY
 
 MISSING_OBJECTS="$(docker compose -f "$COMPOSE_FILE" exec -T nexus-db sh -lc \
-  'exec psql -XAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' 2>/dev/null <<'SQL'
+  'exec psql -XAtq -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' 2>/dev/null <<'SQL'
 BEGIN READ ONLY;
 SET LOCAL statement_timeout='5s';
 SELECT object_name FROM (VALUES
@@ -110,6 +111,16 @@ SELECT object_name FROM (VALUES
  ('table:rule_shadow_cleanup_runs', to_regclass('public.rule_shadow_cleanup_runs') IS NOT NULL),
  ('table:rule_active_review_queue', to_regclass('public.rule_active_review_queue') IS NOT NULL),
  ('table:rule_active_review_events', to_regclass('public.rule_active_review_events') IS NOT NULL),
+ ('constraint:router_mode_previous_active', EXISTS (
+   SELECT 1 FROM pg_constraint c
+   WHERE c.conrelid=to_regclass('public.rule_router_mode_events')
+     AND c.conname='rule_router_mode_events_previous_mode_check'
+     AND position('active' IN pg_get_constraintdef(c.oid)) > 0)),
+ ('constraint:router_mode_new_active', EXISTS (
+   SELECT 1 FROM pg_constraint c
+   WHERE c.conrelid=to_regclass('public.rule_router_mode_events')
+     AND c.conname='rule_router_mode_events_new_mode_check'
+     AND position('active' IN pg_get_constraintdef(c.oid)) > 0)),
  ('function:rule_upsert_versioned', to_regproc('public.rule_upsert_versioned') IS NOT NULL),
  ('function:rule_router_mode_set', to_regproc('public.rule_router_mode_set') IS NOT NULL),
  ('function:rule_shadow_bindings_for_source', to_regproc('public.rule_shadow_bindings_for_source') IS NOT NULL),
@@ -120,7 +131,7 @@ SQL
 )" || die "read-only schema compatibility check failed"
 [[ -z "$MISSING_OBJECTS" ]] || die "V3 schema objects missing: $MISSING_OBJECTS"
 ACTIVE_SOURCES="$(docker compose -f "$COMPOSE_FILE" exec -T nexus-db sh -lc \
-  'exec psql -XAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT id FROM ingest_sources WHERE router_mode=chr(97)||chr(99)||chr(116)||chr(105)||chr(118)||chr(101) ORDER BY id"' 2>/dev/null)" \
+  'exec psql -XAtq -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT id FROM ingest_sources WHERE router_mode=chr(97)||chr(99)||chr(116)||chr(105)||chr(118)||chr(101) ORDER BY id"' 2>/dev/null)" \
   || die "could not verify source modes"
 [[ -z "$ACTIVE_SOURCES" ]] || die "Active Router is enabled for sources: $ACTIVE_SOURCES"
 
@@ -150,8 +161,20 @@ PY
 
 rollback() {
   printf 'Rolling back Core to %s (%s)\n' "$PREVIOUS_REF" "$PREVIOUS_ID" >&2
-  cp -p "$BACKUP_FILE" "$COMPOSE_FILE"
-  docker compose -f "$COMPOSE_FILE" up -d --no-deps --no-build nexus-core >&2 || true
+  cp -p "$BACKUP_FILE" "$COMPOSE_FILE" || die "rollback failed: Compose restore failed"
+  docker compose -f "$COMPOSE_FILE" up -d --no-deps --no-build nexus-core >&2 \
+    || die "rollback failed: Core restore command failed"
+  for _ in $(seq 1 60); do
+    state="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' nexus-core 2>/dev/null || true)"
+    image_id="$(docker inspect --format '{{.Image}}' nexus-core 2>/dev/null || true)"
+    if [[ "$state" == healthy && "$image_id" == "$PREVIOUS_ID" ]]; then
+      printf 'ROLLBACK_OK image_id=%s compose=%s\n' "$image_id" "$BACKUP_FILE" >&2
+      return 0
+    fi
+    if [[ "$state" == exited || "$state" == dead ]]; then break; fi
+    sleep 2
+  done
+  die "rollback failed: previous Core image did not become healthy"
 }
 
 if ! docker compose -f "$COMPOSE_FILE" config --quiet; then rollback; die "candidate Compose validation failed"; fi

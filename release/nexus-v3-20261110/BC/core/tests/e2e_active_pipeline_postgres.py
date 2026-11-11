@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import uuid
+from decimal import Decimal
 from unittest import mock
 
 import asyncpg
@@ -85,10 +86,17 @@ async def main():
             "price": [r"价格[:：]\s*(\d+)"],
         }, "normal")
         normal_raw = await add_raw("TG:@alphauser 昵称：小林 价格：300")
-        normal = await pool.fetchrow("SELECT status,contact_username,nickname,price_amount FROM listings WHERE source_msg_id=$1", normal_raw)
-        assert normal and normal["status"] == "pending" and normal["contact_username"] == "alphauser"
-        assert normal["nickname"] == "小林" and str(normal["price_amount"]) == "300.00"
-        listing_ids.extend(await pool.fetch("SELECT id FROM listings WHERE source_msg_id=$1", normal_raw))
+        normal = await pool.fetchrow(
+            "SELECT reason,candidate_json FROM rule_active_review_queue WHERE raw_id=$1", normal_raw,
+        )
+        assert normal and normal["reason"] == "human_review_required"
+        normal_candidate = normal["candidate_json"]
+        if isinstance(normal_candidate, str):
+            normal_candidate = json.loads(normal_candidate)
+        assert normal_candidate["fields"]["username"] == "alphauser"
+        assert normal_candidate["fields"]["nickname"] == "小林"
+        assert Decimal(str(normal_candidate["fields"]["price_amount"])) == Decimal("300")
+        assert not await pool.fetchval("SELECT EXISTS(SELECT 1 FROM listings WHERE source_msg_id=$1)", normal_raw)
 
         legacy_config = {**RULE_BASE, "extract": {
             "username": [r"TG[:：]\s*@?([A-Za-z0-9_]{5,32})"],
@@ -97,17 +105,31 @@ async def main():
         }}
         disabled = settings.model_copy(update={"active_router_enabled": False, "active_router_kill_switch": True})
         with mock.patch.object(pipeline, "get_settings", return_value=disabled):
+            denied_raw = await add_raw("TG:@denieduser 昵称：关闭保护 价格：320", legacy_config)
+        denied_reason = await pool.fetchval(
+            "SELECT reason FROM rule_active_review_queue WHERE raw_id=$1", denied_raw,
+        )
+        assert denied_reason == "active_router_disabled"
+        assert not await pool.fetchval("SELECT EXISTS(SELECT 1 FROM listings WHERE source_msg_id=$1)", denied_raw)
+
+        await pool.execute("UPDATE ingest_sources SET router_mode='legacy' WHERE id=$1", SOURCE_ID)
+        with mock.patch.object(pipeline, "get_settings", return_value=disabled):
             legacy_raw = await add_raw("TG:@legacyuser 昵称：Legacy路径 价格：320", legacy_config)
         legacy = await pool.fetchrow("SELECT status,contact_username FROM listings WHERE source_msg_id=$1", legacy_raw)
         assert legacy and legacy["status"] == "pending" and legacy["contact_username"] == "legacyuser"
         assert not await pool.fetchval("SELECT EXISTS(SELECT 1 FROM rule_parse_runs WHERE run_reason='active' "
                                        "AND raw_revision_id IN (SELECT id FROM raw_message_revisions WHERE raw_id=$1))", legacy_raw)
-        listing_ids.extend(await pool.fetch("SELECT id FROM listings WHERE source_msg_id=$1", legacy_raw))
+        listing_ids.extend(row["id"] for row in await pool.fetch(
+            "SELECT id FROM listings WHERE source_msg_id=$1", legacy_raw,
+        ))
+        await pool.execute("UPDATE ingest_sources SET router_mode='active' WHERE id=$1", SOURCE_ID)
 
-        await pool.execute(
-            "UPDATE listings SET status='published',nickname='人工锁定',manual_fields=$2::jsonb,"
-            "published_at=NOW() WHERE source_msg_id=$1", normal_raw, '{"nickname":true}',
+        original_listing_id = await pool.fetchval(
+            "INSERT INTO listings(source_msg_id,contact_username,nickname,price_amount,status,"
+            "manual_fields,published_at) VALUES($1,'alphauser','人工锁定',300,'published',"
+            "'{\"nickname\":true}'::jsonb,NOW()) RETURNING id", normal_raw,
         )
+        listing_ids.extend([original_listing_id])
         edited_text = "TG:@alphauser 昵称：新候选 价格：350"
         await pool.execute("UPDATE raw_messages SET raw_text=$2 WHERE id=$1", normal_raw, edited_text)
         await extractor._process_one({
@@ -117,23 +139,35 @@ async def main():
         })
         protected = await pool.fetchrow(
             "SELECT status,contact_username,nickname,price_amount,manual_fields,published_at "
-            "FROM listings WHERE source_msg_id=$1", normal_raw,
+            "FROM listings WHERE id=$1", original_listing_id,
         )
         assert protected["status"] == "published" and protected["contact_username"] == "alphauser"
-        assert protected["nickname"] == "人工锁定" and str(protected["price_amount"]) == "350.00"
+        assert protected["nickname"] == "人工锁定" and str(protected["price_amount"]) == "300.00"
         protected_fields = protected["manual_fields"]
         if isinstance(protected_fields, str):
             protected_fields = json.loads(protected_fields)
         assert protected_fields == {"nickname": True} and protected["published_at"] is not None
 
+        edited_candidate = await pool.fetchrow(
+            "SELECT candidate_json FROM rule_active_review_queue WHERE raw_id=$1 "
+            "ORDER BY id DESC LIMIT 1", normal_raw,
+        )
+        edited_fields = edited_candidate["candidate_json"]
+        if isinstance(edited_fields, str):
+            edited_fields = json.loads(edited_fields)
+        assert Decimal(str(edited_fields["fields"]["price_amount"])) == Decimal("350")
+
         await pool.execute("DELETE FROM source_rule_bindings WHERE source_id=$1", SOURCE_ID)
         await add_rule("merge-identity", {"username": [r"TG[:：]\s*@?([A-Za-z0-9_]{5,32})"]}, "identity")
         await add_rule("merge-profile", {"nickname": [r"昵称[:：]\s*([^\s]+)"]}, "profile")
         merged_raw = await add_raw("TG:@mergeuser 昵称：合并候选")
-        merged = await pool.fetchrow("SELECT status,contact_username,nickname FROM listings WHERE source_msg_id=$1", merged_raw)
-        assert merged and merged["status"] == "pending" and merged["contact_username"] == "mergeuser"
-        assert merged["nickname"] == "合并候选"
-        listing_ids.extend(await pool.fetch("SELECT id FROM listings WHERE source_msg_id=$1", merged_raw))
+        merged = await pool.fetchrow("SELECT candidate_json FROM rule_active_review_queue WHERE raw_id=$1", merged_raw)
+        merged_candidate = merged["candidate_json"]
+        if isinstance(merged_candidate, str):
+            merged_candidate = json.loads(merged_candidate)
+        assert merged_candidate["fields"]["username"] == "mergeuser"
+        assert merged_candidate["fields"]["nickname"] == "合并候选"
+        assert not await pool.fetchval("SELECT EXISTS(SELECT 1 FROM listings WHERE source_msg_id=$1)", merged_raw)
 
         await pool.execute("DELETE FROM source_rule_bindings WHERE source_id=$1", SOURCE_ID)
         await add_rule("identity-a", {"username": [r"TG[:：]\s*@?([A-Za-z0-9_]{5,32})"]}, "identity-a")
@@ -168,14 +202,14 @@ async def main():
         active_runs = await pool.fetchval("SELECT count(*) FROM rule_parse_runs WHERE run_reason='active' AND raw_revision_id IN "
                                           "(SELECT id FROM raw_message_revisions WHERE raw_id=ANY($1::bigint[]))", raw_ids)
         assert active_runs >= len(raw_ids), (active_runs, len(raw_ids))
-        print("Active Core/PostgreSQL pipeline E2E: pending Listing, kill-switch Legacy fallback, additive field merge, "
+        print("Active Core/PostgreSQL pipeline E2E: review-first candidate, kill-switch review parking, additive field merge, "
               "identity/field conflict review, missing identity review, Lifecycle review, no unsafe Listing creation: OK")
     finally:
         if raw_ids:
             await pool.execute("DELETE FROM listings WHERE source_msg_id=ANY($1::bigint[])", raw_ids)
             await pool.execute("DELETE FROM raw_messages WHERE id=ANY($1::bigint[])", raw_ids)
         if listing_ids:
-            await pool.execute("DELETE FROM listings WHERE id=ANY($1::bigint[])", [row["id"] for row in listing_ids])
+            await pool.execute("DELETE FROM listings WHERE id=ANY($1::bigint[])", listing_ids)
         if rule_ids:
             await pool.execute("DELETE FROM ingest_rules WHERE id=ANY($1::bigint[])", rule_ids)
         await pool.execute("DELETE FROM ingest_sources WHERE id=$1", SOURCE_ID)

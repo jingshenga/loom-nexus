@@ -7,6 +7,8 @@ import { api } from "../api/client";
 const sources = ref([]);
 const templates = ref([]);
 const diagnostics = ref(null);
+const activeModeAvailable = ref(false);
+const activeSourceIds = ref([]);
 const selectedSourceId = ref("");
 const selectedRuleId = ref("");
 const selectedVersionId = ref("");
@@ -70,6 +72,8 @@ async function load() {
       api("/api/admin/rules/shadow-diagnostics"),
     ]);
     sources.value = routerData.items || [];
+    activeModeAvailable.value = Boolean(routerData.active_mode_available);
+    activeSourceIds.value = routerData.active_source_ids || [];
     templates.value = templateData.items || [];
     diagnostics.value = diagnosticsData;
     if (!sources.value.some((item) => String(item.source_id) === String(selectedSourceId.value))) {
@@ -129,9 +133,11 @@ async function runDryRun() {
 async function setMode(mode) {
   const source = selectedSource.value;
   if (!source || busy.value || source.router_mode === mode) return;
-  const modeName = mode === "shadow" ? "Shadow" : "Legacy";
+  const modeName = mode === "shadow" ? "Shadow" : mode === "active" ? "Active" : "Legacy";
   const prompt = "确定只对来源「" + source.title + "」(ID " + source.source_id + ") 切换为 " + modeName + "？\n\n"
-    + (mode === "shadow"
+    + (mode === "active"
+      ? "Active 首轮为审核优先：新结果进入审核，不自动上架；身份不清、冲突或异常均进入待审，Lifecycle 仍由人工审核。"
+      : mode === "shadow"
       ? "Shadow 只记录预测，Legacy 继续处理实际数据；启用前需已部署相应数据库结构。"
       : "后续消息会回到 Legacy 路径。")
     + "\n操作会记录管理员身份和变更时间。";
@@ -206,7 +212,7 @@ onMounted(load);
     <header class="flex flex-wrap items-center justify-between gap-3">
       <div>
         <h1 class="flex items-center gap-2 text-xl font-semibold"><GitBranch class="size-5" />规则版本与 Shadow</h1>
-        <p class="mt-1 text-xs text-slate-400">逐来源查看和操作。Active 当前不可用；模式切换仅作用于单个来源。</p>
+        <p class="mt-1 text-xs text-slate-400">逐来源查看和操作。Active 仅可对唯一白名单来源启用；首轮结果先审核，不自动上架。</p>
       </div>
       <button class="flex items-center gap-2 rounded-lg border border-slate-700 px-3 py-2 text-sm" @click="load"><RefreshCw class="size-4" />刷新</button>
     </header>
@@ -218,7 +224,7 @@ onMounted(load);
         <label class="relative block"><Search class="absolute left-3 top-2.5 size-4 text-slate-500" /><input v-model="search" placeholder="搜索来源或规则" class="w-full rounded-lg border border-slate-700 bg-slate-950 py-2 pl-9 pr-3 text-sm" /></label>
         <div class="max-h-[70vh] space-y-2 overflow-y-auto pr-1">
           <button v-for="source in visibleSources" :key="source.source_id" class="w-full min-w-0 rounded-xl border p-3 text-left" :class="String(source.source_id) === String(selectedSourceId) ? 'border-sky-600 bg-sky-950/30' : 'border-slate-800 bg-slate-900/70'" @click="changeSource(source)">
-            <div class="flex min-w-0 items-start justify-between gap-2"><span class="min-w-0 break-words text-sm font-medium">{{ source.title || "未命名来源" }}</span><span class="shrink-0 rounded px-2 py-0.5 text-[10px]" :class="source.router_mode === 'shadow' ? 'bg-violet-900 text-violet-200' : 'bg-slate-800 text-slate-300'">{{ source.router_mode === "shadow" ? "Shadow" : "Legacy" }}</span></div>
+            <div class="flex min-w-0 items-start justify-between gap-2"><span class="min-w-0 break-words text-sm font-medium">{{ source.title || "未命名来源" }}</span><span class="shrink-0 rounded px-2 py-0.5 text-[10px]" :class="source.router_mode === 'shadow' ? 'bg-violet-900 text-violet-200' : source.router_mode === 'active' ? 'bg-amber-900 text-amber-200' : 'bg-slate-800 text-slate-300'">{{ source.router_mode === "shadow" ? "Shadow" : source.router_mode === "active" ? "Active" : "Legacy" }}</span></div>
             <p class="mt-1 break-all text-[11px] text-slate-500">Source {{ source.source_id }} · peer {{ source.peer_id }}</p>
             <p class="mt-1 text-[11px] text-slate-500">{{ source.bindings.length }} 条绑定 · {{ source.last_shadow ? "最近 Shadow " + new Date(source.last_shadow.observed_at).toLocaleString() : "无 Shadow 记录" }}</p>
           </button>
@@ -231,13 +237,14 @@ onMounted(load);
             <div class="min-w-0">
               <h2 class="break-words text-lg font-semibold">{{ selectedSource.title || "未命名来源" }}</h2>
               <p class="mt-1 break-all text-xs text-slate-400">Source {{ selectedSource.source_id }} · peer {{ selectedSource.peer_id }} · {{ selectedSource.username ? "@" + selectedSource.username : "无公开用户名" }} · {{ selectedSource.router_mode }}</p>
-              <p class="mt-1 text-[11px] text-amber-300">模式切换依赖 2A–2D 数据库迁移已完成；本地页面不会代替生产迁移或发布审批。</p>
+              <p class="mt-1 text-[11px] text-amber-300">Active 仅管理员可对唯一白名单来源启用。结果先进入人工审核，不自动上架；可立即切回 Legacy。</p>
               <p v-if="selectedSource.last_mode_event" class="mt-1 text-[11px] text-slate-500">最近模式：{{ selectedSource.last_mode_event.previous_mode }} → {{ selectedSource.last_mode_event.new_mode }} · 管理员 #{{ selectedSource.last_mode_event.actor_user_id }} · {{ new Date(selectedSource.last_mode_event.changed_at).toLocaleString() }}</p>
             </div>
             <div class="flex flex-wrap gap-2">
               <button v-if="selectedSource.router_mode === 'legacy'" :disabled="busy" class="rounded-lg bg-violet-700 px-3 py-2 text-sm text-white disabled:opacity-50" @click="setMode('shadow')">此来源启用 Shadow</button>
               <button v-else :disabled="busy" class="rounded-lg bg-slate-700 px-3 py-2 text-sm text-white disabled:opacity-50" @click="setMode('legacy')">切回 Legacy</button>
-              <button disabled title="Active 模式本阶段不可用" class="cursor-not-allowed rounded-lg border border-slate-800 px-3 py-2 text-sm text-slate-600">Active（禁用）</button>
+              <button v-if="selectedSource.router_mode === 'legacy' && activeModeAvailable && activeSourceIds.includes(selectedSource.source_id)" :disabled="busy" class="rounded-lg bg-amber-700 px-3 py-2 text-sm text-white disabled:opacity-50" @click="setMode('active')">此来源启用 Active（审核优先）</button>
+              <button v-else-if="selectedSource.router_mode === 'legacy'" disabled title="需发布配置明确开启 Active、配置唯一来源白名单并关闭急停" class="cursor-not-allowed rounded-lg border border-slate-800 px-3 py-2 text-sm text-slate-600">Active（未获准）</button>
             </div>
           </div>
           <div class="grid gap-2 md:grid-cols-2">

@@ -45,7 +45,12 @@ async def main():
     suffix = uuid.uuid4().hex[:12]
     username = f"active_e2e_{suffix}"
     peer_id = -int(uuid.uuid4().int % 8_000_000_000) - 1
-    source_id = raw_ids = listing_ids = None
+    allowed_source_ids = {int(part.strip()) for part in settings.active_router_source_ids.split(",")
+                          if part.strip().isdigit()}
+    assert settings.active_router_enabled and not settings.active_router_kill_switch
+    assert len(allowed_source_ids) == 1
+    source_id = next(iter(allowed_source_ids))
+    raw_ids = listing_ids = None
     rule_id = None
     try:
         actor_id = await pool.fetchval(
@@ -83,10 +88,54 @@ async def main():
         rollback_version = next(item for item in version_list["items"] if item["version"] == 3)
         rollback_config = rollback_version["config_json"]
         assert rollback_config == config_v1 and rollback_version["snapshot_origin"] == "rollback"
-        source_id = await pool.fetchval(
-            "INSERT INTO ingest_sources(peer_id,title,username) VALUES($1,$2,$3) RETURNING id",
-            peer_id, "Isolated Active review test", username,
+        await pool.execute(
+            "INSERT INTO ingest_sources(id,peer_id,title,username,router_mode) VALUES($1,$2,$3,$4,'legacy')",
+            source_id, peer_id, "Isolated Active review test", username,
         )
+
+        mode_path = f"/api/admin/rules/sources/{source_id}/router-mode"
+        status, _ = request_json("", mode_path, "PUT", {"mode": "active"})
+        assert status == 401, f"unauthenticated Active mode request accepted: {status}"
+        status, _ = request_json(token, f"/api/admin/rules/sources/{source_id + 999}/router-mode",
+                                 "PUT", {"mode": "active"})
+        assert status == 409, f"non-allowlisted source accepted: {status}"
+
+        non_admin_id = await pool.fetchval(
+            "INSERT INTO site_users(username,password_hash,display_name,is_admin) "
+            "VALUES($1,$2,'isolated non-admin',FALSE) RETURNING id",
+            f"active_nonadmin_{suffix}", auth.hash_password(uuid.uuid4().hex),
+        )
+        non_admin_token, _ = auth.issue_token(non_admin_id, False)
+        status, _ = request_json(non_admin_token, mode_path, "PUT", {"mode": "active"})
+        assert status == 401, f"non-admin Active mode request accepted: {status}"
+
+        other_source = source_id + 999
+        await pool.execute(
+            "INSERT INTO ingest_sources(id,peer_id,title,username,router_mode) "
+            "VALUES($1,$2,'isolated pre-existing Active source',$3,'active')",
+            other_source, peer_id - 1, f"other{suffix}",
+        )
+        status, _ = request_json(token, mode_path, "PUT", {"mode": "active"})
+        assert status == 409, f"second Active source was accepted: {status}"
+        await pool.execute("DELETE FROM ingest_sources WHERE id=$1", other_source)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            concurrent_modes = list(executor.map(
+                lambda _: request_json(token, mode_path, "PUT", {"mode": "active"}), range(2),
+            ))
+        assert [status for status, _ in concurrent_modes] == [200, 200], concurrent_modes
+        assert await pool.fetchval("SELECT router_mode='active' FROM ingest_sources WHERE id=$1", source_id)
+        assert await pool.fetchval(
+            "SELECT count(*) FROM rule_router_mode_events WHERE source_id=$1 AND new_mode='active'", source_id,
+        ) == 1
+        status, mode_result = request_json(token, mode_path, "PUT", {"mode": "legacy"})
+        assert status == 200 and mode_result["mode"] == "legacy"
+        assert await pool.fetchval("SELECT router_mode='legacy' FROM ingest_sources WHERE id=$1", source_id)
+        assert await pool.fetchval(
+            "SELECT count(*) FROM rule_router_mode_events WHERE source_id=$1 "
+            "AND previous_mode='active' AND new_mode='legacy' AND actor_user_id=$2",
+            source_id, actor_id,
+        ) == 1
         raw_ids, listing_ids = [], []
 
         async def candidate(reason, fields):
@@ -198,6 +247,7 @@ async def main():
             await pool.execute("DELETE FROM ingest_rules WHERE id=$1", rule_id)
         if username:
             await pool.execute("DELETE FROM site_users WHERE username=$1", username)
+        await pool.execute("DELETE FROM site_users WHERE username=$1", f"active_nonadmin_{suffix}")
         await pool.close()
 
 

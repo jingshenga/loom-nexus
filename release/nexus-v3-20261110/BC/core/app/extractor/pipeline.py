@@ -20,7 +20,9 @@ from app.config import get_settings
 from app.extractor import ast_rules
 from app.extractor.lifecycle_identity import explicit_lifecycle_username
 from app.extractor.ocr_worker import OcrWorker
-from app.extractor.rule_router import active_source_allowed, resolve_active_listing, shadow_compare
+from app.extractor.rule_router import (
+    active_source_allowed, normalize_telegram_identity, resolve_active_listing, shadow_compare,
+)
 
 logger = logging.getLogger("nexus-core.extractor")
 
@@ -123,7 +125,8 @@ def _shadow_safe_prediction(prediction, actual=None):
                        "candidate_count": len(item.get("values") or [])}
                       for item in prediction.get("conflicts", [])],
         "field_diff_keys": changed_fields,
-        "identity_diff": bool((actual or {}).get("identity") != selected.get("identity", "")),
+        "identity_diff": normalize_telegram_identity((actual or {}).get("identity"))
+        != normalize_telegram_identity(selected.get("identity")),
         "trace": _shadow_safe_trace(prediction.get("trace", [])),
     }
 
@@ -472,20 +475,22 @@ class Extractor:
             await self._mark(raw_id, "new")
 
     async def _active_route(self, row):
-        """Return an Active selection only when every explicit safety gate is open."""
+        """Return a review-only Active result; never let a denied Active job fall through to Legacy."""
         try:
+            mode = await self._pool.fetchval(
+                "SELECT router_mode FROM ingest_sources WHERE id=$1", row["source_id"],
+            )
+            if mode != "active":
+                return None
             settings = get_settings()
             if not active_source_allowed(
                 row["source_id"], enabled=settings.active_router_enabled,
                 allowed_source_ids=settings.active_router_source_ids,
                 kill_switch=settings.active_router_kill_switch,
             ):
-                return None
-            mode = await self._pool.fetchval(
-                "SELECT router_mode FROM ingest_sources WHERE id=$1", row["source_id"],
-            )
-            if mode != "active":
-                return None
+                return {"review_reason": "active_router_disabled", "result": {
+                    "reason": "active_router_disabled", "trace": [], "conflicts": [],
+                }}
             bindings = [dict(item) for item in await self._pool.fetch(SQL_SHADOW_BINDINGS, row["source_id"])]
             result = resolve_active_listing(bindings, row["raw_text"] or "", row["sender_peer_id"])
             await self._record_active_parse_runs(row, bindings, result)
@@ -508,7 +513,8 @@ class Extractor:
             if isinstance(config, str):
                 config = json.loads(config)
             return {"fields": selected.get("fields") or {},
-                    "evidence": selected.get("evidence") or {}, "rule_config": config}
+                    "evidence": selected.get("evidence") or {}, "rule_config": config,
+                    "review_reason": "human_review_required", "result": result}
         except Exception as exc:
             logger.exception("active router failed (source=%s raw=%s); parking for review",
                              row["source_id"], row["raw_id"])

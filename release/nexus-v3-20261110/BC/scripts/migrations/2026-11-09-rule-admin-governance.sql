@@ -83,8 +83,8 @@ $fn$;
 CREATE TABLE IF NOT EXISTS rule_router_mode_events (
     id BIGSERIAL PRIMARY KEY,
     source_id BIGINT NOT NULL REFERENCES ingest_sources(id) ON DELETE CASCADE,
-    previous_mode VARCHAR(12) NOT NULL CHECK (previous_mode IN ('legacy','shadow')),
-    new_mode VARCHAR(12) NOT NULL CHECK (new_mode IN ('legacy','shadow')),
+    previous_mode VARCHAR(12) NOT NULL CHECK (previous_mode IN ('legacy','shadow','active')),
+    new_mode VARCHAR(12) NOT NULL CHECK (new_mode IN ('legacy','shadow','active')),
     actor_user_id BIGINT REFERENCES site_users(id) ON DELETE SET NULL,
     changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
