@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
+    <meta name="theme-color" content="#0b0f1a" />
+    <title>Loom 织网</title>
+    <script>
+      // pre-paint theme: avoid a flash when the user picked a fixed mode
+      (function () {
+        var pref = "auto";
+        try { pref = localStorage.getItem("nexus-theme") || "auto"; } catch (e) {}
+        var dark =
+          pref === "dark" ||
+          (pref === "auto" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+        if (dark) document.documentElement.classList.add("dark");
+      })();
+    </script>
+    <script type="module" crossorigin src="/assets/index-CJ1987PH.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-Bac9EGfD.css">
+  </head>
+  <body>
+    <div id="app"></div>
+  </body>
+</html>

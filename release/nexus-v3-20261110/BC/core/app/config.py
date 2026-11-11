@@ -33,6 +33,9 @@ class CoreSettings(BaseSettings):
     shadow_error_log_interval_s: int = Field(default=60, ge=10, le=3600)
     shadow_capacity_warn_bytes: int = Field(default=524288000, ge=1048576)
     shadow_recent_error_warn_count: int = Field(default=10, ge=1)
+    active_router_enabled: bool = False
+    active_router_source_ids: str = ""
+    active_router_kill_switch: bool = True
 
     def db_kwargs(self) -> dict:
         """Connection parameters passed as typed kwargs (never a URL string)."""

@@ -131,6 +131,12 @@ class RouterDryRunBody(BaseModel):
     rule_version_id: int | None = None
 
 
+class ActiveReviewResolutionBody(BaseModel):
+    action: Literal["dismiss", "no_action", "create_pending_listing"]
+    reason: str = Field(default="", max_length=500)
+    confirmed_fields: dict | None = None
+
+
 class LifecycleResolutionBody(BaseModel):
     action: Literal["approve", "reject"]
     listing_id: int | None = None
@@ -437,6 +443,136 @@ async def router_management() -> dict:
                        "recent_errors": errors.get(row["source_id"], [])}
                       for row in rows],
             "active_mode_available": False}
+
+
+@router.get("/active-review-queue")
+async def active_review_queue(
+    limit: int = 100, status: Literal["open", "resolved", "dismissed"] = "open",
+    source_id: int | None = None, rule_id: int | None = None,
+    reason: str | None = None, since: datetime | None = None,
+    until: datetime | None = None,
+) -> dict:
+    if not 1 <= limit <= 500:
+        raise HTTPException(status_code=422, detail="limit must be 1-500")
+    if since and until and since >= until:
+        raise HTTPException(status_code=422, detail="since must be earlier than until")
+    rows = await _pool().fetch(
+        "SELECT q.id,q.source_id,s.title AS source_title,q.raw_id,r.platform_msg_id,"
+        "r.posted_at,LEFT(COALESCE(r.raw_text,''),1000) AS message_preview,"
+        "COALESCE(r.media_json,'[]'::jsonb) AS media,q.reason,q.candidate_rule_ids,"
+        "q.diagnostics_json,q.candidate_json,q.status,q.listing_id,q.created_at,q.reviewed_at,q.last_action "
+        "FROM rule_active_review_queue q JOIN ingest_sources s ON s.id=q.source_id "
+        "JOIN raw_messages r ON r.id=q.raw_id WHERE q.status=$1 "
+        "AND ($2::bigint IS NULL OR q.source_id=$2) "
+        "AND ($3::bigint IS NULL OR $3=ANY(q.candidate_rule_ids)) "
+        "AND ($4::text IS NULL OR q.reason=$4) AND ($5::timestamptz IS NULL OR q.created_at >= $5) "
+        "AND ($6::timestamptz IS NULL OR q.created_at < $6) "
+        "ORDER BY q.created_at DESC,q.id DESC LIMIT $7",
+        status, source_id, rule_id, reason, since, until, limit,
+    )
+    return {"items": [{**dict(row), "candidate_rule_ids": list(row["candidate_rule_ids"] or []),
+                        "diagnostics_json": _decode_jsonb(row["diagnostics_json"], {}),
+                        "candidate_json": _decode_jsonb(row["candidate_json"], {}),
+                        "media": _decode_jsonb(row["media"], [])}
+                      for row in rows]}
+
+
+@router.get("/active-review-queue/{queue_id}")
+async def active_review_detail(queue_id: int) -> dict:
+    row = await _pool().fetchrow(
+        "SELECT q.*,s.title AS source_title,r.platform_msg_id,r.posted_at,r.raw_text,r.media_json "
+        "FROM rule_active_review_queue q JOIN ingest_sources s ON s.id=q.source_id "
+        "JOIN raw_messages r ON r.id=q.raw_id WHERE q.id=$1", queue_id,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="review candidate not found")
+    events = await _pool().fetch(
+        "SELECT e.id,e.actor_user_id,e.action,e.listing_id,e.reason,e.created_at "
+        "FROM rule_active_review_events e WHERE e.queue_id=$1 ORDER BY e.created_at,e.id", queue_id,
+    )
+    return {**dict(row),
+            "candidate_rule_ids": list(row["candidate_rule_ids"] or []),
+            "diagnostics_json": _decode_jsonb(row["diagnostics_json"], {}),
+            "candidate_json": _decode_jsonb(row["candidate_json"], {}),
+            "media": _decode_jsonb(row["media_json"], []),
+            "events": [dict(item) for item in events]}
+
+
+@router.post("/active-review-queue/{queue_id}/resolve")
+async def resolve_active_review(
+    queue_id: int, body: ActiveReviewResolutionBody,
+    authorization: str = Header(default=""),
+) -> dict:
+    pool = _pool()
+    actor_id = current_user_id(authorization)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT q.*,r.media_json,r.posted_at FROM rule_active_review_queue q "
+                "JOIN raw_messages r ON r.id=q.raw_id WHERE q.id=$1 FOR UPDATE OF q", queue_id,
+            )
+            if row is None:
+                raise HTTPException(status_code=404, detail="review candidate not found")
+            if row["status"] != "open":
+                raise HTTPException(status_code=409, detail="review candidate was already handled")
+
+            listing_id = None
+            if body.action == "create_pending_listing":
+                candidate = _decode_jsonb(row["candidate_json"], {})
+                fields = body.confirmed_fields or candidate.get("fields") or {}
+                username_value = fields.get("username")
+                if username_value is None and body.confirmed_fields is None:
+                    username_value = candidate.get("identity")
+                username = str(username_value or "").strip().lstrip("@")
+                if not username:
+                    raise HTTPException(status_code=409, detail="candidate has no confirmed Telegram identity")
+                existing = await conn.fetchval(
+                    "SELECT id FROM listings WHERE source_msg_id=$1 LIMIT 1", row["raw_id"],
+                )
+                if existing is not None:
+                    raise HTTPException(status_code=409, detail="this source message already has a Listing")
+                duplicate = await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM listings WHERE lower(contact_username)=lower($1) "
+                    "AND status IN ('published','pending','duplicate_pending','archived'))", username,
+                )
+                price = fields.get("price_amount")
+                if price not in (None, ""):
+                    try:
+                        price = str(float(price))
+                    except (TypeError, ValueError):
+                        raise HTTPException(status_code=422, detail="price_amount must be numeric")
+                else:
+                    price = None
+                listing_id = await conn.fetchval(
+                    "INSERT INTO listings(source_msg_id,contact_username,nickname,district,price_amount,"
+                    "price_currency,description,media_json,manual_fields,evidence_json,custom_fields,"
+                    "confidence,status,published_at) VALUES($1,$2,$3,$4,$5::numeric,$6,$7,$8::jsonb,"
+                    "'{}'::jsonb,$9::jsonb,$10::jsonb,0.5,$11,NULL) RETURNING id",
+                    row["raw_id"], username,
+                    str(fields.get("nickname") or "") or None,
+                    str(fields.get("district") or "") or None,
+                    price, str(fields.get("price_currency") or "CNY"),
+                    str(fields.get("description") or ""),
+                    json.dumps(_decode_jsonb(row["media_json"], []), ensure_ascii=False),
+                    json.dumps(candidate.get("evidence") or {}, ensure_ascii=False),
+                    json.dumps(fields.get("custom_fields") or {}, ensure_ascii=False),
+                    "duplicate_pending" if duplicate else "pending",
+                )
+
+            new_status = "dismissed" if body.action == "dismiss" else "resolved"
+            decision = {"confirmed_fields": body.confirmed_fields} if body.confirmed_fields is not None else {}
+            await conn.execute(
+                    "INSERT INTO rule_active_review_events(queue_id,actor_user_id,action,listing_id,reason,decision_json) "
+                    "VALUES($1,$2,$3,$4,$5,$6::jsonb)", queue_id, actor_id, body.action, listing_id,
+                    body.reason, json.dumps(decision, ensure_ascii=False),
+            )
+            await conn.execute(
+                "UPDATE rule_active_review_queue SET status=$2,listing_id=$3,reviewed_by=$4,"
+                "reviewed_at=NOW(),last_action=$5,updated_at=NOW() WHERE id=$1",
+                queue_id, new_status, listing_id, actor_id, body.action,
+            )
+    return {"queue_id": queue_id, "status": new_status, "action": body.action,
+            "listing_id": listing_id, "actor_user_id": actor_id}
 
 
 @router.get("/sources/{source_id}/raw-samples")

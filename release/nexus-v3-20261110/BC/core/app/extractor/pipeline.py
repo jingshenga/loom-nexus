@@ -16,10 +16,11 @@ import time
 import asyncpg
 
 from app import sqlres
+from app.config import get_settings
 from app.extractor import ast_rules
 from app.extractor.lifecycle_identity import explicit_lifecycle_username
 from app.extractor.ocr_worker import OcrWorker
-from app.extractor.rule_router import shadow_compare
+from app.extractor.rule_router import active_source_allowed, resolve_active_listing, shadow_compare
 
 logger = logging.getLogger("nexus-core.extractor")
 
@@ -34,6 +35,8 @@ SQL_LISTING_SYNC_MEDIA = sqlres.load("listing_sync_media.sql")
 SQL_HISTORY_SOURCE = sqlres.load("history_scan_source.sql")
 SQL_CREATE_HISTORY_LISTING = sqlres.load("upsert_history_scan.sql")
 SQL_SHADOW_BINDINGS = sqlres.load("rule_shadow_bindings.sql")
+SQL_ACTIVE_REVIEW_UPSERT = sqlres.load("rule_active_review_upsert.sql")
+SQL_ACTIVE_PARSE_RUN = sqlres.load("rule_parse_run_active_insert.sql")
 SQL_SHADOW_RECORD = sqlres.load("rule_shadow_record.sql")
 SQL_SHADOW_PARSE_RUN = sqlres.load("rule_parse_run_shadow_insert.sql")
 _SHADOW_LOGGED_AT = {}
@@ -234,6 +237,36 @@ class Extractor:
         media = _decode_jsonb(row["media_json"], [])
         await self._record_shadow_if_enabled(row, rule)
         try:
+            active = await self._active_route(row)
+            if active and active.get("review_reason"):
+                if active["review_reason"] == "lifecycle_requires_human_review":
+                    selected = (active.get("result") or {}).get("selected") or {}
+                    fields = selected.get("fields") or {}
+                    term = selected.get("lifecycle") or ""
+                    target_username = explicit_lifecycle_username(text, fields.get("username"))
+                    reason = (
+                        "identity_unresolved" if target_username is None
+                        else "source_or_sender_authority_unverified"
+                    )
+                    await self._pool.fetch(
+                        SQL_LIFECYCLE_REVIEW, raw_id, row["sender_peer_id"], term,
+                        target_username or "", reason,
+                        json.dumps({
+                            "identity_basis": "single_explicit_username_in_message" if target_username else "unresolved",
+                            "candidate_username": target_username or "",
+                            "sender_authority_verified": False,
+                            "forward_metadata_available": False,
+                            "automatic_action_blocked_reason": reason,
+                        }, ensure_ascii=False),
+                    )
+                else:
+                    await self._enqueue_active_review(row, active)
+                await self._mark(raw_id, "dropped")
+                return
+            active_fields = active.get("fields") if active else None
+            active_evidence = active.get("evidence") if active else None
+            if active and active.get("rule_config"):
+                rule = active["rule_config"]
             history_source = await self._pool.fetchval(SQL_HISTORY_SOURCE, row["source_id"])
             for item in media:
                 if item.get("kind") != "photo" or item.get("ocr_status") in (
@@ -253,7 +286,10 @@ class Extractor:
                 logger.info("raw %s dropped by gate (%s)", raw_id, reason)
                 return
 
-            fields, evidence = ast_rules.extract_fields(rule, text)
+            if active_fields is None:
+                fields, evidence = ast_rules.extract_fields(rule, text)
+            else:
+                fields, evidence = active_fields, active_evidence or {}
             term = ast_rules.hit_lifecycle(rule, text)
             if term is not None:
                 target_username = explicit_lifecycle_username(
@@ -434,6 +470,122 @@ class Extractor:
         except Exception:
             logger.exception("raw %s extraction failed; returning to new", raw_id)
             await self._mark(raw_id, "new")
+
+    async def _active_route(self, row):
+        """Return an Active selection only when every explicit safety gate is open."""
+        try:
+            settings = get_settings()
+            if not active_source_allowed(
+                row["source_id"], enabled=settings.active_router_enabled,
+                allowed_source_ids=settings.active_router_source_ids,
+                kill_switch=settings.active_router_kill_switch,
+            ):
+                return None
+            mode = await self._pool.fetchval(
+                "SELECT router_mode FROM ingest_sources WHERE id=$1", row["source_id"],
+            )
+            if mode != "active":
+                return None
+            bindings = [dict(item) for item in await self._pool.fetch(SQL_SHADOW_BINDINGS, row["source_id"])]
+            result = resolve_active_listing(bindings, row["raw_text"] or "", row["sender_peer_id"])
+            await self._record_active_parse_runs(row, bindings, result)
+            selected = result.get("selected") or {}
+            if result.get("conflicts"):
+                return {"review_reason": "rule_conflict", "result": result}
+            if not selected:
+                return {"review_reason": "no_rule_match", "result": result}
+            if selected.get("lifecycle"):
+                return {"review_reason": "lifecycle_requires_human_review", "result": result}
+            if not selected.get("identity"):
+                return {"review_reason": "identity_unresolved", "result": result}
+            selected_ids = set(selected.get("rule_ids") or [])
+            chosen_binding = next(
+                (binding for binding in bindings if binding.get("rule_id") in selected_ids), None,
+            )
+            if not chosen_binding:
+                return {"review_reason": "selected_rule_missing", "result": result}
+            config = chosen_binding.get("config_json") or {}
+            if isinstance(config, str):
+                config = json.loads(config)
+            return {"fields": selected.get("fields") or {},
+                    "evidence": selected.get("evidence") or {}, "rule_config": config}
+        except Exception as exc:
+            logger.exception("active router failed (source=%s raw=%s); parking for review",
+                             row["source_id"], row["raw_id"])
+            return {"review_reason": "active_router_error", "result": {
+                "reason": "active_router_error", "error_class": type(exc).__name__,
+                "trace": [], "conflicts": [],
+            }}
+
+    async def _enqueue_active_review(self, row, active):
+        result = active.get("result") or {}
+        trace = result.get("trace") or []
+        rule_ids = sorted({int(item["rule_id"]) for item in trace
+                           if item.get("matched") and item.get("rule_id") is not None})
+        context = await self._pool.fetchrow(
+            "SELECT content_hash FROM raw_message_revisions WHERE raw_id=$1 ORDER BY revision DESC LIMIT 1",
+            row["raw_id"],
+        )
+        diagnostics = {
+            "reason": active["review_reason"],
+            "trace": [{key: item.get(key) for key in (
+                "rule_id", "rule_version_id", "rule_type", "priority", "supported", "matched", "reason"
+            ) if key in item} for item in trace],
+            "conflict_kinds": sorted({item.get("kind", "unknown") for item in result.get("conflicts", [])}),
+        }
+        selected = result.get("selected") or {}
+        candidate = {
+            "fields": selected.get("fields") or {},
+            "evidence": selected.get("evidence") or {},
+            "identity": selected.get("identity") or "",
+            "rule_ids": selected.get("rule_ids") or rule_ids,
+        }
+        await self._pool.execute(
+            SQL_ACTIVE_REVIEW_UPSERT, row["source_id"], row["raw_id"],
+            context["content_hash"] if context else "unknown", active["review_reason"],
+            rule_ids, json.dumps(diagnostics, ensure_ascii=False),
+            json.dumps(candidate, ensure_ascii=False),
+        )
+
+    async def _record_active_parse_runs(self, row, bindings, result):
+        revision = await self._pool.fetchrow(
+            "SELECT id,content_hash FROM raw_message_revisions "
+            "WHERE raw_id=$1 ORDER BY revision DESC LIMIT 1", row["raw_id"],
+        )
+        if revision is None:
+            return
+        trace = result.get("trace") or []
+        matched = {int(item["rule_id"]): item for item in trace
+                   if item.get("matched") and item.get("rule_id") is not None}
+        if not matched:
+            matched = {int(item["rule_id"]): item for item in trace if item.get("rule_id") is not None}
+        safe_trace = [{key: item.get(key) for key in (
+            "rule_id", "rule_version_id", "rule_type", "priority", "supported", "matched", "reason"
+        ) if key in item} for item in trace]
+        safe_result = {
+            "reason": result.get("reason"),
+            "selected_rule_ids": (result.get("selected") or {}).get("rule_ids") or [],
+            "identity_present": bool((result.get("selected") or {}).get("identity")),
+            "field_keys": sorted(((result.get("selected") or {}).get("fields") or {}).keys()),
+            "conflicts": [{"kind": item.get("kind"), "field": item.get("field")}
+                          for item in result.get("conflicts", [])],
+        }
+        binding_by_id = {int(item["rule_id"]): item for item in bindings if item.get("rule_id") is not None}
+        for rule_id in sorted(matched):
+            binding = binding_by_id.get(rule_id, {})
+            version_id = binding.get("rule_version_id")
+            digest = hashlib.sha256(
+                f"active:{revision['id']}:{rule_id}:{version_id}:{revision['content_hash']}".encode()
+            ).hexdigest()
+            config = binding.get("config_json") or {}
+            if isinstance(config, str):
+                config = _decode_jsonb(config, {})
+            parser_key = config.get("parser_key", "ast_rules_v1") if isinstance(config, dict) else "ast_rules_v1"
+            await self._pool.execute(
+                SQL_ACTIVE_PARSE_RUN, revision["id"], "listing", rule_id, version_id, parser_key,
+                digest, json.dumps({"trace": safe_trace}, ensure_ascii=False),
+                json.dumps(safe_result, ensure_ascii=False),
+            )
 
     async def _record_shadow_if_enabled(self, row, legacy_config: dict) -> None:
         """Persist a read-only prediction; never let shadow block legacy extraction."""

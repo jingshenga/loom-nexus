@@ -20,6 +20,15 @@ def config_hash(config):
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def active_source_allowed(source_id, *, enabled=False, allowed_source_ids="", kill_switch=True):
+    """Fail closed unless the global gate is open and this source is allowlisted."""
+    if not enabled or kill_switch:
+        return False
+    allowed = {int(value.strip()) for value in str(allowed_source_ids).split(",")
+               if value.strip().isdigit()}
+    return int(source_id) in allowed
+
+
 def evaluate_candidate(binding, text, sender_peer_id=None):
     """Run a bounded listing matcher; never performs I/O or OCR."""
     rule_type = binding.get("rule_type", "listing")
@@ -150,6 +159,58 @@ def resolve_group(bindings, text, sender_peer_id=None):
                 "mode": mode, "reason": "unsupported_mode"}
     return {"selected": selected, "trace": evaluated, "conflicts": [],
             "mode": mode, "reason": reason}
+
+
+def resolve_active_listing(bindings, text, sender_peer_id=None):
+    """Resolve listing-purpose groups for Active; never choose across conflicts."""
+    groups = {}
+    for binding in bindings:
+        if binding.get("rule_type") != "listing" or binding.get("is_default"):
+            continue
+        if not binding.get("is_active", True):
+            continue
+        if (binding.get("purpose") or "listing") != "listing":
+            continue
+        groups.setdefault(binding.get("match_group") or "default", []).append(binding)
+    if not groups:
+        return {"selected": None, "trace": [], "conflicts": [], "reason": "no_listing_bindings"}
+
+    results = [resolve_group(group, text, sender_peer_id) for _, group in sorted(groups.items())]
+    traces = [trace for result in results for trace in result.get("trace", [])]
+    conflicts = [item for result in results for item in result.get("conflicts", [])]
+    selected = [result["selected"] for result in results if result.get("selected")]
+    conflicts.extend(_conflicts(selected))
+    if conflicts:
+        return {"selected": None, "trace": traces, "conflicts": conflicts,
+                "reason": "candidate_conflict"}
+    if not selected:
+        return {"selected": None, "trace": traces, "conflicts": [], "reason": "no_match"}
+
+    merged_fields, merged_evidence = {}, {}
+    rule_ids = []
+    for candidate in selected:
+        candidate_rule_ids = candidate.get("rule_ids") or ([candidate.get("rule_id")] if candidate.get("rule_id") else [])
+        for rule_id in candidate_rule_ids:
+            if rule_id not in rule_ids:
+                rule_ids.append(rule_id)
+        for name, value in (candidate.get("fields") or {}).items():
+            merged_fields.setdefault(name, value)
+        for name, value in (candidate.get("evidence") or {}).items():
+            merged_evidence.setdefault(name, value)
+    identities = [candidate.get("identity") for candidate in selected if candidate.get("identity")]
+    return {
+        "selected": {
+            "rule_ids": rule_ids,
+            "fields": merged_fields,
+            "evidence": merged_evidence,
+            "identity": identities[0] if identities else "",
+            "lifecycle": next((candidate.get("lifecycle") for candidate in selected
+                               if candidate.get("lifecycle")), None),
+        },
+        "trace": traces,
+        "conflicts": [],
+        "reason": "active_match",
+    }
 
 
 def shadow_compare(bindings, text, sender_peer_id=None, legacy_config=None):
