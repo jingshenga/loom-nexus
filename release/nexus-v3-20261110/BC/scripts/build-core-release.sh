@@ -28,6 +28,8 @@ else
     || die "source archive checksum verification failed"
 fi
 
+cd "$REPO_ROOT"
+
 ACTUAL_BASE_ID="$(docker image inspect --format '{{.Id}}' "$BASE_IMAGE" 2>/dev/null)" \
   || die "base image is not present locally: $BASE_IMAGE"
 [[ "$ACTUAL_BASE_ID" == "$EXPECTED_BASE_ID" ]] \
