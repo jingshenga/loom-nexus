@@ -40,7 +40,8 @@ async function load() {
     const result = await api(`/api/admin/rules/active-review-queue?${query}`);
     items.value = result.items || [];
     counts.value = result.counts || { review: 0, unmatched: 0 };
-    if (selected.value) await openItem(selected.value.id);
+    if (selected.value && items.value.some(item => item.id === selected.value.id))
+      await openItem(selected.value.id);
     else if (items.value.length) await openItem(items.value[0].id);
     else selected.value = null;
   } catch (e) {
