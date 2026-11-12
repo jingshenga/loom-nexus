@@ -28,6 +28,7 @@ class CoreSettings(BaseSettings):
     extract_ocr_enabled: bool = True
     vision4_mode: Literal["off", "shadow", "active"] = "off"
     vision4_model_dir: str = "/app/data/models/vision-model-v1"
+    vision4_model_store_dir: str = "/app/data/model-versions"
     shadow_sample_rate: float = Field(default=1.0, ge=0.0, le=1.0)
     shadow_trace_max_bytes: int = Field(default=8192, ge=1024, le=65536)
     shadow_error_log_interval_s: int = Field(default=60, ge=10, le=3600)

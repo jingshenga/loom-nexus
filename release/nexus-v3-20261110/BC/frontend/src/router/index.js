@@ -2,7 +2,7 @@ import { createRouter, createWebHistory } from "vue-router";
 import { useSession } from "../stores/session";
 
 const routes = [
-  { path: "/", redirect: "/explore" },
+  { path: "/", beforeEnter: () => useSession().isAdmin ? "/admin" : "/explore" },
   { path: "/login", component: () => import("../views/LoginView.vue") },
   { path: "/explore", component: () => import("../views/ExploreView.vue") },
   { path: "/explore/:id", component: () => import("../views/DetailView.vue") },
@@ -12,64 +12,25 @@ const routes = [
     component: () => import("../views/MessagesView.vue"),
   },
   {
-    path: "/admin/review",
-    component: () => import("../views/AdminReviewView.vue"),
+    path: "/admin",
+    component: () => import("../layouts/AdminLayout.vue"),
     meta: { admin: true },
-  },
-  {
-    path: "/admin/history",
-    component: () => import("../views/AdminHistoryView.vue"),
-    meta: { admin: true },
-  },
-  {
-    path: "/admin/ocr",
-    component: () => import("../views/AdminOcrView.vue"),
-    meta: { admin: true },
-  },
-  {
-    path: "/admin/ocr-classifier",
-    component: () => import("../views/AdminOcrClassifierView.vue"),
-    meta: { admin: true },
-  },
-  {
-    path: "/admin/rules",
-    component: () => import("../views/AdminRulesView.vue"),
-    meta: { admin: true },
-  },
-  {
-    path: "/admin/lifecycle",
-    component: () => import("../views/AdminLifecycleView.vue"),
-    meta: { admin: true },
-  },
-  {
-    path: "/admin/rule-router",
-    component: () => import("../views/AdminRuleRouterView.vue"),
-    meta: { admin: true },
-  },
-  {
-    path: "/admin/rule-review",
-    component: () => import("../views/AdminRuleReviewView.vue"),
-    meta: { admin: true },
-  },
-  {
-    path: "/admin/probe",
-    component: () => import("../views/AdminProbeView.vue"),
-    meta: { admin: true },
-  },
-  {
-    path: "/admin/gateway",
-    component: () => import("../views/AdminGatewayView.vue"),
-    meta: { admin: true },
-  },
-  {
-    path: "/admin/users",
-    component: () => import("../views/AdminUsersView.vue"),
-    meta: { admin: true },
-  },
-  {
-    path: "/admin/accounts",
-    component: () => import("../views/AdminAccountsView.vue"),
-    meta: { admin: true },
+    children: [
+      { path: "", component: () => import("../views/AdminDashboardView.vue"), meta: { title: "管理总览" } },
+      { path: "review", component: () => import("../views/AdminReviewView.vue"), meta: { title: "Listing 审核" } },
+      { path: "history", component: () => import("../views/AdminHistoryView.vue"), meta: { title: "未命中与资料库" } },
+      { path: "ocr", component: () => import("../views/AdminOcrView.vue"), meta: { title: "OCR 核对" } },
+      { path: "ocr-classifier", component: () => import("../views/AdminOcrClassifierView.vue"), meta: { title: "分类器训练" } },
+      { path: "models", component: () => import("../views/AdminModelsView.vue"), meta: { title: "模型中心" } },
+      { path: "rules", component: () => import("../views/AdminRulesView.vue"), meta: { title: "规则管理" } },
+      { path: "lifecycle", component: () => import("../views/AdminLifecycleView.vue"), meta: { title: "Lifecycle 审核" } },
+      { path: "rule-router", component: () => import("../views/AdminRuleRouterView.vue"), meta: { title: "来源与路由" } },
+      { path: "rule-review", component: () => import("../views/AdminRuleReviewView.vue"), meta: { title: "规则待审" } },
+      { path: "probe", component: () => import("../views/AdminProbeView.vue"), meta: { title: "连通检查" } },
+      { path: "gateway", component: () => import("../views/AdminGatewayView.vue"), meta: { title: "系统状态" } },
+      { path: "users", component: () => import("../views/AdminUsersView.vue"), meta: { title: "用户权限" } },
+      { path: "accounts", component: () => import("../views/AdminAccountsView.vue"), meta: { title: "采集账号" } },
+    ],
   },
 ];
 

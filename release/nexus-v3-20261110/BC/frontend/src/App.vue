@@ -28,6 +28,7 @@ const session = useSession();
 const router = useRouter();
 const route = useRoute();
 const theme = useTheme();
+const adminArea = computed(() => route.path.startsWith("/admin"));
 
 const nav = [
   { to: "/explore", label: "广场", icon: Compass },
@@ -115,7 +116,7 @@ onUnmounted(() => unreadTimer && clearInterval(unreadTimer));
 <template>
   <div class="min-h-screen">
     <!-- 玻璃拟态顶栏：桌面完整导航，手机只留 logo + 主题 + 退出 -->
-    <header class="nx-glass sticky top-0 z-40 border-b border-slate-800">
+    <header v-if="!adminArea" class="nx-glass sticky top-0 z-40 border-b border-slate-800">
       <div class="mx-auto flex max-w-7xl items-center gap-x-4 gap-y-2 px-4 py-2.5 sm:py-3">
         <RouterLink to="/explore" class="text-lg font-bold tracking-widest">
           Loom <span class="nx-brand-text">织网</span>
@@ -155,10 +156,10 @@ onUnmounted(() => unreadTimer && clearInterval(unreadTimer));
       </div>
     </header>
 
-    <main class="mx-auto max-w-7xl px-3 py-4 pb-24 sm:px-4 sm:py-6 lg:pb-6">
+    <main :class="adminArea ? 'min-w-0' : 'mx-auto max-w-7xl px-3 py-4 pb-24 sm:px-4 sm:py-6 lg:pb-6'">
       <RouterView />
     </main>
 
-    <BottomNav :unread="session.unread" />
+    <BottomNav v-if="!adminArea" :unread="session.unread" />
   </div>
 </template>

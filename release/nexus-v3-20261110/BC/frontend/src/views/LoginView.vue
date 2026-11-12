@@ -22,7 +22,7 @@ async function submit() {
       body: JSON.stringify({ username: username.value, password: password.value }),
     });
     session.login(data);
-    router.push(data.is_admin ? "/admin/review" : "/explore");
+    router.push(data.is_admin ? "/admin" : "/explore");
   } catch (e) {
     error.value = String(e.message).includes("账户") ? "账户或密码错误" : "登录失败";
   } finally {

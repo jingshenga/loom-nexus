@@ -63,6 +63,7 @@ from app.extractor.media_ocr import MediaOcrProcessor
 from app.extractor.vision4_classifier import Vision4Classifier
 from app.extractor.ocr_fields import structured_ocr_candidate
 from app.extractor.pipeline import Extractor
+from app.api import admin_dashboard, models
 from app.main import app
 sql_dir = Path("/app/app/sql")
 required_rechecks = {
@@ -83,11 +84,13 @@ assert required <= set(paths), f"missing V3 API: {sorted(required - set(paths))}
 settings = CoreSettings()
 assert not settings.active_router_enabled and not settings.active_router_source_ids and settings.active_router_kill_switch
 assert not settings.ocr_review_assist_enabled
+assert settings.vision4_model_store_dir == "/app/data/model-versions"
+assert admin_dashboard.router and models.router
 assert MediaOcrProcessor and Vision4Classifier
 assets = list(Path("/app/static").rglob("*.js"))
 assert assets
 bundle = "\n".join(p.read_text(errors="ignore") for p in assets)
-assert all(path in bundle for path in ("/admin/lifecycle", "/admin/rule-router", "/admin/rule-review"))
+assert all(path in bundle for path in ("/admin", "/admin/models", "/admin/lifecycle", "/admin/rule-router", "/admin/rule-review"))
 ' >/dev/null || die "candidate is missing required V3, Vision4, or default-off Active components"
 printf 'BUILT image=%s image_id=%s base_image_id=%s commit=%s\n' \
   "$CANDIDATE_IMAGE" "$BUILT_ID" "$ACTUAL_BASE_ID" "$COMMIT"

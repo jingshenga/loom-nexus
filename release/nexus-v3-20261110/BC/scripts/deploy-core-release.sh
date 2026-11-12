@@ -63,16 +63,19 @@ required = {
     ("/api/admin/rules/active-review-queue/{queue_id}", "GET"),
     ("/api/admin/rules/active-review-queue/{queue_id}/resolve", "POST"),
     ("/api/admin/rules/active-review-queue/{queue_id}/requeue", "POST"),
+    ("/api/admin/models", "GET"),
+    ("/api/admin/models/vision4/upload", "POST"),
+    ("/api/admin/dashboard", "GET"),
 }
 assert not required - routes, f"missing API routes: {sorted(required - routes)}"
-assert {"vision4_mode", "vision4_model_dir", "active_router_enabled", "active_router_source_ids", "active_router_kill_switch", "ocr_review_assist_enabled"} <= set(CoreSettings.model_fields), "Vision4, Active Router, or OCR review config missing"
+assert {"vision4_mode", "vision4_model_dir", "vision4_model_store_dir", "active_router_enabled", "active_router_source_ids", "active_router_kill_switch", "ocr_review_assist_enabled"} <= set(CoreSettings.model_fields), "Vision4, Active Router, or OCR review config missing"
 settings = CoreSettings()
 assert not settings.active_router_enabled and not settings.active_router_source_ids and settings.active_router_kill_switch, "Active Router must be globally disabled by default"
 assert not settings.ocr_review_assist_enabled, "OCR review assist must be disabled by default"
 assets = list(Path("/app/static").rglob("*.js"))
 assert assets, "built frontend assets missing"
 bundle = "\n".join(p.read_text(errors="ignore") for p in assets)
-assert all(p in bundle for p in ("/admin/lifecycle", "/admin/rule-router", "/admin/rule-review")), "Lifecycle/Router/Rule Review frontend route missing"
+assert all(p in bundle for p in ("/admin", "/admin/models", "/admin/lifecycle", "/admin/rule-router", "/admin/rule-review")), "Admin/V3 frontend routes missing"
 ' >/dev/null || die "candidate lacks Lifecycle, Router, or Vision4 components"
 
 COMPOSE_JSON="$(docker compose -f "$COMPOSE_FILE" config --format json)" || die "Compose configuration is invalid"
@@ -89,6 +92,8 @@ environment = core.get("environment", {})
 def environment_value(name):
     value = environment.get(name)
     return value.get("value") if isinstance(value, dict) else value
+assert environment_value("NEXUS_VISION4_MODEL_STORE_DIR") == "/app/data/model-versions", "Vision4 model store path missing"
+assert any(m.get("target") == "/app/data/model-versions" and not m.get("read_only") for m in core.get("volumes", [])), "dedicated Vision4 model version store must be writable"
 enabled = str(environment_value("NEXUS_ACTIVE_ROUTER_ENABLED")).lower() in {"1", "true"}
 allowed = [part.strip() for part in str(environment_value("NEXUS_ACTIVE_ROUTER_SOURCE_IDS") or "").split(",") if part.strip()]
 kill = str(environment_value("NEXUS_ACTIVE_ROUTER_KILL_SWITCH")).lower() in {"1", "true"}
@@ -114,6 +119,8 @@ SELECT object_name FROM (VALUES
  ('table:rule_active_review_queue', to_regclass('public.rule_active_review_queue') IS NOT NULL),
  ('table:rule_active_review_events', to_regclass('public.rule_active_review_events') IS NOT NULL),
  ('table:rule_active_ocr_rechecks', to_regclass('public.rule_active_ocr_rechecks') IS NOT NULL),
+ ('table:vision4_model_versions', to_regclass('public.vision4_model_versions') IS NOT NULL),
+ ('table:vision4_model_events', to_regclass('public.vision4_model_events') IS NOT NULL),
  ('safety:legacy_raw_requeue_trigger_absent', NOT EXISTS (
    SELECT 1 FROM pg_trigger t WHERE t.tgrelid=to_regclass('public.listing_media_ocr')
      AND t.tgname='trg_active_raw_after_ocr' AND NOT t.tgisinternal)),
@@ -170,6 +177,22 @@ assert match, "nexus-core service block not found"
 section = match.group(1)
 section2, count = re.subn(r"(?m)^(    image:\s*)\S+\s*$", lambda m: m.group(1) + image, section)
 assert count == 1, "expected exactly one Core image line"
+env_match = re.search(r"(?ms)^    environment:\n(.*?)(?=^    [A-Za-z0-9_-]+:\n|\Z)", section2)
+assert env_match, "Core environment mapping not found"
+env = env_match.group(1)
+setting = "      NEXUS_VISION4_MODEL_STORE_DIR: /app/data/model-versions\n"
+if "NEXUS_VISION4_MODEL_STORE_DIR:" in env:
+    assert re.search(r"(?m)^      NEXUS_VISION4_MODEL_STORE_DIR:\s*/app/data/model-versions\s*$", env), "model store path differs from the release contract"
+else:
+    section2 = section2[:env_match.end(1)] + setting + section2[env_match.end(1):]
+volume_match = re.search(r"(?ms)^    volumes:\n(.*?)(?=^    [A-Za-z0-9_-]+:\n|\Z)", section2)
+assert volume_match, "Core volume mapping not found"
+volumes = volume_match.group(1)
+mount = "      - ${NEXUS_DATA_DIR:-./data}/model-versions:/app/data/model-versions:rw\n"
+if "/app/data/model-versions" in volumes:
+    assert re.search(r"(?m)^      - .*:/app/data/model-versions:rw\s*$", volumes), "model store mount must be writable and dedicated"
+else:
+    section2 = section2[:volume_match.end(1)] + mount + section2[volume_match.end(1):]
 updated = text[:match.start(1)] + section2 + text[match.end(1):]
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".compose-core-")
 with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -177,6 +200,9 @@ with os.fdopen(fd, "w", encoding="utf-8") as f:
 os.chmod(tmp, os.stat(path).st_mode)
 os.replace(tmp, path)
 PY
+
+mkdir -p "$ROOT_DIR/data/model-versions" || { cp -p "$BACKUP_FILE" "$COMPOSE_FILE"; die "model version directory creation failed"; }
+chmod 0750 "$ROOT_DIR/data/model-versions" || { cp -p "$BACKUP_FILE" "$COMPOSE_FILE"; die "model version directory permissions failed"; }
 
 rollback() {
   printf 'Rolling back Core to %s (%s)\n' "$PREVIOUS_REF" "$PREVIOUS_ID" >&2
@@ -215,10 +241,10 @@ import json, os, urllib.error, urllib.request
 from pathlib import Path
 base = "http://127.0.0.1:8000"
 assert urllib.request.urlopen(base + "/api/health", timeout=5).status == 200
-for path in ("/admin/lifecycle", "/admin/rule-router"):
+for path in ("/admin", "/admin/models", "/admin/lifecycle", "/admin/rule-router", "/admin/rule-review"):
     response = urllib.request.urlopen(base + path, timeout=5)
     assert response.status == 200 and "<html" in response.read(65536).decode("utf-8", "ignore").lower()
-for path in ("/api/admin/rules/lifecycle-review", "/api/admin/rules/router-management", "/api/admin/rules/shadow-diagnostics"):
+for path in ("/api/admin/rules/lifecycle-review", "/api/admin/rules/router-management", "/api/admin/rules/shadow-diagnostics", "/api/admin/models", "/api/admin/dashboard"):
     try:
         response = urllib.request.urlopen(base + path, timeout=5)
         assert response.status == 200
