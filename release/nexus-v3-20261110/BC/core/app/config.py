@@ -36,6 +36,7 @@ class CoreSettings(BaseSettings):
     active_router_enabled: bool = False
     active_router_source_ids: str = ""
     active_router_kill_switch: bool = True
+    ocr_review_assist_enabled: bool = False
 
     def db_kwargs(self) -> dict:
         """Connection parameters passed as typed kwargs (never a URL string)."""

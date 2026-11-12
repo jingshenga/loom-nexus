@@ -31,7 +31,7 @@ class ActiveRouterPipelineTests(unittest.IsolatedAsyncioTestCase):
 
     def settings(self, **overrides):
         defaults = {"active_router_enabled": True, "active_router_kill_switch": False,
-                    "active_router_source_ids": "2"}
+                    "active_router_source_ids": "2", "ocr_review_assist_enabled": False}
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
 

@@ -25,7 +25,15 @@ const username = computed(() => confirmedFields.value.username || "");
 const fieldRows = computed(() => [
   ["TG 身份", "username"], ["昵称", "nickname"], ["价格", "price_amount"],
   ["区域", "district"], ["描述", "description"],
-].map(([label, key]) => ({ label, value: confirmedFields.value[key] ?? "未提取" })));
+].map(([label, key]) => {
+  const evidence = selected.value?.candidate_json?.evidence?.[key];
+  const conflict = (selected.value?.diagnostics_json?.conflicts || [])
+    .some((item) => item.kind === "field" && item.field === key);
+  return {
+    label, value: confirmedFields.value[key] ?? "未提取",
+    source: evidence?.src || "无证据", conflict,
+  };
+}));
 
 async function load() {
   loading.value = true;
@@ -154,7 +162,7 @@ onMounted(load);
       </section>
       <section v-if="selected" class="min-w-0 space-y-4 rounded-xl border border-slate-800 bg-slate-900/60 p-4">
         <header class="flex flex-wrap items-start justify-between gap-2">
-          <div><h2 class="font-semibold">{{ selected.source_title }} · 消息 {{ selected.platform_msg_id }}</h2><p class="mt-1 text-xs text-slate-400">来源 {{ selected.source_id }} · {{ selected.posted_at || '发布时间未知' }} · 候选 #{{ selected.id }} · {{ selected.reason }} · {{ selected.status }}</p></div>
+          <div><h2 class="font-semibold">{{ selected.source_title }} · 消息 {{ selected.platform_msg_id }}</h2><p class="mt-1 text-xs text-slate-400">来源 {{ selected.source_id }} · {{ selected.posted_at || '发布时间未知' }} · 候选 #{{ selected.id }} · {{ selected.reason }} · {{ selected.status }}</p><p v-if="selected.candidate_json?.ocr_assist?.length" class="mt-1 text-xs text-sky-300">OCR 辅助候选 · {{ selected.candidate_json.ocr_assist.length }} 张图片证据</p></div>
           <p v-if="username" class="text-sm text-sky-300">TG：@{{ String(username).replace(/^@/, "") }}</p>
         </header>
         <pre class="max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-slate-950 p-3 text-sm text-slate-200">{{ selected.raw_text || "（原消息无文字）" }}</pre>
@@ -165,14 +173,15 @@ onMounted(load);
             <span class="block truncate p-1">{{ media.kind || "媒体" }}</span>
             </a>
             <section v-if="media.ocr_result" class="mt-2 space-y-1 border-t border-slate-800 pt-2">
-              <p class="font-medium text-sky-200">已有 OCR · {{ media.ocr_result.status }} · {{ media.ocr_result.review_status }}</p>
+              <p class="font-medium text-sky-200">已有 OCR · {{ media.ocr_result.status }} · {{ media.ocr_result.review_status }} · 分类 {{ media.ocr_result.classification }} · 版本 {{ media.ocr_result.engine_version || '未知' }} · 置信度 {{ media.ocr_result.confidence }}</p>
+              <p v-if="media.ocr_result.classifier_version_id || media.ocr_result.human_classification" class="text-slate-400">图片分类 {{ media.ocr_result.predicted_classification || media.ocr_result.classification }} · 模型版本 #{{ media.ocr_result.classifier_version_id || '未知' }} · 人工标签 {{ media.ocr_result.human_classification || '无' }} · 预测置信度 {{ media.ocr_result.predicted_confidence ?? '未知' }}</p>
               <p class="whitespace-pre-wrap break-words text-slate-300">{{ media.ocr_result.raw_text || media.ocr_result.normalized_text || '已有 OCR 记录，无文本结果' }}</p>
               <pre v-if="media.ocr_result.fields_json && Object.keys(media.ocr_result.fields_json).length" class="whitespace-pre-wrap break-words text-slate-400">{{ JSON.stringify(media.ocr_result.fields_json, null, 2) }}</pre>
             </section>
           </div>
         </div>
         <div class="grid gap-3 md:grid-cols-2">
-          <div class="rounded-lg border border-slate-800 p-3"><h3 class="mb-2 text-sm font-medium">候选字段与缺失项</h3><dl class="mb-3 grid grid-cols-[5rem_minmax(0,1fr)] gap-x-2 gap-y-1 text-xs"><template v-for="row in fieldRows" :key="row.label"><dt class="text-slate-500">{{ row.label }}</dt><dd class="break-words text-slate-300">{{ row.value }}</dd></template></dl><textarea v-model="confirmedFieldsJson" :disabled="selected.status !== 'open' || selected.reason === 'no_rule_match'" rows="7" spellcheck="false" class="w-full rounded-lg border border-slate-700 bg-slate-950 p-2 font-mono text-xs text-slate-300" /><p v-if="selected.reason === 'no_rule_match'" class="mt-2 text-xs text-slate-400">当前没有规则提取字段；送入审核后仍需人工核验身份与字段。</p></div>
+          <div class="rounded-lg border border-slate-800 p-3"><h3 class="mb-2 text-sm font-medium">候选字段与缺失项</h3><dl class="mb-3 grid grid-cols-[5rem_minmax(0,1fr)] gap-x-2 gap-y-1 text-xs"><template v-for="row in fieldRows" :key="row.label"><dt class="text-slate-500">{{ row.label }}</dt><dd class="break-words text-slate-300">{{ row.value }} <span class="text-slate-500">· {{ row.source }}</span><span v-if="row.conflict" class="ml-1 text-amber-300">· 冲突</span></dd></template></dl><textarea v-model="confirmedFieldsJson" :disabled="selected.status !== 'open' || selected.reason === 'no_rule_match'" rows="7" spellcheck="false" class="w-full rounded-lg border border-slate-700 bg-slate-950 p-2 font-mono text-xs text-slate-300" /><p v-if="selected.reason === 'no_rule_match'" class="mt-2 text-xs text-slate-400">当前没有规则提取字段；送入审核后仍需人工核验身份与字段。</p></div>
           <div class="rounded-lg border border-slate-800 p-3"><h3 class="mb-2 text-sm font-medium">规则命中与冲突</h3><p class="mb-2 text-xs text-slate-400">{{ selected.reason }} · 命中规则 {{ selected.candidate_rule_ids.join(', ') || '无' }}</p><div v-for="(trace,index) in selected.diagnostics_json?.trace || []" :key="index" class="mb-2 rounded bg-slate-950 p-2 text-xs text-slate-300">{{ selected.rule_versions?.find(rule => rule.rule_version_id === trace.rule_version_id)?.rule_name || `规则 ${trace.rule_id}` }} · 版本 {{ selected.rule_versions?.find(rule => rule.rule_version_id === trace.rule_version_id)?.version || trace.rule_version_id || '未知' }} · {{ trace.matched ? '命中' : trace.reason || '未命中' }}</div><pre class="whitespace-pre-wrap break-words text-xs text-slate-400">{{ JSON.stringify(selected.diagnostics_json || {}, null, 2) }}</pre></div>
         </div>
         <section class="rounded-lg border border-slate-800 p-3"><h3 class="mb-2 text-sm font-medium">操作历史</h3><p v-if="!selected.events?.length" class="text-xs text-slate-500">暂无处理记录</p><div v-for="event in selected.events" :key="event.id" class="border-t border-slate-800 py-2 text-xs text-slate-400">{{ event.action }} · 管理员 {{ event.actor_user_id }} · {{ event.created_at }}{{ event.listing_id ? ` · Listing #${event.listing_id}` : "" }}</div></section>

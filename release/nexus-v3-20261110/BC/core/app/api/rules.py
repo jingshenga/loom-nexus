@@ -545,9 +545,14 @@ async def active_review_detail(queue_id: int) -> dict:
         "WHERE v.id=ANY($1::bigint[]) ORDER BY v.rule_id,v.version", version_ids,
     ) if version_ids else []
     ocr_rows = await _pool().fetch(
-        "SELECT media_path,status,classification,review_status,raw_text,normalized_text,"
-        "fields_json,evidence_json,confidence,engine_version,created_at "
-        "FROM listing_media_ocr WHERE raw_id=$1 ORDER BY id", row["raw_id"],
+        "SELECT o.media_path,o.status,o.classification,o.review_status,o.raw_text,o.normalized_text,"
+        "o.fields_json,o.evidence_json,o.confidence,o.engine_version,o.created_at,"
+        "to_jsonb(o)->>'predicted_classification' AS predicted_classification,"
+        "to_jsonb(o)->>'predicted_confidence' AS predicted_confidence,"
+        "to_jsonb(o)->>'human_classification' AS human_classification,"
+        "to_jsonb(o)->>'classifier_version_id' AS classifier_version_id,"
+        "to_jsonb(o)->'classifier_signals_json' AS classifier_signals_json "
+        "FROM listing_media_ocr o WHERE o.raw_id=$1 ORDER BY o.id", row["raw_id"],
     )
     media = _decode_jsonb(row["media_json"], [])
     ocr_by_path = {}
@@ -555,6 +560,7 @@ async def active_review_detail(queue_id: int) -> dict:
         record = dict(item)
         record["fields_json"] = _decode_jsonb(record["fields_json"], {})
         record["evidence_json"] = _decode_jsonb(record["evidence_json"], {})
+        record["classifier_signals_json"] = _decode_jsonb(record["classifier_signals_json"], {})
         ocr_by_path[item["media_path"]] = record
     for item in media:
         if item.get("path") in ocr_by_path:

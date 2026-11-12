@@ -2,12 +2,13 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-BASE_IMAGE="${NEXUS_CORE_BASE_IMAGE:-nexus-core:v3-lifecycle-router-shadow-20261110}"
-EXPECTED_BASE_ID="${NEXUS_CORE_BASE_IMAGE_ID:-sha256:9a6b125ee195a46a7ebd3ab3deca13e108053b321c16f40001acbc33a90ceb7e}"
+BASE_IMAGE="${NEXUS_CORE_BASE_IMAGE:-}"
+EXPECTED_BASE_ID="${NEXUS_CORE_BASE_IMAGE_ID:-sha256:600e996adcfb0e1db463335ee57058545d325cfdfcbb38b82245a34c8cd207ce}"
 CANDIDATE_IMAGE="${NEXUS_CORE_CANDIDATE_IMAGE:-nexus-core:active-router-release}"
 
 die() { printf 'BLOCKED: %s\n' "$*" >&2; exit 1; }
 [[ "$EXPECTED_BASE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] || die "invalid expected base Image ID"
+[[ -n "$BASE_IMAGE" ]] || die "set NEXUS_CORE_BASE_IMAGE to the verified local production Core tag"
 
 if git -C "$ROOT_DIR" rev-parse --show-toplevel >/dev/null 2>&1; then
   REPO_ROOT="$(git -C "$ROOT_DIR" rev-parse --show-toplevel)"
@@ -73,6 +74,7 @@ required = {
 assert required <= set(paths), f"missing V3 API: {sorted(required - set(paths))}"
 settings = CoreSettings()
 assert not settings.active_router_enabled and not settings.active_router_source_ids and settings.active_router_kill_switch
+assert not settings.ocr_review_assist_enabled
 assert MediaOcrProcessor and Vision4Classifier
 assets = list(Path("/app/static").rglob("*.js"))
 assert assets

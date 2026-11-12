@@ -65,9 +65,10 @@ required = {
     ("/api/admin/rules/active-review-queue/{queue_id}/requeue", "POST"),
 }
 assert not required - routes, f"missing API routes: {sorted(required - routes)}"
-assert {"vision4_mode", "vision4_model_dir", "active_router_enabled", "active_router_source_ids", "active_router_kill_switch"} <= set(CoreSettings.model_fields), "Vision4 or Active Router config missing"
+assert {"vision4_mode", "vision4_model_dir", "active_router_enabled", "active_router_source_ids", "active_router_kill_switch", "ocr_review_assist_enabled"} <= set(CoreSettings.model_fields), "Vision4, Active Router, or OCR review config missing"
 settings = CoreSettings()
 assert not settings.active_router_enabled and not settings.active_router_source_ids and settings.active_router_kill_switch, "Active Router must be globally disabled by default"
+assert not settings.ocr_review_assist_enabled, "OCR review assist must be disabled by default"
 assets = list(Path("/app/static").rglob("*.js"))
 assert assets, "built frontend assets missing"
 bundle = "\n".join(p.read_text(errors="ignore") for p in assets)
@@ -112,6 +113,13 @@ SELECT object_name FROM (VALUES
  ('table:rule_shadow_cleanup_runs', to_regclass('public.rule_shadow_cleanup_runs') IS NOT NULL),
  ('table:rule_active_review_queue', to_regclass('public.rule_active_review_queue') IS NOT NULL),
  ('table:rule_active_review_events', to_regclass('public.rule_active_review_events') IS NOT NULL),
+ ('column:raw_messages.ocr_review_pending', EXISTS (
+   SELECT 1 FROM information_schema.columns
+   WHERE table_schema='public' AND table_name='raw_messages'
+     AND column_name='ocr_review_pending' AND data_type='boolean')),
+ ('trigger:trg_active_raw_after_ocr', EXISTS (
+   SELECT 1 FROM pg_trigger t WHERE t.tgrelid=to_regclass('public.listing_media_ocr')
+     AND t.tgname='trg_active_raw_after_ocr' AND NOT t.tgisinternal)),
    ('constraint:active_review_manual_requeue', EXISTS (
      SELECT 1 FROM pg_constraint c
      WHERE c.conrelid=to_regclass('public.rule_active_review_events')
