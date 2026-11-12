@@ -43,6 +43,33 @@ SQL_BOT_COLLECTION_RESULTS = sqlres.load("bot_collection_results.sql")
 SQL_CHECKIN_HISTORY_STATUS = sqlres.load("checkin_history_status.sql")
 SQL_BIND_VERSIONED = sqlres.load("rule_bind_versioned.sql")
 SQL_SHADOW_BINDINGS = sqlres.load("rule_shadow_bindings.sql")
+SQL_ACTIVE_REVIEW_CLASSIFIED_CTE = (
+    "WITH classified AS ("
+    " SELECT q.id,q.source_id,s.title AS source_title,q.raw_id,r.platform_msg_id,"
+    " r.posted_at,LEFT(COALESCE(r.raw_text,''),1000) AS message_preview,"
+    " COALESCE(r.media_json,'[]'::jsonb) AS media,q.reason,q.candidate_rule_ids,"
+    " q.diagnostics_json,q.candidate_json,q.status,q.listing_id,q.created_at,q.reviewed_at,q.last_action,"
+    " CASE WHEN q.reason <> 'no_rule_match' "
+    "   OR COALESCE(q.candidate_json->'fields','{}'::jsonb) <> '{}'::jsonb "
+    "   OR COALESCE(q.candidate_json->>'identity','') <> '' "
+    "   OR COALESCE(ocr.structured,false) "
+    "   OR COALESCE(r.raw_text,'') ~* '(@[a-z][a-z0-9_]{4,31}|t\\.me/[a-z][a-z0-9_]{4,31}|telegram\\.me/[a-z][a-z0-9_]{4,31})' "
+    "   OR (COALESCE(r.raw_text,'') ~* '(价格|售价|月租|日租|租金|[￥¥][[:space:]]*[0-9]|[0-9]{3,}[[:space:]]*(元|块))' "
+    "       AND COALESCE(r.raw_text,'') ~* '(昵称|区域|地址|位置|房型|面积|介绍)') "
+    "   OR COALESCE(ocr.identity_evidence,false) "
+    "   OR EXISTS(SELECT 1 FROM listings l WHERE l.source_msg_id=r.id) "
+    " THEN 'review' ELSE 'unmatched' END AS category "
+    " FROM rule_active_review_queue q JOIN ingest_sources s ON s.id=q.source_id "
+    " JOIN raw_messages r ON r.id=q.raw_id "
+    " LEFT JOIN LATERAL (SELECT "
+    "   bool_or(COALESCE(fields_json->>'username','') <> '' OR COALESCE(fields_json->>'nickname','') <> '' "
+    "     OR COALESCE(fields_json->>'price_amount','') <> '' OR COALESCE(fields_json->>'district','') <> '' "
+    "     OR COALESCE(raw_text,'') ~* '(价格|售价|月租|日租|[￥¥][[:space:]]*[0-9]|[0-9]{3,}[[:space:]]*(元|块))') AS structured,"
+    "   bool_or(COALESCE(fields_json->>'username','') <> '' "
+    "     OR COALESCE(raw_text,'') ~* '(t\\.me/[a-z][a-z0-9_]{4,31}|telegram\\.me/[a-z][a-z0-9_]{4,31}|@[a-z][a-z0-9_]{4,31})') AS identity_evidence "
+    "   FROM listing_media_ocr WHERE raw_id=r.id AND status='done') ocr ON TRUE"
+    ") "
+)
 
 LLM_SYSTEM_PROMPT = (
     "你是消息抽取规则生成器。根据用户给出的样本消息，产出一个 JSON 规则对象，"
@@ -467,28 +494,8 @@ async def active_review_queue(
     if since and until and since >= until:
         raise HTTPException(status_code=422, detail="since must be earlier than until")
     rows = await _pool().fetch(
-        "WITH classified AS ("
-        " SELECT q.id,q.source_id,s.title AS source_title,q.raw_id,r.platform_msg_id,"
-        " r.posted_at,LEFT(COALESCE(r.raw_text,''),1000) AS message_preview,"
-        " COALESCE(r.media_json,'[]'::jsonb) AS media,q.reason,q.candidate_rule_ids,"
-        " q.diagnostics_json,q.candidate_json,q.status,q.listing_id,q.created_at,q.reviewed_at,q.last_action,"
-        " CASE WHEN q.reason <> 'no_rule_match' "
-        "   OR COALESCE(q.candidate_json->'fields','{}'::jsonb) <> '{}'::jsonb "
-        "   OR COALESCE(ocr.structured,false) "
-        "   OR COALESCE(r.raw_text,'') ~* '(@[a-z][a-z0-9_]{4,31}|t\\.me/[a-z][a-z0-9_]{4,31}|telegram\\.me/[a-z][a-z0-9_]{4,31})' "
-        "   OR (COALESCE(r.raw_text,'') ~* '(价格|售价|月租|日租|租金|[￥¥][[:space:]]*[0-9]|[0-9]{3,}[[:space:]]*(元|块))' "
-        "       AND COALESCE(r.raw_text,'') ~* '(昵称|区域|地址|位置|房型|面积|介绍)') "
-        "   OR COALESCE(ocr.identity_evidence,false) THEN 'review' ELSE 'unmatched' END AS category "
-        " FROM rule_active_review_queue q JOIN ingest_sources s ON s.id=q.source_id "
-        " JOIN raw_messages r ON r.id=q.raw_id "
-        " LEFT JOIN LATERAL (SELECT "
-        "   bool_or(COALESCE(fields_json->>'username','') <> '' OR COALESCE(fields_json->>'nickname','') <> '' "
-        "     OR COALESCE(fields_json->>'price_amount','') <> '' OR COALESCE(fields_json->>'district','') <> '' "
-        "     OR COALESCE(raw_text,'') ~* '(价格|售价|月租|日租|[￥¥][[:space:]]*[0-9]|[0-9]{3,}[[:space:]]*(元|块))') AS structured,"
-        "   bool_or(COALESCE(fields_json,'{}'::jsonb) ? 'username' "
-        "     OR COALESCE(raw_text,'') ~* '(t\\.me/|telegram\\.me/|@)[a-z][a-z0-9_]{4,31}') AS identity_evidence "
-        "   FROM listing_media_ocr WHERE raw_id=r.id AND status='done') ocr ON TRUE"
-        ") SELECT *,count(*) OVER() AS total_count FROM classified WHERE status=$1 "
+        SQL_ACTIVE_REVIEW_CLASSIFIED_CTE +
+        "SELECT *,count(*) OVER() AS total_count FROM classified WHERE status=$1 "
         "AND ($2::bigint IS NULL OR source_id=$2) "
         "AND ($3::bigint IS NULL OR $3=ANY(candidate_rule_ids)) "
         "AND ($4::text IS NULL OR reason=$4) AND ($5::timestamptz IS NULL OR created_at >= $5) "
@@ -498,32 +505,13 @@ async def active_review_queue(
         status, source_id, rule_id, reason, since, until, category, limit,
     )
     counts = await _pool().fetchrow(
-        "SELECT count(*) FILTER (WHERE q.reason <> 'no_rule_match' "
-        " OR COALESCE(q.candidate_json->'fields','{}'::jsonb) <> '{}'::jsonb "
-        " OR COALESCE(ocr.structured,false) "
-        " OR COALESCE(r.raw_text,'') ~* '(@[a-z][a-z0-9_]{4,31}|t\\.me/[a-z][a-z0-9_]{4,31}|telegram\\.me/[a-z][a-z0-9_]{4,31})' "
-        " OR (COALESCE(r.raw_text,'') ~* '(价格|售价|月租|日租|租金|[￥¥][[:space:]]*[0-9]|[0-9]{3,}[[:space:]]*(元|块))' "
-        "     AND COALESCE(r.raw_text,'') ~* '(昵称|区域|地址|位置|房型|面积|介绍)') "
-        " OR COALESCE(ocr.identity_evidence,false)) AS review,"
-        " count(*) FILTER (WHERE q.reason='no_rule_match' "
-        " AND COALESCE(q.candidate_json->'fields','{}'::jsonb)='{}'::jsonb "
-        " AND NOT COALESCE(ocr.structured,false) "
-        " AND COALESCE(r.raw_text,'') !~* '(@[a-z][a-z0-9_]{4,31}|t\\.me/[a-z][a-z0-9_]{4,31}|telegram\\.me/[a-z][a-z0-9_]{4,31})' "
-        " AND NOT (COALESCE(r.raw_text,'') ~* '(价格|售价|月租|日租|租金|[￥¥][[:space:]]*[0-9]|[0-9]{3,}[[:space:]]*(元|块))' "
-        "          AND COALESCE(r.raw_text,'') ~* '(昵称|区域|地址|位置|房型|面积|介绍)') "
-        " AND NOT COALESCE(ocr.identity_evidence,false)) AS unmatched "
-        "FROM rule_active_review_queue q JOIN raw_messages r ON r.id=q.raw_id "
-        "LEFT JOIN LATERAL (SELECT "
-        " bool_or(COALESCE(fields_json->>'username','') <> '' OR COALESCE(fields_json->>'nickname','') <> '' "
-        "  OR COALESCE(fields_json->>'price_amount','') <> '' OR COALESCE(fields_json->>'district','') <> '' "
-        "  OR COALESCE(raw_text,'') ~* '(价格|售价|月租|日租|[￥¥][[:space:]]*[0-9]|[0-9]{3,}[[:space:]]*(元|块))') AS structured,"
-        " bool_or(COALESCE(fields_json,'{}'::jsonb) ? 'username' "
-        "  OR COALESCE(raw_text,'') ~* '(t\\.me/|telegram\\.me/|@)[a-z][a-z0-9_]{4,31}') AS identity_evidence "
-        " FROM listing_media_ocr WHERE raw_id=r.id AND status='done') ocr ON TRUE "
-        "WHERE q.status=$1 AND ($2::bigint IS NULL OR q.source_id=$2) "
-        "AND ($3::bigint IS NULL OR $3=ANY(q.candidate_rule_ids)) "
-        "AND ($4::text IS NULL OR q.reason=$4) AND ($5::timestamptz IS NULL OR q.created_at >= $5) "
-        "AND ($6::timestamptz IS NULL OR q.created_at < $6)",
+        SQL_ACTIVE_REVIEW_CLASSIFIED_CTE +
+        "SELECT count(*) FILTER (WHERE category='review') AS review,"
+        " count(*) FILTER (WHERE category='unmatched') AS unmatched "
+        "FROM classified WHERE status=$1 AND ($2::bigint IS NULL OR source_id=$2) "
+        "AND ($3::bigint IS NULL OR $3=ANY(candidate_rule_ids)) "
+        "AND ($4::text IS NULL OR reason=$4) AND ($5::timestamptz IS NULL OR created_at >= $5) "
+        "AND ($6::timestamptz IS NULL OR created_at < $6)",
         status, source_id, rule_id, reason, since, until,
     )
     return {"items": [{**dict(row), "candidate_rule_ids": list(row["candidate_rule_ids"] or []),
