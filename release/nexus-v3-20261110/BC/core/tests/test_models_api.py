@@ -5,6 +5,7 @@ import zipfile
 from pathlib import Path
 
 from app.api.models import MAX_UPLOAD_BYTES, _allowed_member, _unpack_package
+from app.api import models
 from app.main import app
 
 
@@ -39,8 +40,9 @@ class ModelPackageTests(unittest.TestCase):
         paths = app.openapi()["paths"]
         self.assertIn("/api/admin/models", paths)
         self.assertIn("/api/admin/models/vision4/upload", paths)
-        route = next(route for route in app.routes if getattr(route, "path", None) == "/api/admin/models/vision4/upload")
-        self.assertTrue(route.dependencies)
+        # FastAPI stores included routers lazily; inspect the router-level
+        # admin dependency instead of relying on eager app.routes expansion.
+        self.assertTrue(models.router.dependencies)
         self.assertEqual(MAX_UPLOAD_BYTES, 100 * 1024 * 1024)
 
 
