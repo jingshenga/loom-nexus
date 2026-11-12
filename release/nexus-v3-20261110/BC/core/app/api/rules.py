@@ -460,30 +460,78 @@ async def active_review_queue(
     source_id: int | None = None, rule_id: int | None = None,
     reason: str | None = None, since: datetime | None = None,
     until: datetime | None = None,
+    category: Literal["review", "unmatched", "all"] = "review",
 ) -> dict:
     if not 1 <= limit <= 500:
         raise HTTPException(status_code=422, detail="limit must be 1-500")
     if since and until and since >= until:
         raise HTTPException(status_code=422, detail="since must be earlier than until")
     rows = await _pool().fetch(
-        "SELECT q.id,q.source_id,s.title AS source_title,q.raw_id,r.platform_msg_id,"
-        "r.posted_at,LEFT(COALESCE(r.raw_text,''),1000) AS message_preview,"
-        "COALESCE(r.media_json,'[]'::jsonb) AS media,q.reason,q.candidate_rule_ids,"
-        "q.diagnostics_json,q.candidate_json,q.status,q.listing_id,q.created_at,q.reviewed_at,q.last_action "
-        "FROM rule_active_review_queue q JOIN ingest_sources s ON s.id=q.source_id "
-        "JOIN raw_messages r ON r.id=q.raw_id WHERE q.status=$1 "
-        "AND ($2::bigint IS NULL OR q.source_id=$2) "
+        "WITH classified AS ("
+        " SELECT q.id,q.source_id,s.title AS source_title,q.raw_id,r.platform_msg_id,"
+        " r.posted_at,LEFT(COALESCE(r.raw_text,''),1000) AS message_preview,"
+        " COALESCE(r.media_json,'[]'::jsonb) AS media,q.reason,q.candidate_rule_ids,"
+        " q.diagnostics_json,q.candidate_json,q.status,q.listing_id,q.created_at,q.reviewed_at,q.last_action,"
+        " CASE WHEN q.reason <> 'no_rule_match' "
+        "   OR COALESCE(q.candidate_json->'fields','{}'::jsonb) <> '{}'::jsonb "
+        "   OR COALESCE(ocr.structured,false) "
+        "   OR COALESCE(r.raw_text,'') ~* '(@[a-z][a-z0-9_]{4,31}|t\\.me/[a-z][a-z0-9_]{4,31}|telegram\\.me/[a-z][a-z0-9_]{4,31})' "
+        "   OR (COALESCE(r.raw_text,'') ~* '(价格|售价|月租|日租|租金|[￥¥][[:space:]]*[0-9]|[0-9]{3,}[[:space:]]*(元|块))' "
+        "       AND COALESCE(r.raw_text,'') ~* '(昵称|区域|地址|位置|房型|面积|介绍)') "
+        "   OR COALESCE(ocr.identity_evidence,false) THEN 'review' ELSE 'unmatched' END AS category "
+        " FROM rule_active_review_queue q JOIN ingest_sources s ON s.id=q.source_id "
+        " JOIN raw_messages r ON r.id=q.raw_id "
+        " LEFT JOIN LATERAL (SELECT "
+        "   bool_or(COALESCE(fields_json->>'username','') <> '' OR COALESCE(fields_json->>'nickname','') <> '' "
+        "     OR COALESCE(fields_json->>'price_amount','') <> '' OR COALESCE(fields_json->>'district','') <> '' "
+        "     OR COALESCE(raw_text,'') ~* '(价格|售价|月租|日租|[￥¥][[:space:]]*[0-9]|[0-9]{3,}[[:space:]]*(元|块))') AS structured,"
+        "   bool_or(COALESCE(fields_json,'{}'::jsonb) ? 'username' "
+        "     OR COALESCE(raw_text,'') ~* '(t\\.me/|telegram\\.me/|@)[a-z][a-z0-9_]{4,31}') AS identity_evidence "
+        "   FROM listing_media_ocr WHERE raw_id=r.id AND status='done') ocr ON TRUE"
+        ") SELECT *,count(*) OVER() AS total_count FROM classified WHERE status=$1 "
+        "AND ($2::bigint IS NULL OR source_id=$2) "
+        "AND ($3::bigint IS NULL OR $3=ANY(candidate_rule_ids)) "
+        "AND ($4::text IS NULL OR reason=$4) AND ($5::timestamptz IS NULL OR created_at >= $5) "
+        "AND ($6::timestamptz IS NULL OR created_at < $6) "
+        "AND ($7::text='all' OR category=$7) "
+        "ORDER BY created_at DESC,id DESC LIMIT $8",
+        status, source_id, rule_id, reason, since, until, category, limit,
+    )
+    counts = await _pool().fetchrow(
+        "SELECT count(*) FILTER (WHERE q.reason <> 'no_rule_match' "
+        " OR COALESCE(q.candidate_json->'fields','{}'::jsonb) <> '{}'::jsonb "
+        " OR COALESCE(ocr.structured,false) "
+        " OR COALESCE(r.raw_text,'') ~* '(@[a-z][a-z0-9_]{4,31}|t\\.me/[a-z][a-z0-9_]{4,31}|telegram\\.me/[a-z][a-z0-9_]{4,31})' "
+        " OR (COALESCE(r.raw_text,'') ~* '(价格|售价|月租|日租|租金|[￥¥][[:space:]]*[0-9]|[0-9]{3,}[[:space:]]*(元|块))' "
+        "     AND COALESCE(r.raw_text,'') ~* '(昵称|区域|地址|位置|房型|面积|介绍)') "
+        " OR COALESCE(ocr.identity_evidence,false)) AS review,"
+        " count(*) FILTER (WHERE q.reason='no_rule_match' "
+        " AND COALESCE(q.candidate_json->'fields','{}'::jsonb)='{}'::jsonb "
+        " AND NOT COALESCE(ocr.structured,false) "
+        " AND COALESCE(r.raw_text,'') !~* '(@[a-z][a-z0-9_]{4,31}|t\\.me/[a-z][a-z0-9_]{4,31}|telegram\\.me/[a-z][a-z0-9_]{4,31})' "
+        " AND NOT (COALESCE(r.raw_text,'') ~* '(价格|售价|月租|日租|租金|[￥¥][[:space:]]*[0-9]|[0-9]{3,}[[:space:]]*(元|块))' "
+        "          AND COALESCE(r.raw_text,'') ~* '(昵称|区域|地址|位置|房型|面积|介绍)') "
+        " AND NOT COALESCE(ocr.identity_evidence,false)) AS unmatched "
+        "FROM rule_active_review_queue q JOIN raw_messages r ON r.id=q.raw_id "
+        "LEFT JOIN LATERAL (SELECT "
+        " bool_or(COALESCE(fields_json->>'username','') <> '' OR COALESCE(fields_json->>'nickname','') <> '' "
+        "  OR COALESCE(fields_json->>'price_amount','') <> '' OR COALESCE(fields_json->>'district','') <> '' "
+        "  OR COALESCE(raw_text,'') ~* '(价格|售价|月租|日租|[￥¥][[:space:]]*[0-9]|[0-9]{3,}[[:space:]]*(元|块))') AS structured,"
+        " bool_or(COALESCE(fields_json,'{}'::jsonb) ? 'username' "
+        "  OR COALESCE(raw_text,'') ~* '(t\\.me/|telegram\\.me/|@)[a-z][a-z0-9_]{4,31}') AS identity_evidence "
+        " FROM listing_media_ocr WHERE raw_id=r.id AND status='done') ocr ON TRUE "
+        "WHERE q.status=$1 AND ($2::bigint IS NULL OR q.source_id=$2) "
         "AND ($3::bigint IS NULL OR $3=ANY(q.candidate_rule_ids)) "
         "AND ($4::text IS NULL OR q.reason=$4) AND ($5::timestamptz IS NULL OR q.created_at >= $5) "
-        "AND ($6::timestamptz IS NULL OR q.created_at < $6) "
-        "ORDER BY q.created_at DESC,q.id DESC LIMIT $7",
-        status, source_id, rule_id, reason, since, until, limit,
+        "AND ($6::timestamptz IS NULL OR q.created_at < $6)",
+        status, source_id, rule_id, reason, since, until,
     )
     return {"items": [{**dict(row), "candidate_rule_ids": list(row["candidate_rule_ids"] or []),
                         "diagnostics_json": _decode_jsonb(row["diagnostics_json"], {}),
                         "candidate_json": _decode_jsonb(row["candidate_json"], {}),
                         "media": _decode_jsonb(row["media"], [])}
-                      for row in rows]}
+                      for row in rows], "total_count": rows[0]["total_count"] if rows else 0,
+            "counts": {"review": counts["review"], "unmatched": counts["unmatched"]}}
 
 
 @router.get("/active-review-queue/{queue_id}")
@@ -499,12 +547,66 @@ async def active_review_detail(queue_id: int) -> dict:
         "SELECT e.id,e.actor_user_id,e.action,e.listing_id,e.reason,e.created_at "
         "FROM rule_active_review_events e WHERE e.queue_id=$1 ORDER BY e.created_at,e.id", queue_id,
     )
+    diagnostics = _decode_jsonb(row["diagnostics_json"], {})
+    trace = diagnostics.get("trace") or []
+    version_ids = sorted({int(item["rule_version_id"]) for item in trace
+                          if str(item.get("rule_version_id", "")).isdigit()})
+    rule_versions = await _pool().fetch(
+        "SELECT v.id AS rule_version_id,v.rule_id,v.version,r.rule_name,v.rule_type "
+        "FROM rule_instance_versions v JOIN ingest_rules r ON r.id=v.rule_id "
+        "WHERE v.id=ANY($1::bigint[]) ORDER BY v.rule_id,v.version", version_ids,
+    ) if version_ids else []
+    ocr_rows = await _pool().fetch(
+        "SELECT media_path,status,classification,review_status,raw_text,normalized_text,"
+        "fields_json,evidence_json,confidence,engine_version,created_at "
+        "FROM listing_media_ocr WHERE raw_id=$1 ORDER BY id", row["raw_id"],
+    )
+    media = _decode_jsonb(row["media_json"], [])
+    ocr_by_path = {}
+    for item in ocr_rows:
+        record = dict(item)
+        record["fields_json"] = _decode_jsonb(record["fields_json"], {})
+        record["evidence_json"] = _decode_jsonb(record["evidence_json"], {})
+        ocr_by_path[item["media_path"]] = record
+    for item in media:
+        if item.get("path") in ocr_by_path:
+            item["ocr_result"] = ocr_by_path[item["path"]]
     return {**dict(row),
             "candidate_rule_ids": list(row["candidate_rule_ids"] or []),
-            "diagnostics_json": _decode_jsonb(row["diagnostics_json"], {}),
+            "diagnostics_json": diagnostics,
             "candidate_json": _decode_jsonb(row["candidate_json"], {}),
-            "media": _decode_jsonb(row["media_json"], []),
+            "media": media,
+            "rule_versions": [dict(item) for item in rule_versions],
             "events": [dict(item) for item in events]}
+
+
+@router.post("/active-review-queue/{queue_id}/requeue")
+async def requeue_unmatched_active_review(
+    queue_id: int, authorization: str = Header(default=""),
+) -> dict:
+    actor_id = current_user_id(authorization)
+    pool = _pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT * FROM rule_active_review_queue WHERE id=$1 FOR UPDATE", queue_id,
+            )
+            if row is None:
+                raise HTTPException(status_code=404, detail="review candidate not found")
+            if row["status"] != "open" or row["reason"] != "no_rule_match":
+                raise HTTPException(status_code=409, detail="only an open no-match record can be sent to review")
+            await conn.execute(
+                "UPDATE rule_active_review_queue SET reason='manual_review_requested',"
+                "diagnostics_json=diagnostics_json || jsonb_build_object('manual_review_requested',true),"
+                "updated_at=NOW() WHERE id=$1", queue_id,
+            )
+            await conn.execute(
+                "INSERT INTO rule_active_review_events(queue_id,actor_user_id,action,reason,decision_json) "
+                "VALUES($1,$2,'manual_requeue','管理员从未命中视图送入人工审核',"
+                "jsonb_build_object('original_reason','no_rule_match'))", queue_id, actor_id,
+            )
+    return {"queue_id": queue_id, "status": "open", "reason": "manual_review_requested",
+            "actor_user_id": actor_id}
 
 
 @router.post("/active-review-queue/{queue_id}/resolve")

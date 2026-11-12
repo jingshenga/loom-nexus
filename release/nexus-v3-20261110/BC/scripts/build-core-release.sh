@@ -66,6 +66,7 @@ required = {
     "/api/admin/rules/router-dryrun",
     "/api/admin/rules/shadow-diagnostics",
     "/api/admin/rules/active-review-queue",
+    "/api/admin/rules/active-review-queue/{queue_id}/requeue",
 }
 assert required <= set(paths), f"missing V3 API: {sorted(required - set(paths))}"
 settings = CoreSettings()

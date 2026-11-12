@@ -157,6 +157,45 @@ async def main():
             )
             return queue_id, raw_id
 
+        unmatched_id, unmatched_raw = await candidate("no_rule_match", {})
+        status, unmatched_list = request_json(
+            token, "/api/admin/rules/active-review-queue?status=open&category=unmatched", "GET",
+        )
+        assert status == 200 and any(item["id"] == unmatched_id for item in unmatched_list["items"])
+        status, detail = request_json(
+            token, f"/api/admin/rules/active-review-queue/{unmatched_id}", "GET",
+        )
+        assert status == 200 and detail["raw_id"] == unmatched_raw
+        status, requeued = request_json(
+            token, f"/api/admin/rules/active-review-queue/{unmatched_id}/requeue", "POST",
+        )
+        assert status == 200 and requeued["reason"] == "manual_review_requested"
+        assert await pool.fetchval(
+            "SELECT count(*) FROM rule_active_review_events WHERE queue_id=$1 "
+            "AND actor_user_id=$2 AND action='manual_requeue'", unmatched_id, actor_id,
+        ) == 1
+        status, _ = request_json(
+            token, f"/api/admin/rules/active-review-queue/{unmatched_id}/requeue", "POST",
+        )
+        assert status == 409, "a no-match record was requeued more than once"
+
+        ocr_id, ocr_raw = await candidate("human_review_required", {"username": f"ocr_{suffix}"})
+        media_path = f"isolated/{suffix}.jpg"
+        await pool.execute(
+            "UPDATE raw_messages SET media_json=$2::jsonb WHERE id=$1",
+            ocr_raw, json.dumps([{"path": media_path, "kind": "photo"}]),
+        )
+        await pool.execute(
+            "INSERT INTO listing_media_ocr(raw_id,media_path,status,review_status,raw_text,fields_json) "
+            "VALUES($1,$2,'done','pending','synthetic OCR evidence', '{\"nickname\":\"synthetic\"}'::jsonb)",
+            ocr_raw, media_path,
+        )
+        status, detail = request_json(
+            token, f"/api/admin/rules/active-review-queue/{ocr_id}", "GET",
+        )
+        assert status == 200 and detail["media"][0]["ocr_result"]["raw_text"] == "synthetic OCR evidence"
+        assert detail["media"][0]["ocr_result"]["fields_json"] == {"nickname": "synthetic"}
+
         original_username = f"preserved_{suffix}"
         original_id = await pool.fetchval(
             "INSERT INTO listings(contact_username,nickname,status,manual_fields,published_at) "
@@ -233,8 +272,9 @@ async def main():
         assert await pool.fetchval(
             "SELECT count(*) FROM rule_active_review_events WHERE queue_id=$1", concurrent_id,
         ) == 1
-        print("Active review HTTP + PostgreSQL integration: identity guard, pending-only Listing, "
-              "manual/published protection, audit, dismiss/no_action, idempotence, concurrency: OK")
+        print("Active review HTTP + PostgreSQL integration: review/unmatched split, OCR/media detail, "
+              "manual requeue audit, identity guard, pending-only Listing, manual/published protection, "
+              "dismiss/no_action, idempotence, concurrency: OK")
     finally:
         if raw_ids:
             await pool.execute("DELETE FROM listings WHERE source_msg_id=ANY($1::bigint[])", raw_ids)

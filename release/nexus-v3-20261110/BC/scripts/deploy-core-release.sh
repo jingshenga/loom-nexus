@@ -62,6 +62,7 @@ required = {
     ("/api/admin/rules/active-review-queue", "GET"),
     ("/api/admin/rules/active-review-queue/{queue_id}", "GET"),
     ("/api/admin/rules/active-review-queue/{queue_id}/resolve", "POST"),
+    ("/api/admin/rules/active-review-queue/{queue_id}/requeue", "POST"),
 }
 assert not required - routes, f"missing API routes: {sorted(required - routes)}"
 assert {"vision4_mode", "vision4_model_dir", "active_router_enabled", "active_router_source_ids", "active_router_kill_switch"} <= set(CoreSettings.model_fields), "Vision4 or Active Router config missing"
@@ -111,6 +112,16 @@ SELECT object_name FROM (VALUES
  ('table:rule_shadow_cleanup_runs', to_regclass('public.rule_shadow_cleanup_runs') IS NOT NULL),
  ('table:rule_active_review_queue', to_regclass('public.rule_active_review_queue') IS NOT NULL),
  ('table:rule_active_review_events', to_regclass('public.rule_active_review_events') IS NOT NULL),
+   ('constraint:active_review_manual_requeue', EXISTS (
+     SELECT 1 FROM pg_constraint c
+     WHERE c.conrelid=to_regclass('public.rule_active_review_events')
+       AND c.conname='rule_active_review_events_action_check'
+       AND position('manual_requeue' IN pg_get_constraintdef(c.oid)) > 0)),
+ ('constraint:active_review_manual_requeue', EXISTS (
+   SELECT 1 FROM pg_constraint c
+   WHERE c.conrelid=to_regclass('public.rule_active_review_events')
+     AND c.conname='rule_active_review_events_action_check'
+     AND position('manual_requeue' IN pg_get_constraintdef(c.oid)) > 0)),
  ('constraint:router_mode_previous_active', EXISTS (
    SELECT 1 FROM pg_constraint c
    WHERE c.conrelid=to_regclass('public.rule_router_mode_events')

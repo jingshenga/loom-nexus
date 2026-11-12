@@ -4076,7 +4076,7 @@ CREATE TABLE IF NOT EXISTS rule_active_review_events (
     id BIGSERIAL PRIMARY KEY,
     queue_id BIGINT NOT NULL REFERENCES rule_active_review_queue(id) ON DELETE CASCADE,
     actor_user_id BIGINT REFERENCES site_users(id) ON DELETE SET NULL,
-    action VARCHAR(32) NOT NULL CHECK (action IN ('dismiss','no_action','create_pending_listing')),
+    action VARCHAR(32) NOT NULL CHECK (action IN ('dismiss','no_action','create_pending_listing','manual_requeue')),
     listing_id BIGINT REFERENCES listings(id) ON DELETE SET NULL,
     decision_json JSONB NOT NULL DEFAULT '{}'::jsonb,
     reason TEXT NOT NULL DEFAULT '',
