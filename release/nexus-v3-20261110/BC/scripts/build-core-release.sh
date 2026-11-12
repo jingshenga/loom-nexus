@@ -10,7 +10,15 @@ die() { printf 'BLOCKED: %s\n' "$*" >&2; exit 1; }
 [[ "$EXPECTED_BASE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] || die "invalid expected base Image ID"
 [[ -n "$BASE_IMAGE" ]] || die "set NEXUS_CORE_BASE_IMAGE to the verified local production Core tag"
 
-if git -C "$ROOT_DIR" rev-parse --show-toplevel >/dev/null 2>&1; then
+REPO_ROOT="$(cd "$ROOT_DIR/../../.." && pwd)"
+if [[ -f "$REPO_ROOT/.nexus-release-commit" && -f "$REPO_ROOT/SHA256SUMS.source" ]]; then
+  [[ -n "${NEXUS_RELEASE_COMMIT:-}" ]] || die "release package commit marker is required"
+  COMMIT="$(tr -d '[:space:]' < "$REPO_ROOT/.nexus-release-commit")"
+  [[ "$COMMIT" == "$NEXUS_RELEASE_COMMIT" && "$COMMIT" =~ ^[0-9a-f]{40}$ ]] \
+    || die "release package commit marker does not match the requested source"
+  (cd "$REPO_ROOT" && sha256sum -c SHA256SUMS.source) \
+    || die "release package checksum verification failed"
+elif git -C "$ROOT_DIR" rev-parse --show-toplevel >/dev/null 2>&1; then
   REPO_ROOT="$(git -C "$ROOT_DIR" rev-parse --show-toplevel)"
   cd "$REPO_ROOT"
   [[ -z "$(git status --porcelain)" ]] || die "release worktree must be clean before build"
@@ -18,15 +26,7 @@ if git -C "$ROOT_DIR" rev-parse --show-toplevel >/dev/null 2>&1; then
   [[ -z "${NEXUS_RELEASE_COMMIT:-}" || "$NEXUS_RELEASE_COMMIT" == "$COMMIT" ]] \
     || die "requested release commit does not match checked out source"
 else
-  REPO_ROOT="$(cd "$ROOT_DIR/../../.." && pwd)"
-  [[ -n "${NEXUS_RELEASE_COMMIT:-}" ]] || die "archive builds require NEXUS_RELEASE_COMMIT"
-  [[ -f "$REPO_ROOT/.nexus-release-commit" && -f "$REPO_ROOT/SHA256SUMS.source" ]] \
-    || die "source archive commit marker or checksum manifest missing"
-  COMMIT="$(tr -d '[:space:]' < "$REPO_ROOT/.nexus-release-commit")"
-  [[ "$COMMIT" == "$NEXUS_RELEASE_COMMIT" && "$COMMIT" =~ ^[0-9a-f]{40}$ ]] \
-    || die "source archive commit does not match requested release commit"
-  (cd "$REPO_ROOT" && sha256sum -c SHA256SUMS.source) \
-    || die "source archive checksum verification failed"
+  die "release package marker or Git source checkout is missing"
 fi
 
 cd "$REPO_ROOT"
