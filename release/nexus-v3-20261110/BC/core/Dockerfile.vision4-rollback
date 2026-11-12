@@ -1,7 +1,7 @@
-ARG BASE_IMAGE
+ARG BASE_IMAGE=nexus-core:nexus-v3-unified-20261112
 FROM ${BASE_IMAGE}
 ARG SOURCE_COMMIT
-ARG BASE_IMAGE_ID
+ARG BASE_IMAGE_ID=sha256:070e778deb248f70c6437d49544bd8130834cdb89c19aff4e56e5306d5f8213c
 LABEL org.opencontainers.image.revision="${SOURCE_COMMIT}" \
       io.nexus.base-image-id="${BASE_IMAGE_ID}" \
       io.nexus.release-source="Nexus V3 Vision4 rollback compatibility hotfix"
