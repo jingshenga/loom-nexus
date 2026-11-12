@@ -75,6 +75,25 @@ def _load_classifier(model_dir: Path) -> tuple[Vision4Classifier, dict]:
     return classifier, manifest
 
 
+def _validate_managed_version(path: str | Path, version: str, model_sha256: str) -> Path:
+    candidate = Path(path)
+    store = _store_dir()
+    if candidate.is_symlink() or candidate.resolve().parent != store:
+        raise ValueError("回滚模型不在受控版本目录中")
+    candidate = candidate.resolve()
+    try:
+        manifest = json.loads((candidate / "manifest.json").read_text(encoding="utf-8"))
+        model_file = candidate / "model.onnx"
+        actual_sha256 = hashlib.sha256(model_file.read_bytes()).hexdigest()
+    except (OSError, ValueError) as exc:
+        raise ValueError("回滚模型文件不完整") from exc
+    if (model_file.is_symlink() or manifest.get("model_version") != version
+            or manifest.get("model_sha256") != model_sha256
+            or actual_sha256 != model_sha256):
+        raise ValueError("回滚模型版本或 SHA-256 不匹配")
+    return candidate
+
+
 async def _read_upload(request: Request, target: Path) -> None:
     declared = request.headers.get("content-length")
     if declared:
@@ -258,11 +277,20 @@ async def _activate_version(version_id: int, request: Request, actor: int, actio
                 async with conn.transaction():
                     if previous_manifest.get("model_sha256") and previous.model_dir.exists():
                         old_version = previous_manifest.get("model_version") or previous.model_dir.name
+                        registered = await conn.fetchrow(
+                            "SELECT model_path,model_sha256 FROM vision4_model_versions "
+                            "WHERE version_key=$1", old_version,
+                        )
+                        if registered is None or registered["model_sha256"] != previous_manifest["model_sha256"]:
+                            raise ValueError("当前模型尚无匹配的持久化回滚版本")
+                        previous_path = _validate_managed_version(
+                            registered["model_path"], old_version, previous_manifest["model_sha256"],
+                        )
                         await conn.execute(
                             "INSERT INTO vision4_model_versions(version_key,model_path,model_sha256,status,metadata_json) "
                             "VALUES($1,$2,$3,'rollback',$4::jsonb) ON CONFLICT(version_key) DO UPDATE "
-                            "SET status='rollback',model_path=EXCLUDED.model_path,model_sha256=EXCLUDED.model_sha256",
-                            old_version, str(previous.model_dir), previous_manifest["model_sha256"],
+                            "SET status='rollback',metadata_json=EXCLUDED.metadata_json",
+                            old_version, str(previous_path), previous_manifest["model_sha256"],
                             json.dumps(previous_manifest, ensure_ascii=False),
                         )
                     await conn.execute(
@@ -278,8 +306,10 @@ async def _activate_version(version_id: int, request: Request, actor: int, actio
                         "VALUES($1,$2,$3,$4::jsonb)", version_id, action, actor,
                         json.dumps({"previous_sha256": previous_manifest.get("model_sha256")}),
                     )
-        except Exception:
+        except Exception as exc:
             processor._vision4 = previous
+            if isinstance(exc, ValueError):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             raise
     return {"ok": True, "version": row["version_key"], "sha256": row["model_sha256"], "action": action}
 
