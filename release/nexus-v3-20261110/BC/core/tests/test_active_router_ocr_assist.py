@@ -67,6 +67,51 @@ class ActiveOcrAssistTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["conflicts"][0]["kind"], "telegram_identity")
         self.assertEqual(result["selected"]["identity"], "alphauser")
 
+    async def test_structured_fields_json_fills_missing_candidate_fields(self):
+        item = self.ocr_row("", fields={
+            "stage_name": "阿青", "contact_handles": ["alphauser"],
+            "location_text": ["地区：宁波市海曙区"],
+            "price_text": ["价格：900元"],
+        })
+        self.pool.fetch.return_value = [item]
+        result, evidence, pending = await self.extractor._supplement_active_from_ocr(
+            self.row, self.bindings, {"selected": None, "trace": [], "conflicts": []},
+        )
+        self.assertFalse(pending)
+        self.assertEqual(result["selected"]["fields"], {
+            "nickname": "阿青", "username": "alphauser", "district": "宁波市海曙区",
+            "price_amount": 900, "price_currency": "CNY",
+        })
+        self.assertEqual(result["selected"]["evidence"]["price_amount"]["src"], "ocr")
+        self.assertEqual(evidence[0]["ocr_id"], 23)
+
+    async def test_equivalent_text_and_structured_price_is_not_a_conflict(self):
+        self.pool.fetch.return_value = [self.ocr_row(
+            "价格：900元", fields={"price_text": ["价格：900元"]},
+        )]
+        text_result = {"selected": {
+            "fields": {"username": "alphauser", "price_amount": 900.0},
+            "evidence": {"username": {"src": "regex"}, "price_amount": {"src": "regex"}},
+            "identity": "alphauser", "rule_ids": [7],
+        }, "trace": [], "conflicts": []}
+        result, _, _ = await self.extractor._supplement_active_from_ocr(self.row, self.bindings, text_result)
+        self.assertFalse(result["conflicts"])
+        self.assertEqual(result["selected"]["fields"]["price_amount"], 900.0)
+
+    async def test_real_price_conflict_keeps_text_value_and_both_evidence(self):
+        self.pool.fetch.return_value = [self.ocr_row(
+            "价格：900元", fields={"price_text": ["价格：1200元"]},
+        )]
+        text_result = {"selected": {
+            "fields": {"username": "alphauser", "price_amount": 900},
+            "evidence": {"username": {"src": "regex"}, "price_amount": {"src": "regex", "line": "价格：900元"}},
+            "identity": "alphauser", "rule_ids": [7],
+        }, "trace": [], "conflicts": []}
+        result, _, _ = await self.extractor._supplement_active_from_ocr(self.row, self.bindings, text_result)
+        conflict = next(item for item in result["conflicts"] if item.get("field") == "price_amount")
+        self.assertEqual(conflict["values"], [900, 1200])
+        self.assertEqual(result["selected"]["fields"]["price_amount"], 900)
+
     async def test_uncertain_image_without_two_business_signals_is_not_used(self):
         self.pool.fetch.return_value = [self.ocr_row(
             "@alphauser 昵称：阿青 价格：900", classification="uncertain", fields={"other_text": ["text"]},

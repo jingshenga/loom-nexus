@@ -19,6 +19,7 @@ from app import sqlres
 from app.config import get_settings
 from app.extractor import ast_rules
 from app.extractor.lifecycle_identity import explicit_lifecycle_username
+from app.extractor.ocr_fields import equivalent_field, structured_ocr_candidate
 from app.extractor.ocr_worker import OcrWorker
 from app.extractor.rule_router import (
     active_source_allowed, normalize_telegram_identity, resolve_active_listing, shadow_compare,
@@ -39,6 +40,10 @@ SQL_CREATE_HISTORY_LISTING = sqlres.load("upsert_history_scan.sql")
 SQL_OCR_ENQUEUE_RAW = sqlres.load("media_ocr_enqueue_raw.sql")
 SQL_SHADOW_BINDINGS = sqlres.load("rule_shadow_bindings.sql")
 SQL_ACTIVE_REVIEW_UPSERT = sqlres.load("rule_active_review_upsert.sql")
+SQL_OCR_RECHECK_ENQUEUE = sqlres.load("active_ocr_recheck_enqueue.sql")
+SQL_OCR_RECHECK_CLAIM = sqlres.load("active_ocr_recheck_claim.sql")
+SQL_OCR_RECHECK_FINISH = sqlres.load("active_ocr_recheck_finish.sql")
+SQL_OCR_RECHECK_CONTEXT = sqlres.load("active_ocr_recheck_context.sql")
 SQL_ACTIVE_PARSE_RUN = sqlres.load("rule_parse_run_active_insert.sql")
 SQL_SHADOW_RECORD = sqlres.load("rule_shadow_record.sql")
 SQL_SHADOW_PARSE_RUN = sqlres.load("rule_parse_run_shadow_insert.sql")
@@ -226,11 +231,13 @@ class Extractor:
         )
         while not stop.is_set():
             rows = await self._pool.fetch(SQL_CLAIM, batch_size)
-            if not rows:
-                await _sleep(stop, idle_s)
-                continue
             for row in rows:
                 await self._process_one(row)
+            rechecks = await self._pool.fetch(SQL_OCR_RECHECK_CLAIM, batch_size)
+            for task in rechecks:
+                await self._process_ocr_recheck(task)
+            if not rows and not rechecks:
+                await _sleep(stop, idle_s)
 
     async def _process_one(self, row) -> None:
         raw_id = row["raw_id"]
@@ -266,8 +273,6 @@ class Extractor:
                 else:
                     await self._enqueue_active_review(row, active)
                 await self._mark(raw_id, "dropped")
-                if active.get("ocr_pending"):
-                    await self._release_ocr_recheck_if_ready(raw_id)
                 return
             active_fields = active.get("fields") if active else None
             active_evidence = active.get("evidence") if active else None
@@ -503,7 +508,7 @@ class Extractor:
                     row, bindings, result,
                 )
                 if ocr_pending:
-                    await self._schedule_ocr_recheck(row)
+                    await self._schedule_ocr_recheck(row, bindings)
             await self._record_active_parse_runs(row, bindings, result)
             selected = result.get("selected") or {}
             if result.get("conflicts"):
@@ -541,7 +546,7 @@ class Extractor:
             }}
 
     async def _supplement_active_from_ocr(self, row, bindings, result):
-        """Use completed info-card OCR as evidence; never infer from classifier labels."""
+        """Fuse persisted OCR fields into review-only Active candidates."""
         media = _decode_jsonb(row.get("media_json"), [])
         paths = list(dict.fromkeys(
             item.get("path") for item in media
@@ -552,21 +557,22 @@ class Extractor:
         records = await self._pool.fetch(
             "SELECT id,media_path,status,classification,review_status,raw_text,fields_json,"
             "evidence_json,confidence,engine_version,updated_at FROM listing_media_ocr "
-            "WHERE raw_id=$1 AND media_path=ANY($2::text[]) ORDER BY id",
+            "WHERE raw_id=$1 AND media_path=ANY($2::text[]) ORDER BY media_path,id",
             row["raw_id"], paths,
         )
         completed = []
-        business_keys = {
-            "location_text", "service_text", "features_text", "restriction_text",
-            "price_text", "price_1p_text", "price_2p_text", "contact_handles",
-        }
         for record in records:
             item = dict(record)
             ocr_fields = _decode_jsonb(item["fields_json"], {})
-            business_evidence = business_keys.intersection(ocr_fields)
+            business_keys = {
+                "location_text", "service_text", "features_text", "restriction_text",
+                "price_text", "price_1p_text", "price_2p_text", "contact_handles",
+            }
             if (item["status"] == "done" and item["review_status"] != "not_card"
-                    and item["raw_text"] and (item["classification"] == "info_card"
-                    or (item["classification"] == "uncertain" and len(business_evidence) >= 2))):
+                    and item["classification"] not in {"profile_photo", "other"}
+                    and (item["raw_text"] or ocr_fields)
+                    and (item["classification"] != "uncertain"
+                         or len(business_keys.intersection(ocr_fields)) >= 2)):
                 completed.append(item)
         pending = any(item["status"] in {"pending", "processing"} for item in records)
         if not completed:
@@ -583,70 +589,134 @@ class Extractor:
         result = dict(result)
         result["ocr_assist"] = metadata
         text_selected = result.get("selected") or {}
-        ocr_matches = [resolve_active_listing(bindings, item["raw_text"], row["sender_peer_id"])
+        ocr_matches = [resolve_active_listing(bindings, item["raw_text"] or "", row["sender_peer_id"])
                        for item in completed]
         result["trace"] = list(result.get("trace") or []) + [
             {**trace, "evidence_source": "ocr"}
             for match in ocr_matches for trace in match.get("trace", [])
         ]
-        if any(match.get("conflicts") for match in ocr_matches):
-            result["conflicts"] = list(result.get("conflicts") or []) + [
-                {"kind": "ocr_rule_conflict", "source": "ocr"}
-            ]
-            return result, metadata, False
-        selected_ocr = [match["selected"] for match in ocr_matches if match.get("selected")]
-        if not selected_ocr:
-            return result, metadata, False
-        ocr_selected = {"fields": {}, "evidence": {}, "rule_ids": [], "identity": ""}
+        selected_ocr = []
+        ocr_conflicts = []
+        for item, match in zip(completed, ocr_matches):
+            if match.get("conflicts"):
+                ocr_conflicts.extend({"kind": conflict.get("kind", "ocr_rule_conflict"),
+                                     "field": conflict.get("field"), "source": "ocr_rule"}
+                                    for conflict in match["conflicts"])
+            parsed = match.get("selected") or {}
+            parsed_fields = dict(parsed.get("fields") or {})
+            parsed_evidence = {
+                key: {**(value if isinstance(value, dict) else {}), "src": "ocr",
+                      "ocr_id": item["id"], "engine_version": item["engine_version"]}
+                for key, value in (parsed.get("evidence") or {}).items()
+            }
+            structured = structured_ocr_candidate(
+                _decode_jsonb(item["fields_json"], {}),
+                _decode_jsonb(item["evidence_json"], {}),
+                ocr_id=item["id"], engine_version=item["engine_version"],
+                confidence=float(item["confidence"] or 0),
+                text_identity=text_selected.get("identity") or parsed.get("identity") or "",
+            )
+            ocr_conflicts.extend(structured["conflicts"])
+            for key, value in structured["fields"].items():
+                if key in parsed_fields and not equivalent_field(key, parsed_fields[key], value):
+                    ocr_conflicts.append({"kind": "field", "field": key,
+                                          "source": "ocr_text_vs_fields_json",
+                                          "values": [parsed_fields[key], value],
+                                          "evidence": {"text": parsed_evidence.get(key),
+                                                       "ocr": structured["evidence"].get(key)}})
+                    parsed_fields.pop(key, None)
+                    parsed_evidence.pop(key, None)
+                elif key not in parsed_fields:
+                    parsed_fields[key] = value
+                    parsed_evidence[key] = structured["evidence"].get(key)
+            identity = parsed.get("identity") or structured["fields"].get("username") or ""
+            if identity:
+                parsed_fields.setdefault("username", identity)
+                parsed_evidence.setdefault("username", structured["evidence"].get("username") or parsed_evidence.get("username"))
+            selected_ocr.append({
+                "fields": parsed_fields, "evidence": parsed_evidence, "identity": identity,
+                "rule_ids": parsed.get("rule_ids") or [], "clues": structured["clues"],
+            })
+
+        # Merge media in stable path/id order and do not choose between conflicting values.
+        field_values = {}
+        identities = []
+        rule_ids = []
+        clues = {}
         for candidate in selected_ocr:
-            identity = normalize_telegram_identity(candidate.get("identity"))
-            prior_identity = normalize_telegram_identity(ocr_selected.get("identity"))
-            if identity and prior_identity and identity != prior_identity:
-                result["conflicts"] = list(result.get("conflicts") or []) + [
-                    {"kind": "telegram_identity", "source": "ocr_media_conflict"}
-                ]
-            for key, value in (candidate.get("fields") or {}).items():
-                if key in ocr_selected["fields"] and ocr_selected["fields"][key] != value:
-                    result["conflicts"] = list(result.get("conflicts") or []) + [
-                        {"kind": "field", "field": key, "source": "ocr_media_conflict"}
-                    ]
-                else:
-                    ocr_selected["fields"].setdefault(key, value)
-                    if key in (candidate.get("evidence") or {}):
-                        ocr_selected["evidence"].setdefault(key, candidate["evidence"][key])
-            if not prior_identity and identity:
-                ocr_selected["identity"] = candidate.get("identity") or ""
-            ocr_selected["rule_ids"].extend(candidate.get("rule_ids") or [])
-        ocr_selected["rule_ids"] = list(dict.fromkeys(ocr_selected["rule_ids"]))
-        if result.get("conflicts"):
-            return result, metadata, False
+            if candidate.get("identity"):
+                identities.append((candidate["identity"], candidate["evidence"].get("username")))
+            rule_ids.extend(candidate.get("rule_ids") or [])
+            clues.update(candidate.get("clues") or {})
+            for key, value in candidate["fields"].items():
+                field_values.setdefault(key, []).append((value, candidate["evidence"].get(key)))
+        ocr_selected = {"fields": {}, "evidence": {}, "rule_ids": list(dict.fromkeys(rule_ids)),
+                        "identity": "", "clues": clues}
+        for key, values in field_values.items():
+            unique = []
+            for value, evidence in values:
+                if not any(equivalent_field(key, value, old_value) for old_value, _ in unique):
+                    unique.append((value, evidence))
+            if len(unique) == 1:
+                ocr_selected["fields"][key] = unique[0][0]
+                if unique[0][1]:
+                    ocr_selected["evidence"][key] = unique[0][1]
+            else:
+                ocr_conflicts.append({"kind": "field", "field": key,
+                                      "source": "multiple_ocr_media",
+                                      "values": [value for value, _ in unique],
+                                      "evidence": [evidence for _, evidence in unique]})
+        unique_identities = {}
+        for value, evidence in identities:
+            unique_identities.setdefault(normalize_telegram_identity(value), (value, evidence))
+        if len(unique_identities) == 1:
+            value, evidence = next(iter(unique_identities.values()))
+            ocr_selected["identity"] = value
+            if evidence:
+                ocr_selected["evidence"].setdefault("username", evidence)
+        elif len(unique_identities) > 1:
+            ocr_conflicts.append({"kind": "telegram_identity", "source": "multiple_ocr_media",
+                                  "values": [item[0] for item in unique_identities.values()],
+                                  "evidence": [item[1] for item in unique_identities.values()]})
+
+        if ocr_conflicts:
+            result["conflicts"] = list(result.get("conflicts") or []) + ocr_conflicts
         if not text_selected:
-            structural_fields = {"username", "nickname", "district", "price_amount"}
-            if len(structural_fields.intersection(ocr_selected["fields"])) < 2:
+            structural_fields = {"nickname", "district", "price_amount"}
+            if len(structural_fields.intersection(ocr_selected["fields"])) < 1 or not (
+                    ocr_selected.get("identity") or len(structural_fields.intersection(ocr_selected["fields"])) >= 2):
+                result["ocr_clues"] = ocr_selected["clues"]
                 return result, metadata, False
             result["selected"] = ocr_selected
-            result["reason"] = "ocr_supplement_match"
+            result["reason"] = "ocr_structured_candidate"
             return result, metadata, False
 
         text_identity = normalize_telegram_identity(text_selected.get("identity"))
         ocr_identity = normalize_telegram_identity(ocr_selected.get("identity"))
         if text_identity and ocr_identity and text_identity != ocr_identity:
-            result["conflicts"] = list(result.get("conflicts") or []) + [
-                {"kind": "telegram_identity", "source": "telegram_text_vs_ocr"}
-            ]
-            return result, metadata, False
+            result["conflicts"] = list(result.get("conflicts") or []) + [{
+                "kind": "telegram_identity", "source": "telegram_text_vs_ocr",
+                "values": [text_selected.get("identity"), ocr_selected.get("identity")],
+                "evidence": {"text": text_selected.get("evidence", {}).get("username"),
+                             "ocr": ocr_selected.get("evidence", {}).get("username")},
+            }]
         merged = dict(text_selected)
         fields = dict(text_selected.get("fields") or {})
         evidence = dict(text_selected.get("evidence") or {})
         for key, value in (ocr_selected.get("fields") or {}).items():
-            if key in fields and fields[key] != value:
+            if key in fields and not equivalent_field(key, fields[key], value):
                 result["conflicts"] = list(result.get("conflicts") or []) + [
-                    {"kind": "field", "field": key, "source": "telegram_text_vs_ocr"}
+                    {"kind": "field", "field": key, "source": "telegram_text_vs_ocr",
+                     "values": [fields[key], value],
+                     "evidence": {"text": evidence.get(key), "ocr": ocr_selected["evidence"].get(key)}},
                 ]
                 continue
             if key not in fields:
                 fields[key] = value
-                evidence[key] = {**(ocr_selected.get("evidence") or {}).get(key, {}), "src": "ocr"}
+                evidence[key] = (ocr_selected.get("evidence") or {}).get(key, {"src": "ocr"})
+        if ocr_identity and not text_identity:
+            fields.setdefault("username", ocr_selected.get("identity"))
+            evidence.setdefault("username", ocr_selected.get("evidence", {}).get("username", {"src": "ocr"}))
         merged["fields"] = fields
         merged["evidence"] = evidence
         merged["identity"] = text_selected.get("identity") or ocr_selected.get("identity") or ""
@@ -654,13 +724,14 @@ class Extractor:
             (text_selected.get("rule_ids") or []) + (ocr_selected.get("rule_ids") or [])
         ))
         result["selected"] = merged
+        result["ocr_clues"] = ocr_selected["clues"]
         if result.get("conflicts"):
             result["reason"] = "ocr_text_conflict"
         else:
             result["reason"] = "ocr_supplement_merge"
         return result, metadata, False
 
-    async def _schedule_ocr_recheck(self, row):
+    async def _schedule_ocr_recheck(self, row, bindings):
         media = _decode_jsonb(row.get("media_json"), [])
         paths = list(dict.fromkeys(
             item.get("path") for item in media
@@ -672,22 +743,104 @@ class Extractor:
             async with conn.transaction():
                 for path in paths:
                     await conn.execute(SQL_OCR_ENQUEUE_RAW, row["raw_id"], path)
+                versions = sorted({int(binding["rule_version_id"]) for binding in bindings
+                                   if binding.get("rule_version_id") is not None})
                 await conn.execute(
-                    "UPDATE raw_messages SET ocr_review_pending=TRUE WHERE id=$1 AND EXISTS ("
-                    "SELECT 1 FROM listing_media_ocr WHERE raw_id=$1 AND status IN ('pending','processing'))",
-                    row["raw_id"],
+                    SQL_OCR_RECHECK_ENQUEUE, row["raw_id"], row["source_id"], versions,
                 )
 
-    async def _release_ocr_recheck_if_ready(self, raw_id):
-        await self._pool.execute(
-            "UPDATE raw_messages SET extract_state=CASE WHEN EXISTS ("
-            "SELECT 1 FROM listing_media_ocr WHERE raw_id=$1 AND status='done') "
-            "THEN 'new' ELSE 'dropped' END,ocr_review_pending=FALSE "
-            "WHERE id=$1 AND extract_state='dropped' AND ocr_review_pending "
-            "AND NOT EXISTS (SELECT 1 FROM listing_media_ocr WHERE raw_id=$1 "
-            "AND status IN ('pending','processing'))",
-            raw_id,
-        )
+    async def _process_ocr_recheck(self, task):
+        """Refresh only the original open Active review item; never claim a raw message."""
+        task_id = task["id"]
+        try:
+            row = await self._pool.fetchrow(SQL_OCR_RECHECK_CONTEXT, task["raw_id"])
+            if (not row or row["extract_state"] != "dropped"
+                    or int(row["revision_id"]) != int(task["raw_revision_id"])
+                    or row["content_hash"] != task["content_hash"]):
+                await self._finish_ocr_recheck(task_id, "stale")
+                return
+            queue_status = await self._pool.fetchval(
+                "SELECT status FROM rule_active_review_queue "
+                "WHERE source_id=$1 AND raw_id=$2 AND content_hash=$3",
+                task["source_id"], task["raw_id"], task["content_hash"],
+            )
+            if queue_status != "open":
+                await self._finish_ocr_recheck(task_id, "stale")
+                return
+            mode = await self._pool.fetchval(
+                "SELECT router_mode FROM ingest_sources WHERE id=$1", task["source_id"],
+            )
+            settings = get_settings()
+            if (mode != "active" or int(row["mode_event_id"]) != int(task["mode_event_id"])
+                    or not settings.ocr_review_assist_enabled
+                    or not active_source_allowed(
+                        task["source_id"], enabled=settings.active_router_enabled,
+                        allowed_source_ids=settings.active_router_source_ids,
+                        kill_switch=settings.active_router_kill_switch,
+                    )):
+                await self._finish_ocr_recheck(task_id, "stale")
+                return
+
+            bindings = [dict(item) for item in await self._pool.fetch(
+                SQL_SHADOW_BINDINGS, task["source_id"],
+            )]
+            versions = sorted({int(binding["rule_version_id"]) for binding in bindings
+                               if binding.get("rule_version_id") is not None})
+            if versions != sorted(int(value) for value in task["rule_version_ids"]):
+                await self._finish_ocr_recheck(task_id, "stale")
+                return
+
+            result = resolve_active_listing(
+                bindings, row["raw_text"] or "", row["sender_peer_id"],
+            )
+            result, ocr_evidence, pending = await self._supplement_active_from_ocr(
+                row, bindings, result,
+            )
+            if pending:
+                await self._finish_ocr_recheck(task_id, "retry", "OCR media still pending")
+                return
+            if not ocr_evidence:
+                await self._finish_ocr_recheck(task_id, "failed", "No completed OCR evidence")
+                return
+
+            selected = result.get("selected") or {}
+            if result.get("conflicts"):
+                reason = "rule_conflict"
+            elif selected.get("lifecycle"):
+                term = selected.get("lifecycle") or ""
+                fields = selected.get("fields") or {}
+                target = explicit_lifecycle_username(row["raw_text"] or "", fields.get("username"))
+                lifecycle_reason = "identity_unresolved" if target is None else "source_or_sender_authority_unverified"
+                await self._pool.fetch(
+                    SQL_LIFECYCLE_REVIEW, task["raw_id"], row["sender_peer_id"], term,
+                    target or "", lifecycle_reason,
+                    json.dumps({"identity_basis": "single_explicit_username_in_message" if target else "unresolved",
+                                "candidate_username": target or "", "sender_authority_verified": False,
+                                "forward_metadata_available": False,
+                                "automatic_action_blocked_reason": lifecycle_reason,
+                                "ocr_recheck_id": task_id}, ensure_ascii=False),
+                )
+                await self._finish_ocr_recheck(task_id, "done")
+                return
+            elif not selected:
+                reason = "no_rule_match"
+            elif not selected.get("identity"):
+                reason = "identity_unresolved"
+            else:
+                reason = "human_review_required"
+            active = {"review_reason": reason, "result": result,
+                      "ocr_evidence": ocr_evidence, "ocr_pending": False}
+            await self._enqueue_active_review(row, active)
+            await self._finish_ocr_recheck(task_id, "done")
+        except Exception as exc:
+            logger.exception("OCR review recheck failed (task=%s raw=%s)", task_id, task.get("raw_id"))
+            try:
+                await self._finish_ocr_recheck(task_id, "retry", type(exc).__name__)
+            except Exception:
+                logger.exception("OCR review recheck lease remains for recovery (task=%s)", task_id)
+
+    async def _finish_ocr_recheck(self, task_id, status, error=""):
+        await self._pool.execute(SQL_OCR_RECHECK_FINISH, task_id, status, error)
 
     async def _enqueue_active_review(self, row, active):
         result = active.get("result") or {}
@@ -705,7 +858,8 @@ class Extractor:
             "rule_id", "rule_version_id", "rule_type", "priority", "supported", "matched",
             "reason", "evidence_source") if key in item} for item in trace],
             "conflict_kinds": sorted({item.get("kind", "unknown") for item in result.get("conflicts", [])}),
-            "conflicts": [{key: item.get(key) for key in ("kind", "field", "source") if key in item}
+            "conflicts": [{key: item.get(key) for key in
+                           ("kind", "field", "source", "values", "evidence") if key in item}
                           for item in result.get("conflicts", [])],
         }
         selected = result.get("selected") or {}
@@ -715,6 +869,7 @@ class Extractor:
             "identity": selected.get("identity") or "",
             "rule_ids": selected.get("rule_ids") or rule_ids,
             "ocr_assist": active.get("ocr_evidence") or result.get("ocr_assist") or [],
+            "ocr_clues": result.get("ocr_clues") or {},
             "raw_revision_id": context["id"] if context else None,
             "content_hash": context["content_hash"] if context else None,
         }

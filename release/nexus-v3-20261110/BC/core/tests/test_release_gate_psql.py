@@ -20,6 +20,9 @@ class ReleaseGatePsqlTests(unittest.TestCase):
         self.assertEqual(script.count("psql -XAtq -v ON_ERROR_STOP=1"), 2)
         self.assertIn("constraint:router_mode_previous_active", script)
         self.assertIn("constraint:router_mode_new_active", script)
+        self.assertIn("table:rule_active_ocr_rechecks", script)
+        self.assertIn("safety:legacy_raw_requeue_trigger_absent", script)
+        self.assertIn("trigger:active_ocr_review_retry", script)
         self.assertIn("ROLLBACK_OK image_id=", script)
 
         good = subprocess.run(

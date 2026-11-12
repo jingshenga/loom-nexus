@@ -113,13 +113,13 @@ SELECT object_name FROM (VALUES
  ('table:rule_shadow_cleanup_runs', to_regclass('public.rule_shadow_cleanup_runs') IS NOT NULL),
  ('table:rule_active_review_queue', to_regclass('public.rule_active_review_queue') IS NOT NULL),
  ('table:rule_active_review_events', to_regclass('public.rule_active_review_events') IS NOT NULL),
- ('column:raw_messages.ocr_review_pending', EXISTS (
-   SELECT 1 FROM information_schema.columns
-   WHERE table_schema='public' AND table_name='raw_messages'
-     AND column_name='ocr_review_pending' AND data_type='boolean')),
- ('trigger:trg_active_raw_after_ocr', EXISTS (
+ ('table:rule_active_ocr_rechecks', to_regclass('public.rule_active_ocr_rechecks') IS NOT NULL),
+ ('safety:legacy_raw_requeue_trigger_absent', NOT EXISTS (
    SELECT 1 FROM pg_trigger t WHERE t.tgrelid=to_regclass('public.listing_media_ocr')
      AND t.tgname='trg_active_raw_after_ocr' AND NOT t.tgisinternal)),
+ ('trigger:active_ocr_review_retry', EXISTS (
+   SELECT 1 FROM pg_trigger t WHERE t.tgrelid=to_regclass('public.listing_media_ocr')
+     AND t.tgname='trg_active_ocr_review_retry' AND NOT t.tgisinternal)),
    ('constraint:active_review_manual_requeue', EXISTS (
      SELECT 1 FROM pg_constraint c
      WHERE c.conrelid=to_regclass('public.rule_active_review_events')

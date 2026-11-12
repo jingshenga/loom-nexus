@@ -61,7 +61,15 @@ from pathlib import Path
 from app.config import CoreSettings
 from app.extractor.media_ocr import MediaOcrProcessor
 from app.extractor.vision4_classifier import Vision4Classifier
+from app.extractor.ocr_fields import structured_ocr_candidate
+from app.extractor.pipeline import Extractor
 from app.main import app
+sql_dir = Path("/app/app/sql")
+required_rechecks = {
+    "active_ocr_recheck_enqueue.sql", "active_ocr_recheck_claim.sql",
+    "active_ocr_recheck_finish.sql", "active_ocr_recheck_context.sql",
+}
+assert required_rechecks <= {p.name for p in sql_dir.glob("active_ocr_recheck_*.sql")}, "OCR recheck SQL missing from overlay"
 paths = app.openapi()["paths"]
 required = {
     "/api/admin/rules/lifecycle-review",

@@ -199,11 +199,178 @@ async def main():
         assert lifecycle and lifecycle["status"] == "pending" and lifecycle["candidate_username"] == "lifeuser"
         assert not await pool.fetchval("SELECT EXISTS(SELECT 1 FROM listings WHERE source_msg_id=$1)", lifecycle_raw)
 
+        # OCR completion is handled through its own durable work queue. It may
+        # enrich the open Active review item but must never re-claim a raw row.
+        await pool.execute("DELETE FROM source_rule_bindings WHERE source_id=$1", SOURCE_ID)
+        await add_rule("ocr-fields", {
+            "username": [r"TG[:：]\s*@?([A-Za-z0-9_]{5,32})"],
+            "nickname": [r"昵称[:：]\s*([^\s]+)"],
+            "price": [r"价格[:：]\s*(\d+)"],
+        }, "ocr")
+        await pool.execute("UPDATE app_settings SET value='1' WHERE key='autopublish_enabled'")
+        ocr_media_path = f"e2e/{suffix}/card.jpg"
+        ocr_detail_path = f"e2e/{suffix}/detail.jpg"
+        ocr_raw = await pool.fetchval(
+            "INSERT INTO raw_messages(source_id,platform_msg_id,sender_peer_id,raw_text,media_json,posted_at,extract_state) "
+            "VALUES($1,$2,$3,'见图片',jsonb_build_array(jsonb_build_object('kind','photo','path',$4::text),"
+            "jsonb_build_object('kind','photo','path',$5::text)),"
+            "NOW(),'processing') RETURNING id",
+            SOURCE_ID, int(uuid.uuid4().int % 2_000_000_000), peer_id, ocr_media_path, ocr_detail_path,
+        )
+        raw_ids.append(ocr_raw)
+        ocr_row = await pool.fetchrow(
+            "SELECT id AS raw_id,source_id,platform_msg_id,sender_peer_id,grouped_id,raw_text,media_json,posted_at,"
+            "(SELECT config_json FROM ingest_rules WHERE rule_name LIKE $1 ORDER BY id DESC LIMIT 1) AS rule_config "
+            "FROM raw_messages WHERE id=$2", f"active-e2e-{suffix}-ocr-fields", ocr_raw,
+        )
+        ocr_settings = settings.model_copy(update={"ocr_review_assist_enabled": True})
+        with mock.patch.object(pipeline, "get_settings", return_value=ocr_settings):
+            await extractor._process_one(ocr_row)
+        ocr_bindings = [dict(item) for item in await pool.fetch(pipeline.SQL_SHADOW_BINDINGS, SOURCE_ID)]
+        await extractor._schedule_ocr_recheck(ocr_row, ocr_bindings)
+        assert await pool.fetchval("SELECT count(*) FROM rule_active_ocr_rechecks WHERE raw_id=$1", ocr_raw) == 1
+        pending_queue = await pool.fetchrow(
+            "SELECT reason FROM rule_active_review_queue WHERE raw_id=$1", ocr_raw,
+        )
+        assert pending_queue and pending_queue["reason"] == "no_rule_match"
+        await pool.execute(
+            "UPDATE listing_media_ocr SET status='done',classification='info_card',review_status='pending',"
+            "raw_text='',fields_json=$3::jsonb,evidence_json=$4::jsonb,confidence=0.91,"
+            "engine_version='e2e-structured-ocr' WHERE raw_id=$1 AND media_path=$2",
+            ocr_raw, ocr_detail_path,
+            json.dumps({"price_text": ["价格：900元"]}, ensure_ascii=False),
+            json.dumps({"price_text": {"line": "价格：900元", "score": 0.9}}, ensure_ascii=False),
+        )
+        await pool.execute(
+            "UPDATE listing_media_ocr SET status='done',classification='info_card',review_status='pending',"
+            "raw_text='',fields_json=$3::jsonb,evidence_json=$4::jsonb,confidence=0.91,"
+            "engine_version='e2e-structured-ocr' WHERE raw_id=$1 AND media_path=$2",
+            ocr_raw, ocr_media_path,
+            json.dumps({"stage_name": "阿青", "contact_handles": ["ocruser"],
+                        "location_text": ["地区：宁波市海曙区"]}, ensure_ascii=False),
+            json.dumps({"stage_name": {"line": "昵称：阿青", "score": 0.9}}, ensure_ascii=False),
+        )
+        assert await pool.fetchval("SELECT extract_state FROM raw_messages WHERE id=$1", ocr_raw) == "dropped"
+        assert not await pool.fetchval("SELECT EXISTS(SELECT 1 FROM pg_trigger WHERE tgname='trg_active_raw_after_ocr' AND NOT tgisinternal)")
+        ocr_tasks = await pool.fetch(pipeline.SQL_OCR_RECHECK_CLAIM, 10)
+        ocr_task = next(task for task in ocr_tasks if task["raw_id"] == ocr_raw)
+        restarted_extractor = Extractor(pool, "", False, ocr_worker=object())
+        with mock.patch.object(pipeline, "get_settings", return_value=ocr_settings):
+            await restarted_extractor._process_ocr_recheck(ocr_task)
+        refreshed = await pool.fetchrow(
+            "SELECT reason,candidate_json,status FROM rule_active_review_queue WHERE raw_id=$1", ocr_raw,
+        )
+        refreshed_candidate = refreshed["candidate_json"]
+        if isinstance(refreshed_candidate, str):
+            refreshed_candidate = json.loads(refreshed_candidate)
+        assert refreshed["reason"] == "human_review_required" and refreshed["status"] == "open"
+        assert refreshed_candidate["fields"]["username"] == "ocruser"
+        assert refreshed_candidate["fields"]["nickname"] == "阿青"
+        assert Decimal(str(refreshed_candidate["fields"]["price_amount"])) == Decimal("900")
+        assert await pool.fetchval("SELECT extract_state FROM raw_messages WHERE id=$1", ocr_raw) == "dropped"
+        assert not await pool.fetchval("SELECT EXISTS(SELECT 1 FROM listings WHERE source_msg_id=$1)", ocr_raw)
+        assert await pool.fetchval("SELECT status FROM rule_active_ocr_rechecks WHERE raw_id=$1", ocr_raw) == "done"
+
+        # OCR failure is terminal until an explicit retry. The retry endpoint's
+        # failed->pending transition reopens only this still-open review task.
+        retry_path = f"e2e/{suffix}/retry.jpg"
+        retry_raw = await pool.fetchval(
+            "INSERT INTO raw_messages(source_id,platform_msg_id,sender_peer_id,raw_text,media_json,posted_at,extract_state) "
+            "VALUES($1,$2,$3,'见图片',jsonb_build_array(jsonb_build_object('kind','photo','path',$4::text)),"
+            "NOW(),'processing') RETURNING id",
+            SOURCE_ID, int(uuid.uuid4().int % 2_000_000_000), peer_id, retry_path,
+        )
+        raw_ids.append(retry_raw)
+        retry_row = dict(ocr_row)
+        retry_row.update({"raw_id": retry_raw, "platform_msg_id": retry_raw,
+                          "media_json": [{"kind": "photo", "path": retry_path}]})
+        with mock.patch.object(pipeline, "get_settings", return_value=ocr_settings):
+            await extractor._process_one(retry_row)
+        await pool.execute(
+            "UPDATE listing_media_ocr SET status='failed',error_text='synthetic OCR failure' "
+            "WHERE raw_id=$1 AND media_path=$2", retry_raw, retry_path,
+        )
+        failed_task = next(task for task in await pool.fetch(pipeline.SQL_OCR_RECHECK_CLAIM, 10)
+                           if task["raw_id"] == retry_raw)
+        with mock.patch.object(pipeline, "get_settings", return_value=ocr_settings):
+            await restarted_extractor._process_ocr_recheck(failed_task)
+        assert await pool.fetchval("SELECT status FROM rule_active_ocr_rechecks WHERE raw_id=$1", retry_raw) == "failed"
+        assert await pool.fetchval("SELECT extract_state FROM raw_messages WHERE id=$1", retry_raw) == "dropped"
+        await pool.execute(
+            "UPDATE listing_media_ocr SET status='pending',error_text=NULL WHERE raw_id=$1 AND media_path=$2",
+            retry_raw, retry_path,
+        )
+        assert await pool.fetchval("SELECT status FROM rule_active_ocr_rechecks WHERE raw_id=$1", retry_raw) == "waiting_ocr"
+        await pool.execute(
+            "UPDATE listing_media_ocr SET status='done',classification='info_card',review_status='pending',"
+            "raw_text='',fields_json=$3::jsonb,evidence_json='{}'::jsonb,engine_version='e2e-retry' "
+            "WHERE raw_id=$1 AND media_path=$2",
+            retry_raw, retry_path,
+            json.dumps({"stage_name": "小青", "contact_handles": ["retryuser"],
+                        "price_text": ["价格：700元"]}, ensure_ascii=False),
+        )
+        retried_task = next(task for task in await pool.fetch(pipeline.SQL_OCR_RECHECK_CLAIM, 10)
+                            if task["raw_id"] == retry_raw)
+        with mock.patch.object(pipeline, "get_settings", return_value=ocr_settings):
+            await restarted_extractor._process_ocr_recheck(retried_task)
+        retry_candidate = await pool.fetchrow(
+            "SELECT reason,candidate_json FROM rule_active_review_queue WHERE raw_id=$1", retry_raw,
+        )
+        assert retry_candidate["reason"] == "human_review_required"
+        assert await pool.fetchval("SELECT status FROM rule_active_ocr_rechecks WHERE raw_id=$1", retry_raw) == "done"
+        assert await pool.fetchval("SELECT extract_state FROM raw_messages WHERE id=$1", retry_raw) == "dropped"
+        assert not await pool.fetchval("SELECT EXISTS(SELECT 1 FROM listings WHERE source_msg_id=$1)", retry_raw)
+
+        # A manual terminal review is immutable under a later OCR retry.
+        before_review = await pool.fetchval(
+            "SELECT candidate_json FROM rule_active_review_queue WHERE raw_id=$1", ocr_raw,
+        )
+        await pool.execute("UPDATE rule_active_review_queue SET status='resolved' WHERE raw_id=$1", ocr_raw)
+        await pool.execute(
+            "UPDATE listing_media_ocr SET status='pending' WHERE raw_id=$1 AND media_path=$2",
+            ocr_raw, ocr_media_path,
+        )
+        assert await pool.fetchval("SELECT status FROM rule_active_ocr_rechecks WHERE raw_id=$1", ocr_raw) == "done"
+        assert await pool.fetchval(
+            "SELECT candidate_json FROM rule_active_review_queue WHERE raw_id=$1", ocr_raw,
+        ) == before_review
+
+        # A task created in Active becomes stale after Legacy cutover. Even
+        # with autopublish enabled it cannot enter the Legacy listing path.
+        stale_path = f"e2e/{suffix}/stale.jpg"
+        stale_raw = await pool.fetchval(
+            "INSERT INTO raw_messages(source_id,platform_msg_id,sender_peer_id,raw_text,media_json,posted_at,extract_state) "
+            "VALUES($1,$2,$3,'见图片',jsonb_build_array(jsonb_build_object('kind','photo','path',$4::text)),"
+            "NOW(),'processing') RETURNING id",
+            SOURCE_ID, int(uuid.uuid4().int % 2_000_000_000), peer_id, stale_path,
+        )
+        raw_ids.append(stale_raw)
+        stale_row = dict(ocr_row)
+        stale_row.update({"id": stale_raw, "raw_id": stale_raw, "platform_msg_id": stale_raw,
+                          "media_json": [{"kind": "photo", "path": stale_path}]})
+        with mock.patch.object(pipeline, "get_settings", return_value=ocr_settings):
+            await extractor._process_one(stale_row)
+        await pool.execute("UPDATE ingest_sources SET router_mode='legacy' WHERE id=$1", SOURCE_ID)
+        await pool.execute(
+            "UPDATE listing_media_ocr SET status='done',classification='info_card',review_status='pending',"
+            "raw_text='TG:@staleuser 昵称：不应发布 价格：900元' WHERE raw_id=$1 AND media_path=$2",
+            stale_raw, stale_path,
+        )
+        stale_task = next(task for task in await pool.fetch(pipeline.SQL_OCR_RECHECK_CLAIM, 10)
+                          if task["raw_id"] == stale_raw)
+        with mock.patch.object(pipeline, "get_settings", return_value=ocr_settings):
+            await extractor._process_ocr_recheck(stale_task)
+        assert await pool.fetchval("SELECT extract_state FROM raw_messages WHERE id=$1", stale_raw) == "dropped"
+        assert await pool.fetchval("SELECT status FROM rule_active_ocr_rechecks WHERE raw_id=$1", stale_raw) == "stale"
+        assert not await pool.fetchval("SELECT EXISTS(SELECT 1 FROM listings WHERE source_msg_id=$1)", stale_raw)
+        await pool.execute("UPDATE ingest_sources SET router_mode='active' WHERE id=$1", SOURCE_ID)
+
         active_runs = await pool.fetchval("SELECT count(*) FROM rule_parse_runs WHERE run_reason='active' AND raw_revision_id IN "
                                           "(SELECT id FROM raw_message_revisions WHERE raw_id=ANY($1::bigint[]))", raw_ids)
         assert active_runs >= len(raw_ids), (active_runs, len(raw_ids))
         print("Active Core/PostgreSQL pipeline E2E: review-first candidate, kill-switch review parking, additive field merge, "
-              "identity/field conflict review, missing identity review, Lifecycle review, no unsafe Listing creation: OK")
+              "identity/field conflict review, missing identity review, Lifecycle review, structured OCR fusion, "
+              "delayed recheck isolation, Active-to-Legacy stale-task protection, no unsafe Listing creation: OK")
     finally:
         if raw_ids:
             await pool.execute("DELETE FROM listings WHERE source_msg_id=ANY($1::bigint[])", raw_ids)
