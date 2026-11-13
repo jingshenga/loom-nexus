@@ -3,7 +3,11 @@ import { useSession } from "../stores/session";
 
 const routes = [
   { path: "/", redirect: "/explore" },
-  { path: "/admin", redirect: "/admin/review" },
+  {
+    path: "/admin",
+    component: () => import("../views/AdminOverviewView.vue"),
+    meta: { admin: true },
+  },
   { path: "/login", component: () => import("../views/LoginView.vue") },
   { path: "/explore", component: () => import("../views/ExploreView.vue") },
   { path: "/explore/:id", component: () => import("../views/DetailView.vue") },

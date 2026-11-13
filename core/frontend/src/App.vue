@@ -7,6 +7,7 @@ import { useTheme } from "./theme";
 import BottomNav from "./components/BottomNav.vue";
 import {
   LogOut,
+  LayoutDashboard,
   Compass,
   Star,
   MessageSquare,
@@ -40,6 +41,7 @@ const nav = [
   { to: "/messages", label: "消息", icon: MessageSquare },
 ];
 const adminNav = [
+  { to: "/admin", label: "总览", icon: LayoutDashboard },
   { to: "/admin/review", label: "审核", icon: ShieldCheck },
   { to: "/admin/ocr", label: "OCR核对", icon: ImageIcon },
   { to: "/admin/bots", label: "Bot质量", icon: Bot },
@@ -137,7 +139,7 @@ onUnmounted(() => unreadTimer && clearInterval(unreadTimer));
           >
             <component :is="item.icon" class="size-4" />{{ item.label }}
           </RouterLink>
-          <RouterLink v-if="session.isAdmin" to="/admin/review"
+          <RouterLink v-if="session.isAdmin" to="/admin"
             class="flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-sm text-slate-400 hover:bg-slate-800 hover:text-white">
             <ShieldCheck class="size-4" />管理后台
           </RouterLink>

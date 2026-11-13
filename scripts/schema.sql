@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS bridge_accounts (
     session_file VARCHAR(255) NOT NULL,
     status VARCHAR(32) DEFAULT 'active',        -- active | disconnected | needs_auth
     last_active_at TIMESTAMPTZ,
+    flood_wait_until TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -283,6 +284,8 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     status VARCHAR(16) DEFAULT 'queued',        -- queued | sending | sent | failed
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+ALTER TABLE chat_messages
+    ADD COLUMN IF NOT EXISTS outbound_alias_snapshot VARCHAR(32);
 
 CREATE TABLE IF NOT EXISTS outbox_jobs (
     id BIGSERIAL PRIMARY KEY,
@@ -2174,8 +2177,8 @@ DECLARE
 BEGIN
     UPDATE listings
     SET contact_peer_id = p_peer_id
-    WHERE contact_username = p_username
-      AND (contact_peer_id IS NULL OR contact_peer_id <> p_peer_id);
+    WHERE lower(contact_username) = lower(p_username)
+      AND contact_peer_id IS NULL;
     GET DIAGNOSTICS v_count = ROW_COUNT;
     RETURN v_count;
 END
@@ -2526,6 +2529,24 @@ BEGIN
 END
 $fn$;
 
+CREATE OR REPLACE FUNCTION account_flood_wait_set(
+    p_account_id BIGINT,
+    p_seconds INTEGER
+) RETURNS TIMESTAMPTZ
+LANGUAGE plpgsql AS $fn$
+DECLARE v_until TIMESTAMPTZ;
+BEGIN
+    UPDATE bridge_accounts
+    SET flood_wait_until = GREATEST(
+        COALESCE(flood_wait_until, NOW()),
+        NOW() + make_interval(secs => GREATEST(p_seconds, 1))
+    )
+    WHERE id = p_account_id
+    RETURNING flood_wait_until INTO v_until;
+    RETURN v_until;
+END
+$fn$;
+
 -- display name becomes mandatory; existing users fall back to username
 UPDATE site_users SET display_name = username WHERE display_name IS NULL OR display_name = '';
 
@@ -2740,6 +2761,9 @@ BEGIN
         FROM outbox_jobs oj
         JOIN chat_messages cm ON cm.id = oj.chat_msg_id
         JOIN chat_sessions cs ON cs.id = cm.session_id
+        JOIN bridge_accounts ba ON ba.id = p_account_id
+          AND ba.status = 'active'
+          AND (ba.flood_wait_until IS NULL OR ba.flood_wait_until <= NOW())
         WHERE cs.assigned_account_id = p_account_id
           AND cs.status = 'open'
           AND (
@@ -2748,7 +2772,7 @@ BEGIN
               )
         ORDER BY oj.id
         LIMIT 1
-        FOR UPDATE OF oj SKIP LOCKED
+        FOR UPDATE OF oj, cs, ba SKIP LOCKED
     )
     UPDATE outbox_jobs o
     SET status = 'processing', run_after = NOW()
@@ -2846,6 +2870,9 @@ BEGIN
         FROM outbox_jobs oj
         JOIN chat_messages cm ON cm.id = oj.chat_msg_id
         JOIN chat_sessions cs ON cs.id = cm.session_id
+        JOIN bridge_accounts ba ON ba.id = p_account_id
+          AND ba.status = 'active'
+          AND (ba.flood_wait_until IS NULL OR ba.flood_wait_until <= NOW())
         WHERE cs.assigned_account_id = p_account_id
           AND cs.status = 'open'
           AND (
@@ -2854,7 +2881,7 @@ BEGIN
               )
         ORDER BY oj.id
         LIMIT 1
-        FOR UPDATE OF oj SKIP LOCKED
+        FOR UPDATE OF oj, cs, ba SKIP LOCKED
     )
     UPDATE outbox_jobs o
     SET status = 'processing', run_after = NOW()
