@@ -126,8 +126,9 @@ async def _send_sim(pool, account_id, job) -> None:
     fake_platform_id = random.randint(1_000_000, 9_999_999)
     await _finish(pool, job["job_id"], True, None, fake_platform_id, "direct")
     rows = await pool.fetch(
-        SQL_INCOMING, account_id, job["contact_peer_id"], None,
-        fake_platform_id, "（模拟回复）已收到您的咨询，稍后为您介绍。",
+        SQL_INCOMING, account_id, job["contact_peer_id"],
+        job.get("contact_username"), fake_platform_id,
+        "（模拟回复）已收到您的咨询，稍后为您介绍。", None, None,
     )
     if rows[0]["message_id"] is not None:
         logger.info(
