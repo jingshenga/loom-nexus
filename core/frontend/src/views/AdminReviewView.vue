@@ -1,5 +1,4 @@
 <script setup>
-import AdminTabs from "../components/AdminTabs.vue";
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { CheckCircle2, XCircle, Save, Inbox, ArchiveRestore, Trash2 } from "lucide-vue-next";
 import { api, mediaUrl } from "../api/client";

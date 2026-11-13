@@ -1,5 +1,4 @@
 <script setup>
-import AdminTabs from "../components/AdminTabs.vue";
 import { onMounted, ref } from "vue";
 import { api } from "../api/client";
 

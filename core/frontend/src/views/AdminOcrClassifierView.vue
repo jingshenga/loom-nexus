@@ -1,7 +1,6 @@
 <script setup>
 import { computed, onMounted, ref } from "vue";
 import { RouterLink } from "vue-router";
-import AdminTabs from "../components/AdminTabs.vue";
 import { api } from "../api/client";
 
 const categories = ref([]);
@@ -176,7 +175,6 @@ onMounted(load);
 
 <template>
   <div class="space-y-4">
-    <AdminTabs />
     <div class="flex flex-wrap items-center gap-3">
       <h1 class="text-lg font-semibold">图片分类训练与规则</h1>
       <RouterLink to="/admin/ocr" class="text-xs text-sky-300 hover:text-sky-200">返回 OCR 核对 ↗</RouterLink>

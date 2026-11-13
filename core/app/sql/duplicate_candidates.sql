@@ -37,7 +37,13 @@ SELECT a.id AS left_id, a.status AS left_status,
        CASE
            WHEN a.contact_peer_id IS NOT NULL AND a.contact_peer_id = b.contact_peer_id THEN 'TG 数字 ID 一致'
            WHEN NULLIF(a.contact_username, '') IS NOT NULL
-                AND lower(a.contact_username) = lower(b.contact_username) THEN 'TG 号一致'
+                AND lower(a.contact_username) = lower(b.contact_username)
+                AND a.contact_peer_id IS NOT NULL AND b.contact_peer_id IS NOT NULL
+                AND a.contact_peer_id <> b.contact_peer_id THEN 'TG 号对应数字 ID 冲突'
+           WHEN NULLIF(a.contact_username, '') IS NOT NULL
+                AND lower(a.contact_username) = lower(b.contact_username)
+                AND (a.contact_peer_id IS NULL OR b.contact_peer_id IS NULL
+                     OR a.contact_peer_id = b.contact_peer_id) THEN 'TG 号一致'
            WHEN NULLIF(a.nickname, '') IS NOT NULL
                 AND regexp_replace(lower(a.nickname), '[[:space:][:punct:]_]+', '', 'g')
                     = regexp_replace(lower(b.nickname), '[[:space:][:punct:]_]+', '', 'g') THEN '昵称一致，待核对'
@@ -62,7 +68,9 @@ LEFT JOIN listing_duplicate_decisions d
 WHERE d.left_listing_id IS NULL
   AND (a.person_group_id IS NULL OR b.person_group_id IS NULL OR a.person_group_id <> b.person_group_id)
   AND NOT (NULLIF(a.contact_username, '') IS NOT NULL
-           AND lower(a.contact_username) = lower(b.contact_username))
+           AND lower(a.contact_username) = lower(b.contact_username)
+           AND (a.contact_peer_id IS NULL OR b.contact_peer_id IS NULL
+                OR a.contact_peer_id = b.contact_peer_id))
   AND (
       ((a.profile_collection_job_id IS NOT NULL OR b.profile_collection_job_id IS NOT NULL
         OR EXISTS (SELECT 1 FROM raw_messages h JOIN checkin_history_scans hs ON hs.source_id=h.source_id
@@ -72,7 +80,9 @@ WHERE d.left_listing_id IS NULL
        AND (
            (a.contact_peer_id IS NOT NULL AND a.contact_peer_id = b.contact_peer_id)
            OR (NULLIF(a.contact_username, '') IS NOT NULL
-               AND lower(a.contact_username) = lower(b.contact_username))
+               AND lower(a.contact_username) = lower(b.contact_username)
+               AND (a.contact_peer_id IS NULL OR b.contact_peer_id IS NULL
+                    OR a.contact_peer_id = b.contact_peer_id))
            OR (NULLIF(a.nickname, '') IS NOT NULL
                AND regexp_replace(lower(a.nickname), '[[:space:][:punct:]_]+', '', 'g')
                    = regexp_replace(lower(b.nickname), '[[:space:][:punct:]_]+', '', 'g'))

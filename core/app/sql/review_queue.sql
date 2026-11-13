@@ -35,8 +35,11 @@ WHERE l.status = $1::text
         AND other.status IN ('pending', 'duplicate_pending', 'published', 'archived')
         AND NULLIF(l.nickname, '') IS NOT NULL
         AND NULLIF(other.nickname, '') IS NOT NULL
-        AND regexp_replace(lower(l.nickname), '[[:space:][:punct:]_]+', '', 'g')
-            = regexp_replace(lower(other.nickname), '[[:space:][:punct:]_]+', '', 'g')
+        AND ((l.contact_peer_id IS NOT NULL AND l.contact_peer_id = other.contact_peer_id)
+             OR (NULLIF(l.contact_username, '') IS NOT NULL
+                 AND lower(l.contact_username) = lower(other.contact_username)
+                 AND (l.contact_peer_id IS NULL OR other.contact_peer_id IS NULL
+                      OR l.contact_peer_id = other.contact_peer_id)))
         AND (l.profile_collection_job_id IS NOT NULL OR other.profile_collection_job_id IS NOT NULL
              OR EXISTS (SELECT 1 FROM raw_messages history_raw
                         JOIN checkin_history_scans hs ON hs.source_id=history_raw.source_id

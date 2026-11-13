@@ -1,8 +1,8 @@
 <script setup>
-import { nextTick, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { ArrowLeft, Clock, Check, XCircle, Send, TriangleAlert, ExternalLink, PhoneOff, Bell, ImagePlus, MoreHorizontal } from "lucide-vue-next";
-import { api, mediaUrl } from "../api/client";
+import { ArrowLeft, Clock, Check, XCircle, Send, TriangleAlert, ExternalLink, PhoneOff, Bell, ImagePlus, MoreHorizontal, UserRoundPen, Trash2, X } from "lucide-vue-next";
+import { api } from "../api/client";
 import { useSession } from "../stores/session";
 
 const session = useSession();
@@ -12,6 +12,12 @@ const desktopQuery = window.matchMedia("(min-width: 1024px)");
 const mobile = ref(!desktopQuery.matches);
 const chatOpen = ref(false);
 const menuOpen = ref(false);
+const aliasDialog = ref(false);
+const aliasInfo = ref({ chat_alias: "", is_custom: false, changed_at: null, next_change_at: null });
+const aliasInput = ref("");
+const previewSrc = ref("");
+const aliasCanChange = computed(() => !aliasInfo.value.next_change_at
+  || new Date(aliasInfo.value.next_change_at).getTime() <= Date.now());
 const sessions = ref([]);
 const current = ref(null);
 const messages = ref([]);
@@ -22,6 +28,30 @@ const externalUrl = "https://web.telegram.org/";
 let ws = null;
 let bottomEl = null;
 let listTimer = null;
+const mediaObjectUrls = new Set();
+
+function clearMediaUrls() {
+  for (const url of mediaObjectUrls) URL.revokeObjectURL(url);
+  mediaObjectUrls.clear();
+  previewSrc.value = "";
+}
+
+async function hydrateMedia(items) {
+  await Promise.all(items.map(async (message) => {
+    if (message.media_kind !== "photo" || !message.media_url || message.local_url) return;
+    try {
+      const response = await fetch(message.media_url, {
+        headers: { Authorization: `Bearer ${session.token}` },
+      });
+      if (!response.ok) throw new Error("图片加载失败");
+      const url = URL.createObjectURL(await response.blob());
+      mediaObjectUrls.add(url);
+      message.local_url = url;
+    } catch {
+      message.media_error = true;
+    }
+  }));
+}
 
 async function loadSessions() {
   sessions.value = (await api("/api/chat/sessions")).items;
@@ -50,6 +80,7 @@ async function closeCurrent() {
   chatOpen.value = false;
   menuOpen.value = false;
   messages.value = [];
+  clearMediaUrls();
   if (ws) { ws.close(); ws = null; }
   if (route.query.session) {
     const query = { ...route.query };
@@ -59,11 +90,61 @@ async function closeCurrent() {
   await loadSessions();
 }
 
+async function deleteCurrent() {
+  if (!current.value) return;
+  const ok = window.confirm("确定删除这段聊天记录？删除后无法在 Nexus 中恢复，Telegram 对方已经收到的消息不会因此被删除。");
+  if (!ok) return;
+  try {
+    await api(`/api/chat/sessions/${current.value.session_id}`, { method: "DELETE" });
+    if (ws) { ws.close(); ws = null; }
+    current.value = null;
+    messages.value = [];
+    clearMediaUrls();
+    chatOpen.value = false;
+    menuOpen.value = false;
+    const query = { ...route.query };
+    delete query.session;
+    await router.replace({ query });
+    await loadSessions();
+    notify("聊天记录已删除");
+  } catch (e) {
+    notify(String(e.message).includes("稍后再删除") ? "消息正在投递，请稍后重试删除" : `删除失败：${String(e.message).slice(0, 40)}`);
+  }
+}
+
+async function loadAlias() {
+  try {
+    aliasInfo.value = await api("/api/chat/alias");
+    aliasInput.value = aliasInfo.value.chat_alias || "";
+  } catch { /* API error is shown when the dialog is opened */ }
+}
+
+async function saveAlias() {
+  try {
+    await api("/api/chat/alias", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_alias: aliasInput.value }),
+    });
+    await loadAlias();
+    aliasDialog.value = false;
+    notify("咨询昵称已保存");
+  } catch (e) {
+    notify(`保存失败：${String(e.message).slice(0, 60)}`);
+  }
+}
+
+function previewImage(src) {
+  if (src) previewSrc.value = src;
+}
+
 async function select(item) {
+  clearMediaUrls();
   current.value = item;
   chatOpen.value = true;
   conflict.value = false;
   messages.value = (await api(`/api/chat/sessions/${item.session_id}/messages`)).items;
+  await hydrateMedia(messages.value);
   scrollBottom();
   connectWs();
 }
@@ -74,33 +155,17 @@ function connectWs() {
   ws = new WebSocket(
     `${proto}://${location.host}/api/chat/ws/${current.value.session_id}?token=${encodeURIComponent(session.token)}`
   );
-  ws.onmessage = (ev) => {
+  ws.onmessage = async (ev) => {
     const msg = JSON.parse(ev.data);
     const existing = messages.value.find((m) => m.id === msg.id);
     if (existing) {
       existing.status = msg.status;
       return;
     }
+    await hydrateMedia([msg]);
     messages.value.push(msg);
     scrollBottom();
   };
-}
-
-async function startChat() {
-  const contact = prompt("联系人 username（不带@，演示用，正式入口在卡片「咨询」按钮）");
-  if (!contact) return;
-  const data = await api("/api/chat/sessions", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ contact_username: contact.trim().replace(/^@+/, "") }),
-  });
-  if (data.status === "CONFLICT_LOCKED") {
-    conflict.value = true;
-    return;
-  }
-  await loadSessions();
-  const fresh = sessions.value.find((s) => s.session_id === data.session_id);
-  if (fresh) select(fresh);
 }
 
 // 普通用户只见 发送中/已送达/发送失败；管理员额外看 重试次数/错误原因/通道
@@ -238,6 +303,7 @@ function scrollBottom() {
 
 onMounted(() => {
   desktopQuery.addEventListener("change", onViewportChange);
+  loadAlias();
   loadSessions();
   listTimer = setInterval(loadSessions, 10000);
 });
@@ -245,6 +311,7 @@ onUnmounted(() => {
   desktopQuery.removeEventListener("change", onViewportChange);
   ws && ws.close();
   clearInterval(listTimer);
+  clearMediaUrls();
 });
 
 function onViewportChange(event) {
@@ -254,11 +321,12 @@ function onViewportChange(event) {
 </script>
 
 <template>
-  <div class="grid h-[calc(100dvh-170px)] min-h-[320px] grid-cols-1 gap-4 lg:h-[calc(100dvh-140px)] lg:grid-cols-12">
+  <div class="chat-shell grid min-h-[320px] grid-cols-1 gap-4 lg:grid-cols-12">
     <aside v-show="!mobile || !chatOpen" class="min-h-0 space-y-2 overflow-y-auto lg:col-span-3">
-      <button @click="startChat"
-        class="w-full rounded-lg bg-sky-600 py-2 text-sm font-medium hover:bg-sky-500">
-        + 新建咨询
+      <button @click="aliasDialog = true"
+        class="flex w-full items-center justify-between rounded-lg border border-slate-800 bg-slate-900 px-3 py-2 text-left text-sm hover:border-slate-600">
+        <span class="min-w-0 truncate">咨询昵称：{{ aliasInfo.chat_alias || "加载中" }}</span>
+        <UserRoundPen class="ml-2 size-4 shrink-0 text-slate-400" />
       </button>
       <div v-if="conflict && mobile" class="rounded-lg border border-amber-600/40 bg-amber-600/15 p-3 text-sm text-amber-300">
         该联系人当前没有空闲的独立网关账号，请稍后再试。
@@ -275,11 +343,10 @@ function onViewportChange(event) {
               {{ s.unread > 99 ? "99+" : s.unread }}
             </span>
           </span>
-          <span class="shrink-0 text-xs text-slate-500">账号#{{ s.account_id }}</span>
         </div>
         <div class="mt-1 flex items-center gap-2 text-xs"
           :class="s.status === 'open' ? 'text-slate-500' : 'text-slate-600'">
-          联系人 {{ s.contact_peer_id }} · {{ s.status === "open" ? "进行中" : "已结束" }}
+          {{ s.contact_username ? `@${s.contact_username}` : "资料联系人" }} · {{ s.status === "open" ? "进行中" : "已结束" }}
         </div>
       </button>
     </aside>
@@ -290,7 +357,7 @@ function onViewportChange(event) {
           class="flex size-9 shrink-0 items-center justify-center rounded-lg hover:bg-slate-800">
           <ArrowLeft class="size-5" />
         </button>
-        <span class="min-w-0 flex-1 truncate">{{ current.contact_username ? "@" + current.contact_username : "联系人 " + current.contact_peer_id }} · 网关账号#{{ current.account_id }} 代理</span>
+        <span class="min-w-0 flex-1 truncate">{{ current.nickname || (current.contact_username ? "@" + current.contact_username : "资料联系人") }}</span>
         <div v-if="mobile" class="relative shrink-0">
           <button @click="menuOpen = !menuOpen" aria-label="会话操作" :aria-expanded="menuOpen"
             class="flex size-9 items-center justify-center rounded-lg hover:bg-slate-800">
@@ -303,6 +370,9 @@ function onViewportChange(event) {
             <button v-if="current.status === 'open'" @click="closeCurrent" class="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left hover:bg-slate-800">
               <PhoneOff class="size-4" />结束会话
             </button>
+            <button @click="deleteCurrent" class="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-rose-300 hover:bg-slate-800">
+              <Trash2 class="size-4" />删除聊天记录
+            </button>
           </div>
         </div>
         <button @click="toggleNotify" :title="notifyOn ? '桌面通知：开' : '桌面通知：关'"
@@ -310,11 +380,15 @@ function onViewportChange(event) {
           :class="notifyOn ? 'border-sky-600/60 text-sky-300' : 'border-slate-700 text-slate-500 hover:text-slate-300'">
           <Bell class="size-3.5" />{{ notifyOn ? "通知开" : "通知关" }}
         </button>
-        <button v-if="current.status === 'open'" @click="closeCurrent"
+            <button v-if="current.status === 'open'" @click="closeCurrent"
           class="hidden items-center gap-1 rounded-lg border border-slate-700 px-2.5 py-1 hover:bg-slate-800 hover:text-slate-300 lg:flex">
           <PhoneOff class="size-3.5" />结束会话（释放账号）
         </button>
-        <span v-else class="hidden rounded bg-slate-800 px-2 py-0.5 lg:inline">会话已结束</span>
+        <button @click="deleteCurrent"
+          class="hidden items-center gap-1 rounded-lg border border-rose-800/70 px-2.5 py-1 text-rose-300 hover:bg-rose-950/40 lg:flex">
+          <Trash2 class="size-3.5" />删除记录
+        </button>
+        <span v-if="current.status !== 'open'" class="hidden rounded bg-slate-800 px-2 py-0.5 lg:inline">会话已结束</span>
       </div>
       <div v-if="conflict" class="flex flex-wrap items-center gap-3 border-b border-amber-600/40 bg-amber-600/15 px-4 py-3 text-sm text-amber-300">
         <TriangleAlert class="size-5 shrink-0" />
@@ -332,8 +406,9 @@ function onViewportChange(event) {
             :class="m.direction === 'out'
               ? 'rounded-br-sm nx-grad text-white shadow-lg shadow-sky-400/10'
               : 'rounded-bl-sm bg-slate-800 text-slate-100'">
-            <img v-if="m.media_kind === 'photo'" :src="m.local_url || mediaUrl(m.media_path)"
-              class="mb-1 max-h-72 w-full rounded-xl object-cover" loading="lazy" />
+            <img v-if="m.media_kind === 'photo'" :src="m.local_url"
+              class="mb-1 max-h-72 w-full cursor-zoom-in rounded-xl object-cover" loading="lazy"
+              @click="previewImage(m.local_url)" @error="notify('图片加载失败，请稍后重试')" />
             <p v-if="m.content" class="whitespace-pre-wrap">{{ m.content }}</p>
             <div v-if="statusLine(m)" class="mt-1 flex items-center justify-end gap-1 text-[11px]"
               :class="[statusLine(m).cls, m.direction === 'out' && m.status !== 'failed' ? 'text-sky-200/80' : '']">
@@ -371,5 +446,27 @@ function onViewportChange(event) {
     <div v-if="flash" role="status" class="fixed bottom-24 left-1/2 z-50 max-w-[90vw] -translate-x-1/2 rounded-xl bg-slate-800 px-4 py-2 text-sm text-slate-100 shadow-lg">
       {{ flash }}
     </div>
+    <div v-if="aliasDialog" class="fixed inset-0 z-[80] flex items-center justify-center bg-black/70 p-4" @click.self="aliasDialog = false">
+      <section class="w-full max-w-sm rounded-2xl border border-slate-700 bg-slate-900 p-4 shadow-2xl">
+        <div class="mb-3 flex items-center justify-between"><h2 class="font-semibold">咨询昵称</h2><button @click="aliasDialog = false" aria-label="关闭" class="rounded-lg p-1 hover:bg-slate-800"><X class="size-5" /></button></div>
+        <p class="mb-3 text-sm text-slate-400">此昵称会显示在发给联系人的每条消息前。首次设置不受修改周期限制，之后每六个月可修改一次。</p>
+        <input v-model="aliasInput" maxlength="24" class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" aria-label="咨询昵称" />
+        <p v-if="aliasInfo.next_change_at" class="mt-2 text-xs text-slate-500">下次可修改：{{ new Date(aliasInfo.next_change_at).toLocaleString() }}</p>
+        <button @click="saveAlias" :disabled="!aliasCanChange" class="nx-grad mt-4 w-full rounded-lg px-3 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-40">保存</button>
+      </section>
+    </div>
+    <div v-if="previewSrc" class="fixed inset-0 z-[90] flex items-center justify-center bg-black/95 p-3" @click="previewSrc = ''" @keydown.esc.window="previewSrc = ''">
+      <button @click.stop="previewSrc = ''" aria-label="关闭图片预览" class="absolute right-3 top-3 z-10 rounded-full bg-slate-800/80 p-2 text-white"><X class="size-6" /></button>
+      <img :src="previewSrc" alt="聊天图片预览" class="max-h-[92dvh] max-w-[96vw] touch-auto object-contain" @click.stop />
+    </div>
   </div>
 </template>
+
+<style scoped>
+.chat-shell {
+  height: calc(100dvh - 134px - env(safe-area-inset-bottom));
+}
+@media (min-width: 1024px) {
+  .chat-shell { height: calc(100dvh - 96px); }
+}
+</style>

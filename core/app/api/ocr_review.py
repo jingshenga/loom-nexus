@@ -157,6 +157,9 @@ async def queue(
         " WHEN $1='not_card' THEN o.review_status='not_card' "
         " WHEN $1='failed' THEN o.status='failed' ELSE TRUE END " + filters +
         "ORDER BY CASE WHEN o.status='failed' THEN 0 ELSE 1 END, "
+        "CASE WHEN o.review_status='pending' AND COALESCE(o.human_classification,o.classification)='info_card' THEN 0 "
+        "     WHEN o.review_status='pending' AND COALESCE(o.human_classification,o.classification)='profile_photo' THEN 1 "
+        "     WHEN o.review_status='pending' THEN 2 ELSE 3 END, "
         "CASE WHEN $7='confidence_asc' THEN COALESCE(o.predicted_confidence,o.confidence) END ASC NULLS LAST, "
         "CASE WHEN $7='confidence_desc' THEN COALESCE(o.predicted_confidence,o.confidence) END DESC NULLS LAST, "
         "CASE WHEN $7='oldest' THEN o.id END ASC, CASE WHEN $7='newest' THEN o.id END DESC, o.id "

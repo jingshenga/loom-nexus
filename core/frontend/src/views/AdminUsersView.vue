@@ -1,5 +1,4 @@
 <script setup>
-import AdminTabs from "../components/AdminTabs.vue";
 import { onMounted, ref } from "vue";
 import { UserPlus, KeyRound, Trash2, ShieldCheck, UserCog } from "lucide-vue-next";
 import { api } from "../api/client";

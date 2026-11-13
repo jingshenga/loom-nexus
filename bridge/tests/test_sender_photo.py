@@ -7,7 +7,7 @@ import zlib
 
 from PIL import Image
 
-from runner.sender import _payload, _send_any
+from runner.sender import _payload, _prefixed_text, _resolve_bot, _send_any
 
 
 def photo_data_url():
@@ -18,6 +18,32 @@ def photo_data_url():
 
 
 class PhotoSendTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_a_unique_verified_bot_is_used_as_fallback(self):
+        class Pool:
+            rows = []
+
+            async def fetch(self, *_args):
+                return self.rows
+
+        pool = Pool()
+        pool.rows = [{"bot_url": "https://t.me/service_bot?start=abc"}]
+        self.assertEqual(await _resolve_bot(pool, 12), "service_bot")
+        pool.rows = [
+            {"bot_url": "https://t.me/service_bot"},
+            {"bot_url": "https://t.me/otherbot"},
+        ]
+        self.assertIsNone(await _resolve_bot(pool, 12))
+        pool.rows = []
+        self.assertIsNone(await _resolve_bot(pool, 12))
+
+    def test_each_outbound_message_uses_the_alias_snapshot(self):
+        job = {"display_name": "小北", "content": "你好", "is_first": False}
+        self.assertEqual(_prefixed_text(job), "【小北】你好")
+
+    def test_prefix_is_not_added_twice_on_retry(self):
+        job = {"display_name": "小北", "content": "【小北】你好", "is_first": False}
+        self.assertEqual(_prefixed_text(job), "【小北】你好")
+
     async def test_photo_is_sent_as_named_image_with_caption(self):
         class Client:
             async def send_file(self, target, file, **kwargs):

@@ -1,5 +1,4 @@
 <script setup>
-import AdminTabs from "../components/AdminTabs.vue";
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { Save, FlaskConical, Sparkles, Trash2, Link2, Settings2, PlugZap, RefreshCw, Copy } from "lucide-vue-next";
 import { api, mediaUrl } from "../api/client";

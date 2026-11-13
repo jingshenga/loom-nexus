@@ -5,18 +5,15 @@ INSERT INTO listings (
 SELECT r.contact_peer_id, r.contact_username,
        NULLIF(r.evidence_json->>'nickname', ''),
        NULLIF(r.evidence_json->>'district', ''),
-       COALESCE(
-           NULLIF(BTRIM(r.bot_url), ''),
-           (
+           COALESCE((
                SELECT NULLIF(BTRIM(bot.bot_url), '')
                FROM bot_collection_results bot
                WHERE lower(bot.contact_username) = lower(r.contact_username)
+                 AND bot.verification_status = 'verified'
                  AND NULLIF(BTRIM(bot.bot_url), '') IS NOT NULL
                ORDER BY bot.collected_at DESC, bot.job_id DESC
                LIMIT 1
-           ),
-           ''
-       ),
+           ), ''),
        r.description, r.media_json,
        r.evidence_json || jsonb_build_object('review_bucket', $2::text),
        CASE WHEN EXISTS (
@@ -28,9 +25,9 @@ SELECT r.contact_peer_id, r.contact_username,
              AND (
                  (r.contact_peer_id IS NOT NULL AND old.contact_peer_id = r.contact_peer_id)
                  OR (NULLIF(r.contact_username, '') IS NOT NULL
-                     AND lower(old.contact_username) = lower(r.contact_username))
-                 OR (NULLIF(r.evidence_json->>'nickname', '') IS NOT NULL
-                     AND lower(trim(old.nickname)) = lower(trim(r.evidence_json->>'nickname')))
+                     AND lower(old.contact_username) = lower(r.contact_username)
+                     AND (r.contact_peer_id IS NULL OR old.contact_peer_id IS NULL
+                          OR r.contact_peer_id = old.contact_peer_id))
              )
        ) THEN 'duplicate_pending' ELSE 'pending' END,
        0.95, j.id
@@ -44,7 +41,8 @@ DO UPDATE SET contact_peer_id = EXCLUDED.contact_peer_id,
                               ELSE COALESCE(EXCLUDED.nickname, listings.nickname) END,
               district = CASE WHEN listings.manual_fields ? 'district' THEN listings.district
                               ELSE COALESCE(EXCLUDED.district, listings.district) END,
-              bot_url = CASE WHEN listings.manual_fields ? 'bot_url' THEN listings.bot_url ELSE EXCLUDED.bot_url END,
+              bot_url = CASE WHEN listings.manual_fields ? 'bot_url' THEN listings.bot_url
+                             ELSE COALESCE(NULLIF(EXCLUDED.bot_url, ''), listings.bot_url) END,
               description = EXCLUDED.description,
               media_json = EXCLUDED.media_json,
               evidence_json = EXCLUDED.evidence_json,

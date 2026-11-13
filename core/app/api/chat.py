@@ -8,11 +8,13 @@ hood; fully adequate for NAS-scale usage).
 """
 import asyncio
 import json
+from pathlib import Path
 
 from fastapi import APIRouter, Header, HTTPException, WebSocket, WebSocketDisconnect, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app import db, sqlres
+from app.config import get_settings
 
 from app.api.auth import (
     bearer_identity,
@@ -36,14 +38,18 @@ SQL_LISTING_CONTACT = sqlres.load("listing_contact.sql")
 SQL_CLOSE = sqlres.load("chat_close.sql")
 SQL_MARK_READ = sqlres.load("chat_mark_read.sql")
 SQL_RETRY = sqlres.load("retry_message.sql")
+SQL_CHAT_ALIAS = sqlres.load("chat_alias_get.sql")
+SQL_CHAT_ALIAS_SET = sqlres.load("chat_alias_set.sql")
+SQL_CHAT_DELETE = sqlres.load("chat_delete_session.sql")
 
 EXTERNAL_CLIENT_URL = "https://web.telegram.org/"
 
 
 class OpenBody(BaseModel):
-    listing_id: int = None
-    contact_username: str = None
-    contact_peer_id: int = None
+    listing_id: int
+
+    class Config:
+        extra = "forbid"
 
 
 class SendBody(BaseModel):
@@ -69,16 +75,11 @@ def _user_id(authorization: str) -> int:
 async def open_session(body: OpenBody, authorization: str = Header(default="")) -> dict:
     pool = _pool()
     user_id = _user_id(authorization)
-    # contacts are identified by their extracted @username; the peer id
-    # is an optional cache (filled by presence resolution / first DM)
-    username = (body.contact_username or "").strip() or None
-    peer_id = body.contact_peer_id
-    if username is None and body.listing_id is not None:
-        rows = await pool.fetch(SQL_LISTING_CONTACT, body.listing_id)
-        if not rows:
-            raise HTTPException(status_code=404, detail="listing not found or not published")
-        username = rows[0]["contact_username"]
-        peer_id = peer_id or rows[0]["contact_peer_id"]
+    rows = await pool.fetch(SQL_LISTING_CONTACT, body.listing_id)
+    if not rows:
+        raise HTTPException(status_code=404, detail="资料已下架或暂不可咨询")
+    username = (rows[0]["contact_username"] or "").strip() or None
+    peer_id = rows[0]["contact_peer_id"]
     if username is None and peer_id is None:
         raise HTTPException(status_code=400, detail="listing_id / contact_username / contact_peer_id required")
     rows = await pool.fetch(SQL_OPEN, user_id, body.listing_id, username, peer_id)
@@ -86,7 +87,6 @@ async def open_session(body: OpenBody, authorization: str = Header(default="")) 
     return {
         "session_id": r["session_id"],
         "status": r["status"],
-        "account_id": r["account_id"],
         "contact_username": username,
         "external_url": EXTERNAL_CLIENT_URL if r["status"] == "CONFLICT_LOCKED" else None,
     }
@@ -100,9 +100,7 @@ async def list_sessions(authorization: str = Header(default="")) -> dict:
         "items": [
             {
                 "session_id": r["session_id"],
-                "contact_peer_id": r["contact_peer_id"],
                 "contact_username": r["contact_username"],
-                "account_id": r["account_id"],
                 "status": r["status"],
                 "listing_id": r["listing_id"],
                 "nickname": r["nickname"],
@@ -122,6 +120,69 @@ async def close_session(session_id: int, authorization: str = Header(default="")
     if rows[0]["outcome"] != "closed":
         raise HTTPException(status_code=404, detail="session not found or not open")
     return {"ok": True, "status": "closed"}
+
+
+@router.delete("/sessions/{session_id}")
+async def delete_session(session_id: int, authorization: str = Header(default="")) -> dict:
+    pool = _pool()
+    rows = await pool.fetch(SQL_CHAT_DELETE, session_id, _user_id(authorization))
+    result = rows[0]
+    if result["outcome"] == "NOT_FOUND":
+        raise HTTPException(status_code=404, detail="会话不存在")
+    if result["outcome"] == "IN_FLIGHT":
+        raise HTTPException(status_code=409, detail="消息正在投递，请稍后再删除")
+
+    media_root = Path(get_settings().media_dir).resolve()
+    for raw_path in result["media_paths"] or []:
+        path = Path(raw_path)
+        path = path if path.is_absolute() else media_root / path
+        path = path.resolve()
+        if media_root not in path.parents:
+            continue
+        referenced = await pool.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM chat_messages WHERE media_path=$1) "
+            "OR EXISTS(SELECT 1 FROM listings l, jsonb_array_elements(COALESCE(l.media_json,'[]'::jsonb)) m "
+            "WHERE m->>'path'=$1 OR m->>'poster'=$1)", raw_path,
+        )
+        if not referenced:
+            path.unlink(missing_ok=True)
+    return {"ok": True, "status": "deleted"}
+
+
+@router.get("/alias")
+async def get_chat_alias(authorization: str = Header(default="")) -> dict:
+    rows = await _pool().fetch(SQL_CHAT_ALIAS, _user_id(authorization))
+    if not rows:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    row = rows[0]
+    return {
+        "chat_alias": row["chat_alias"],
+        "is_custom": row["chat_alias_is_custom"],
+        "changed_at": row["chat_alias_changed_at"].isoformat() if row["chat_alias_changed_at"] else None,
+        "next_change_at": row["next_change_at"].isoformat() if row["next_change_at"] else None,
+    }
+
+
+class ChatAliasBody(BaseModel):
+    chat_alias: str = Field(min_length=2, max_length=24)
+
+
+@router.put("/alias")
+async def set_chat_alias(body: ChatAliasBody, authorization: str = Header(default="")) -> dict:
+    rows = await _pool().fetch(SQL_CHAT_ALIAS_SET, _user_id(authorization), body.chat_alias)
+    row = rows[0]
+    if row["outcome"] == "INVALID":
+        raise HTTPException(status_code=422, detail="昵称需为 2–24 个中英文、数字、空格、下划线或短横线字符，且不能使用保留名称")
+    if row["outcome"] == "TAKEN":
+        raise HTTPException(status_code=409, detail="该咨询昵称已被使用")
+    if row["outcome"] == "TOO_SOON":
+        raise HTTPException(status_code=409, detail={
+            "message": "咨询昵称每六个月只能修改一次",
+            "next_change_at": row["next_change_at"].isoformat() if row["next_change_at"] else None,
+        })
+    if row["outcome"] == "NOT_FOUND":
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return {"chat_alias": row["current_alias"], "outcome": row["outcome"]}
 
 
 @router.get("/sessions/{session_id}/messages")
@@ -150,7 +211,7 @@ async def history(session_id: int, authorization: str = Header(default="")) -> d
                 "client_msg_id": r["client_msg_id"],
                 "created_at": r["created_at"].isoformat(),
                 "media_kind": r["media_kind"],
-                "media_path": r["media_path"],
+                "media_url": f"/api/chat/sessions/{session_id}/messages/{r['id']}/image" if r["media_kind"] == "photo" else None,
                 **({
                     "error_text": r["error_text"],
                     "attempts": r["attempts"],
@@ -227,7 +288,7 @@ async def ws_chat(websocket: WebSocket, session_id: int, token: str = ""):
                     "status": r["status"],
                     "created_at": r["created_at"].isoformat(),
                     "media_kind": r["media_kind"],
-                    "media_path": r["media_path"],
+                    "media_url": f"/api/chat/sessions/{session_id}/messages/{r['id']}/image" if r["media_kind"] == "photo" else None,
                 }
                 if r["id"] > last_id:
                     last_id = r["id"]

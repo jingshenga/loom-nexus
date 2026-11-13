@@ -6,8 +6,8 @@ synthetic reply, so the whole outbox loop (claim -> deliver -> finish
 -> inbound store) runs without external network. Real mode sends
 through Telethon clients kept alive for each logged-in account, with:
 
-- identity prefix: the session's first outbound message carries the
-  site user's display name so the contact knows who is writing;
+- identity prefix: every outbound message carries the alias snapshotted
+  when it entered the outbox;
 - failure classification: Telethon errors map to friendly text shown
   (admin-only) next to the message;
 - stranger-limit handling: once an account trips Telegram's
@@ -36,7 +36,7 @@ SQL_CLAIM = sqlres.load("outbox_claim.sql")
 SQL_FINISH = sqlres.load("outbox_finish.sql")
 SQL_INCOMING = sqlres.load("chat_incoming.sql")
 SQL_REGISTER = sqlres.load("register_account.sql")
-SQL_SOURCE_TEXT = sqlres.load("session_source_text.sql")
+SQL_VERIFIED_BOT = sqlres.load("verified_bot_for_session.sql")
 SQL_SET_CHANNEL = sqlres.load("session_set_channel.sql")
 SQL_LIMIT_SET = sqlres.load("gateway_limit_set.sql")
 
@@ -87,11 +87,14 @@ async def _send_any(client, target, kind, payload, caption=""):
 
 
 async def _resolve_bot(pool, session_id: int):
-    """Pull the contact's bot handle out of the listing's original text."""
-    rows = await pool.fetch(SQL_SOURCE_TEXT, session_id)
-    text = (rows[0]["raw_text"] if rows else "") or ""
-    match = BOT_RE.search(text)
-    return match.group(1) if match else None
+    """Return only a Bot candidate explicitly verified by an administrator."""
+    rows = await pool.fetch(SQL_VERIFIED_BOT, session_id)
+    handles = {
+        match.group(1).lower(): match.group(1)
+        for row in rows
+        if (match := BOT_RE.search((row["bot_url"] or "")))
+    }
+    return next(iter(handles.values())) if len(handles) == 1 else None
 
 
 async def _sim_account_ids(pool: asyncpg.Pool) -> list:
@@ -157,18 +160,17 @@ def _payload(job):
 
 
 def _prefixed_text(job) -> str:
-    if job["is_first"] and job["display_name"]:
-        return f"【{job['display_name']}】{job['content']}"
-    return job["content"]
+    content = job["content"] or ""
+    alias = (job.get("display_name") or "").strip()
+    if not alias:
+        return content
+    content = re.sub(r"^【[^】]{1,24}】\s*", "", content, count=1)
+    return f"【{alias}】{content}"
 
 
 def _prefixed(job) -> str:
-    """First outbound message of a session carries the site user's
-    display name so the contact can tell writers apart."""
-    content = job["content"]
-    if job["is_first"] and job["display_name"]:
-        return f"【{job['display_name']}】{content}"
-    return content
+    """Return the stored alias-prefixed Telegram text for any message."""
+    return _prefixed_text(job)
 
 
 async def _send_real(pool, account_id, job) -> None:
@@ -200,8 +202,8 @@ async def _send_real(pool, account_id, job) -> None:
             and job["limit_mode"] == "bot_first":
         use_bot = True
 
-    bot = job["fallback_bot"]
-    if use_bot and not bot:
+    bot = None
+    if use_bot:
         bot = await _resolve_bot(pool, job["session_id"])
         if bot:
             await pool.fetch(

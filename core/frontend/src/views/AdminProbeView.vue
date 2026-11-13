@@ -1,5 +1,4 @@
 <script setup>
-import AdminTabs from "../components/AdminTabs.vue";
 import { onMounted, ref } from "vue";
 import { ShieldQuestion, CheckCircle2, XCircle } from "lucide-vue-next";
 import { api } from "../api/client";

@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from app import db
-from app.api import accounts, auth, chat, chat_media, gateway, health, listings, ocr_classifier, ocr_review, probe, review, review_meta, rules, settings, sources, users
+from app.api import accounts, admin_bots, admin_chat, auth, chat, chat_media, gateway, health, listings, ocr_classifier, ocr_review, probe, review, review_meta, rules, settings, sources, users
 from app.config import get_settings
 
 logger = logging.getLogger("nexus-core")
@@ -69,6 +69,8 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="nexus-core", version="0.1.0", lifespan=lifespan)
 app.include_router(health.router)
 app.include_router(auth.router)
+app.include_router(admin_bots.router)
+app.include_router(admin_chat.router)
 app.include_router(listings.router)
 app.include_router(review.router)
 app.include_router(review_meta.router)

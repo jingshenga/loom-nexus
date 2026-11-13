@@ -15,7 +15,7 @@ from runner.duty import (
     profile_usernames,
 )
 from runner.duty_collection import (
-    _find_checkin_matches, _flood_wait_seconds, _is_flood_wait,
+    _collect_checkin_source, _find_checkin_matches, _flood_wait_seconds, _is_flood_wait,
     _profile_links, _profile_media_kind,
 )
 
@@ -52,6 +52,33 @@ class LinkedProfileMessage:
 
 
 class DutyProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_same_nickname_does_not_skip_exact_checkin_lookup(self):
+        from unittest.mock import AsyncMock
+        from runner import duty_collection
+
+        class Pool:
+            def __init__(self):
+                self.sql = []
+
+            async def fetch(self, query, *args):
+                self.sql.append(query)
+                return []
+
+        pool = Pool()
+        job = {
+            "target_msg_id": None, "target_peer_id": None, "source_id": 1,
+            "contact_username": "contact_1", "contact_nickname": "同名老师",
+            "account_id": 2,
+        }
+        with patch.object(duty_collection, "_rate_limited_entity", AsyncMock(return_value=object())), \
+             patch.object(duty_collection, "_find_checkin_matches", AsyncMock(return_value=[])):
+            status, error = await _collect_checkin_source(
+                pool, object(), job, {"source_username": "checkin_source"},
+            )
+        self.assertEqual(status, "not_found")
+        self.assertIn("没有找到", error)
+        self.assertNotIn(duty_collection.SQL_CHECKIN_INDEX_NICKNAME, pool.sql)
+
     async def test_green_only_is_not_enqueued_but_green_blue_is(self):
         message = LinkedProfileMessage([
             ("🟢\u2060团子", "https://t.me/tuanzi?profile"),

@@ -1,12 +1,14 @@
 <script setup>
 import { useRoute } from "vue-router";
-import { ShieldCheck, ImageIcon, Wrench, Activity, ShieldQuestion, Users, UserCog, Database } from "lucide-vue-next";
+import { ShieldCheck, ImageIcon, Wrench, Activity, ShieldQuestion, Users, UserCog, Database, Bot, MessageCircle } from "lucide-vue-next";
 
 const route = useRoute();
 const tabs = [
   { to: "/admin/review", label: "审核", icon: ShieldCheck },
   { to: "/admin/history", label: "资料库", icon: Database },
   { to: "/admin/ocr", label: "OCR核对", icon: ImageIcon },
+  { to: "/admin/bots", label: "Bot质量", icon: Bot },
+  { to: "/admin/chat", label: "聊天诊断", icon: MessageCircle },
   { to: "/admin/ocr-classifier", label: "分类训练", icon: Wrench },
   { to: "/admin/rules", label: "规则", icon: Wrench },
   { to: "/admin/probe", label: "穿透", icon: ShieldQuestion },

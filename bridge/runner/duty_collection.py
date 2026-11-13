@@ -518,13 +518,8 @@ async def _collect_checkin_source(pool, client, job, cfg):
         )
         if indexed:
             return "skipped", f"资料库已按 TG 号命中卡片 #{indexed[0]['listing_id']}"
-        nickname = str(job["contact_nickname"] or "").strip()
-        if nickname:
-            indexed = await pool.fetch(
-                SQL_CHECKIN_INDEX_NICKNAME, job["source_id"], nickname,
-            )
-            if len(indexed) == 1:
-                return "skipped", f"资料库已按唯一昵称命中卡片 #{indexed[0]['listing_id']}"
+        # A matching nickname is only a similarity hint. It is not a
+        # stable identity and must not suppress an exact Telegram lookup.
     entity = await _rate_limited_entity(
         pool, client, job["account_id"], source_username,
     )
@@ -627,36 +622,12 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
             "bot_url=EXCLUDED.bot_url, collected_at=NOW()",
             job["job_id"], job["contact_username"], profile_url, bot_url or "",
         )
-        if bot_url:
-            await pool.execute(
-                "UPDATE listings l SET bot_url=CASE WHEN l.manual_fields ? 'bot_url' "
-                "THEN l.bot_url ELSE $2 END, updated_at=NOW(), "
-                "status=CASE WHEN l.status IN ('pending','published') AND "
-                "listing_meets_publish_requirements(l.nickname,l.price_amount,l.description, "
-                "l.contact_username,CASE WHEN l.manual_fields ? 'bot_url' THEN l.bot_url ELSE $2 END, "
-                "l.media_json,l.custom_fields) "
-                "AND NOT EXISTS (SELECT 1 FROM jsonb_each(COALESCE(l.evidence_json,'{}'::jsonb)) e "
-                "WHERE e.value->>'src'='ocr') THEN 'published' "
-                "WHEN l.status='published' THEN 'pending' ELSE l.status END, "
-                "published_at=CASE WHEN l.status IN ('pending','published') AND "
-                "listing_meets_publish_requirements(l.nickname,l.price_amount,l.description, "
-                "l.contact_username,CASE WHEN l.manual_fields ? 'bot_url' THEN l.bot_url ELSE $2 END, "
-                "l.media_json,l.custom_fields) "
-                "AND NOT EXISTS (SELECT 1 FROM jsonb_each(COALESCE(l.evidence_json,'{}'::jsonb)) e "
-                "WHERE e.value->>'src'='ocr') "
-                "THEN COALESCE(l.published_at,NOW()) "
-                "WHEN l.status='published' THEN NULL ELSE l.published_at END "
-                "WHERE lower(l.contact_username)=lower($1)",
-                job["contact_username"], bot_url,
-            )
-            return "fetched", None
-        await pool.execute(
-            "UPDATE listings SET status='pending', published_at=NULL, updated_at=NOW() "
-            "WHERE lower(contact_username)=lower($1) AND status='published' "
-            "AND NOT (manual_fields ? 'bot_url') AND NULLIF(BTRIM(bot_url),'') IS NULL",
-            job["contact_username"],
+        # This collector records a candidate only. A Bot address alone is
+        # not proof that it belongs to the profile owner, and it must never
+        # publish or unpublish a Listing.
+        return ("fetched", None) if bot_url else (
+            "not_found", "Telegram 个人名片中未找到 Bot 地址"
         )
-        return "not_found", "Telegram 个人名片中未找到 Bot 地址"
     await _profile_progress(
         pool, job, "resolve_channel", 1, 1,
         f"关联频道：{channel_url or '未找到，使用个人公开资料'}",

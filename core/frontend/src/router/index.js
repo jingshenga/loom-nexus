@@ -3,6 +3,7 @@ import { useSession } from "../stores/session";
 
 const routes = [
   { path: "/", redirect: "/explore" },
+  { path: "/admin", redirect: "/admin/review" },
   { path: "/login", component: () => import("../views/LoginView.vue") },
   { path: "/explore", component: () => import("../views/ExploreView.vue") },
   { path: "/explore/:id", component: () => import("../views/DetailView.vue") },
@@ -24,6 +25,16 @@ const routes = [
   {
     path: "/admin/ocr",
     component: () => import("../views/AdminOcrView.vue"),
+    meta: { admin: true },
+  },
+  {
+    path: "/admin/bots",
+    component: () => import("../views/AdminBotView.vue"),
+    meta: { admin: true },
+  },
+  {
+    path: "/admin/chat",
+    component: () => import("../views/AdminChatView.vue"),
     meta: { admin: true },
   },
   {

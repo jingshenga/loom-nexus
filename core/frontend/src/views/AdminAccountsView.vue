@@ -1,5 +1,4 @@
 <script setup>
-import AdminTabs from "../components/AdminTabs.vue";
 import { onMounted, onUnmounted, ref } from "vue";
 import { LogOut, Power, UserPlus, KeyRound, RefreshCw } from "lucide-vue-next";
 import { api } from "../api/client";
