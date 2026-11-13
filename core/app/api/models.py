@@ -130,7 +130,7 @@ async def _register_configured_baseline(pool) -> None:
     )
     await pool.execute(
         "INSERT INTO vision4_model_versions(version_key,model_path,model_sha256,status,metadata_json,activated_at) "
-        "VALUES($1,$2,$3,$4,$5::jsonb,CASE WHEN $4='active' THEN NOW() ELSE NULL END) "
+        "VALUES($1,$2,$3,$4::varchar,$5::jsonb,CASE WHEN $4::varchar='active' THEN NOW() ELSE NULL END) "
         "ON CONFLICT DO NOTHING",
         version, str(source), model_sha, "rollback" if status else "active",
         json.dumps(manifest, ensure_ascii=False),

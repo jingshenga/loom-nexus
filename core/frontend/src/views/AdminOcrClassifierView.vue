@@ -5,6 +5,9 @@ import { api } from "../api/client";
 
 const categories = ref([]);
 const versions = ref([]);
+const loading = ref(true);
+const categoriesError = ref("");
+const versionsError = ref("");
 const selectedId = ref(null);
 const busy = ref(false);
 const message = ref("");
@@ -40,18 +43,45 @@ function notify(text) {
 }
 
 async function load() {
-  const [categoryData, versionData] = await Promise.all([
+  loading.value = true;
+  categoriesError.value = "";
+  versionsError.value = "";
+  const [categoryResult, versionResult] = await Promise.allSettled([
     api("/api/admin/ocr-classifier/categories"),
     api("/api/admin/ocr-classifier/versions"),
   ]);
-  categories.value = categoryData.items;
-  versions.value = versionData.items;
-  syncReviewClasses();
-  if (!selectedId.value) selectedId.value = versions.value.find((item) => item.status === "active")?.id || versions.value[0]?.id || null;
-  if (versions.value.find((item) => item.id === selectedId.value)?.shadow_count) {
-    shadowSummary.value = await api(`/api/admin/ocr-classifier/versions/${selectedId.value}/shadow`);
+  if (categoryResult.status === "fulfilled" && Array.isArray(categoryResult.value.items)) {
+    categories.value = categoryResult.value.items;
+    syncReviewClasses();
   } else {
+    categories.value = [];
+    categoriesError.value = categoryResult.status === "rejected"
+      ? categoryResult.reason?.message || "类别读取失败"
+      : "类别接口返回格式异常";
+  }
+  if (versionResult.status === "fulfilled" && Array.isArray(versionResult.value.items)) {
+    versions.value = versionResult.value.items;
+    if (!versions.value.some((item) => item.id === selectedId.value)) {
+      selectedId.value = versions.value.find((item) => item.status === "active")?.id || versions.value[0]?.id || null;
+    }
+  } else {
+    versions.value = [];
+    selectedId.value = null;
+    versionsError.value = versionResult.status === "rejected"
+      ? versionResult.reason?.message || "版本状态读取失败"
+      : "版本接口返回格式异常";
+  }
+  try {
+    if (versions.value.find((item) => item.id === selectedId.value)?.shadow_count) {
+      shadowSummary.value = await api(`/api/admin/ocr-classifier/versions/${selectedId.value}/shadow`);
+    } else {
+      shadowSummary.value = null;
+    }
+  } catch (error) {
     shadowSummary.value = null;
+    notify(`影子结果读取失败：${error.message}`);
+  } finally {
+    loading.value = false;
   }
 }
 
@@ -178,7 +208,7 @@ onMounted(load);
     <div class="flex flex-wrap items-center gap-3">
       <h1 class="text-lg font-semibold">图片分类训练与规则</h1>
       <RouterLink to="/admin/ocr" class="text-xs text-sky-300 hover:text-sky-200">返回 OCR 核对 ↗</RouterLink>
-      <span class="ml-auto text-xs text-slate-400">当前线上：{{ active ? `V${active.id}` : "尚未发布训练模型，使用旧规则" }}</span>
+      <span class="ml-auto text-xs text-slate-400">当前线上：{{ loading ? "正在读取…" : versionsError ? "状态未知" : active ? `V${active.id}` : "尚未发布训练模型，使用旧规则" }}</span>
     </div>
 
     <div class="grid gap-4 xl:grid-cols-2">
@@ -187,6 +217,7 @@ onMounted(load);
           <h2 class="font-medium">类别</h2>
       <p class="mt-1 text-xs text-slate-500">二分类时，资料卡以外的人工类别合并为“非资料卡”，原标签不会修改。多类别模式会按启用类别分别训练。</p>
         </div>
+        <div v-if="categoriesError" role="alert" class="rounded border border-rose-900/70 bg-rose-950/30 p-2 text-xs text-rose-200">类别配置读取失败：{{ categoriesError }}。训练暂不可用，请刷新或检查 API。</div>
         <div class="max-h-64 space-y-2 overflow-y-auto">
           <div v-for="category in categories" :key="category.code" class="flex flex-wrap items-center gap-2 rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2">
             <span class="min-w-20 text-sm">{{ category.name }}</span>
@@ -231,7 +262,7 @@ onMounted(load);
         </div>
         <p class="text-xs text-slate-400">低于置信度门槛的预测会进入核对。二分类会始终复核“资料卡”，高置信“非资料卡”按非资料卡处理；多类别的复核项由左侧勾选决定。</p>
         <div class="flex flex-wrap gap-2 border-t border-slate-800 pt-3">
-          <button :disabled="busy" @click="train" class="rounded-lg bg-sky-700 px-3 py-2 text-xs font-medium text-white disabled:opacity-40">{{ busy ? "处理中…" : "开始训练并验证" }}</button>
+          <button :disabled="busy || loading || Boolean(categoriesError) || Boolean(versionsError)" @click="train" class="rounded-lg bg-sky-700 px-3 py-2 text-xs font-medium text-white disabled:opacity-40">{{ busy ? "处理中…" : "开始训练并验证" }}</button>
           <button :disabled="busy || !selected || !['tested','ready'].includes(selected.status)" @click="runShadow" class="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-200 disabled:opacity-40">影子测试 100 张</button>
           <button :disabled="busy || !canPrepare" @click="prepare" class="rounded-lg border border-amber-700 px-3 py-2 text-xs text-amber-200 disabled:opacity-40">准备上线</button>
           <button :disabled="busy || selected?.status !== 'ready'" @click="publish" class="rounded-lg bg-emerald-700 px-3 py-2 text-xs font-medium text-white disabled:opacity-40">发布到线上</button>
@@ -249,7 +280,9 @@ onMounted(load);
         <button v-if="active" @click="rollbackToLegacy" :disabled="busy" class="rounded border border-slate-700 px-2.5 py-1.5 text-xs text-amber-300 disabled:opacity-40">切回旧规则</button>
         <button v-if="selected && ['ready','retired'].includes(selected.status)" @click="rollback(selected)" :disabled="busy" class="rounded border border-slate-700 px-2.5 py-1.5 text-xs text-amber-300 disabled:opacity-40">切回此版本</button>
       </div>
-      <div v-if="selected" class="grid gap-4 lg:grid-cols-3">
+      <div v-if="loading" class="py-6 text-center text-sm text-slate-500">正在读取分类器版本状态…</div>
+      <div v-else-if="versionsError" role="alert" class="rounded border border-rose-900/70 bg-rose-950/30 p-3 text-sm text-rose-200">版本状态读取失败：{{ versionsError }}。当前线上版本暂时无法确认，请刷新重试。</div>
+      <div v-else-if="selected" class="grid gap-4 lg:grid-cols-3">
         <div class="rounded-lg bg-slate-950/70 p-3">
           <div class="text-xs text-slate-400">验证集概况</div>
           <div class="mt-2 grid grid-cols-2 gap-2 text-sm">
