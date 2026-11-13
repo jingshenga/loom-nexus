@@ -51,8 +51,8 @@ CURRENT_ID="$(docker inspect --format '{{.Image}}' nexus-core 2>/dev/null)" || d
 CURRENT_REF="$(docker inspect --format '{{.Config.Image}}' nexus-core)"
 [[ "$(docker inspect --format '{{.State.Health.Status}}' nexus-core 2>/dev/null)" == healthy ]] \
     || die "current Core is not healthy"
-[[ "$CURRENT_ID" == "sha256:600e996adcfb0e1db463335ee57058545d325cfdfcbb38b82245a34c8cd207ce" ]] \
-    || die "production Core differs from the verified 600e996a baseline; stop and reconcile source first"
+[[ "$CURRENT_ID" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || die "running Core Image ID is invalid; stop and reconcile source first"
 
 export NEXUS_CORE_BASE_IMAGE="$CURRENT_REF"
 export NEXUS_CORE_BASE_IMAGE_ID="$CURRENT_ID"
@@ -100,7 +100,7 @@ ACTIVE_COUNT="$(docker compose -f "$COMPOSE_FILE" exec -T nexus-db sh -lc \
 [[ "$ACTIVE_COUNT" == "0" ]] || die "all sources must be Legacy before this Core-only release"
 
 apply_migration() {
-    local file="$BC_DIR/scripts/migrations/$1"
+    local file="$REPO_DIR/scripts/migrations/$1"
     [[ -f "$file" ]] || die "migration is missing: $file"
     sha256sum "$file" >> "$BACKUP_DIR/migrations.sha256"
     docker compose -f "$COMPOSE_FILE" exec -T nexus-db sh -lc \

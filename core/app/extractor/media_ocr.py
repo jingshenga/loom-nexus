@@ -1,4 +1,5 @@
 """Local OCR triage for image-based listing cards."""
+import asyncio
 import logging
 import json
 import re
@@ -10,6 +11,7 @@ from PIL import Image
 from app import sqlres
 from app.extractor import ast_rules
 from app.extractor.image_classifier import predict
+from app.extractor.vision4_classifier import Vision4Classifier
 
 logger = logging.getLogger("nexus-core.media-ocr")
 
@@ -21,6 +23,18 @@ SQL_RESET = sqlres.load("media_ocr_reset_processing.sql")
 SQL_PROFILE_DISCOVER = sqlres.load("profile_collection_ocr_discover.sql")
 SQL_PROFILE_FLAGS = sqlres.load("profile_collection_ocr_flags.sql")
 SQL_ENQUEUE_RAW = sqlres.load("media_ocr_enqueue_raw.sql")
+SQL_VISION4_INIT = sqlres.load("vision4_predictions_init.sql")
+SQL_VISION4_UPSERT = sqlres.load("vision4_predictions_upsert.sql")
+SQL_VISION4_ASSET_UPSERT = sqlres.load("vision4_asset_predictions_upsert.sql")
+SQL_VISION4_PREDICTION_UPDATE = sqlres.load("vision4_prediction_fields_update.sql")
+SQL_PROFILE_LISTING_SYNC = (
+    "UPDATE listings SET nickname=$2,price_amount=$3,price_currency=$4,description=$5,"
+    "custom_fields=$6::jsonb,evidence_json=$7::jsonb,"
+    "media_json=CASE WHEN manual_fields ? 'media' THEN media_json ELSE $8::jsonb END,"
+    "status=$9::varchar(32),published_at=CASE WHEN $9::varchar(32)='published' "
+    "THEN COALESCE(published_at,NOW()) WHEN status='published' THEN NULL ELSE published_at END,"
+    "updated_at=NOW() WHERE id=$1"
+)
 
 ENGINE_VERSION = "rapidocr-local-v1"
 _DECORATIVE = re.compile(
@@ -261,10 +275,27 @@ def extract_card_fields(lines: list) -> tuple[dict, dict]:
 
 
 class MediaOcrProcessor:
-    def __init__(self, pool, media_dir: str, ocr_worker):
+    def __init__(
+        self, pool, media_dir: str, ocr_worker,
+        vision4_mode: str = "off",
+        vision4_model_dir: str = "/app/data/models/vision-model-v1",
+    ):
         self._pool = pool
         self._media_dir = Path(media_dir).resolve()
         self._ocr = ocr_worker
+        self._vision4 = Vision4Classifier(vision4_mode, vision4_model_dir)
+        self._vision4_gate = asyncio.Semaphore(1)
+
+    async def initialize_vision4(self) -> None:
+        try:
+            await self._pool.execute(SQL_VISION4_INIT)
+        except Exception:
+            logger.exception("vision4 result storage unavailable; OCR continues without V4 predictions")
+        if self._vision4.enabled:
+            try:
+                await asyncio.to_thread(self._vision4._ensure_loaded)
+            except Exception:
+                logger.exception("vision4 model initialization failed; OCR continues without V4 predictions")
 
     async def read_raw_texts(self, raw_id: int, media_paths: list[str]) -> tuple[list[str], bool]:
         """Reuse the persisted OCR result, or claim and process the same queue row."""
@@ -350,8 +381,11 @@ class MediaOcrProcessor:
         ), {})
         face_score = entry.get("score")
         uniformity, dimensions = image_signals(str(media_path))
-        model_row = await self._load_active_classifier()
         signals = self._signals([], face_score, uniformity, dimensions)
+        if await self._classifier_engine() == "vision4":
+            await self._process_vision4(row, media_path, signals, face_score, uniformity, dimensions)
+            return
+        model_row = await self._load_active_classifier()
         try:
             document = await self._ocr.read_document(str(media_path))
             if not document.get("ok"):
@@ -428,6 +462,98 @@ class MediaOcrProcessor:
                 evidence, confidence, str(exc)[:500], version_id, signals,
             )
 
+    async def _classifier_engine(self) -> str:
+        value = await self._pool.fetchval(
+            "SELECT value FROM app_settings WHERE key='ocr_classifier_engine'"
+        )
+        return value if value in ("vision4", "legacy") else (
+            "vision4" if self._vision4.mode == "active" else "legacy"
+        )
+
+    async def _process_vision4(self, row, media_path: Path, signals, face_score, uniformity, dimensions) -> None:
+        try:
+            async with self._vision4_gate:
+                result = await asyncio.to_thread(self._vision4.predict, str(media_path))
+        except Exception:
+            logger.exception("vision4 inference task failed (ocr_id=%s)", row["id"])
+            result = {"status": "error", "error_code": "inference_error", "scores": {}}
+        classification = result.get("mapped_classification") if result.get("status") == "classified" else None
+        classification = classification or "uncertain"
+        scores = result.get("scores") or {}
+        confidence = max(scores.values()) if scores else 0.0
+        try:
+            document = await self._ocr.read_document(str(media_path))
+            if not document.get("ok"):
+                raise RuntimeError(document.get("error") or "OCR worker failed")
+            lines = document.get("lines", [])
+            signals = self._signals(lines, face_score, uniformity, dimensions)
+            raw = "\n".join(str(item.get("text") or "").strip() for item in lines if item.get("text"))
+            if row["profile_result_id"] is not None:
+                raw = " ".join(str(item.get("text") or "").strip() for item in lines if item.get("text"))
+            fields, evidence = extract_card_fields(lines)
+            evidence["classifier"] = {"engine": "vision4", "scores": scores}
+            await self._finish(row, "done", classification, "pending", "admin", raw,
+                               normalize_ocr_text(raw), fields, evidence, confidence, None,
+                               signals=signals)
+        except Exception as exc:
+            logger.warning("OCR image %s failed: %s", row["id"], exc)
+            await self._finish(row, "failed", classification, "pending", "admin", "", "", {},
+                               {"classifier": {"engine": "vision4", "scores": scores}},
+                               confidence, str(exc)[:500], signals=signals)
+        await self._run_vision4(row, media_path, result)
+
+    async def _run_vision4(self, row, media_path: Path, result=None) -> bool:
+        if not self._vision4.enabled:
+            return False
+        if result is None:
+            try:
+                async with self._vision4_gate:
+                    result = await asyncio.to_thread(self._vision4.predict, str(media_path))
+            except Exception:
+                logger.warning("vision4 inference task failed (ocr_id=%s); continuing OCR", row["id"], exc_info=True)
+                return False
+        version = result.get("model_version") or self._vision4.model_dir.name
+        model_sha = result.get("model_sha")
+        model_key = f"{version}:{model_sha or result.get('error_code', 'unavailable')}"
+        status = result.get("status", "unavailable")
+        category = result.get("category")
+        mapped = result.get("mapped_classification")
+        category_zh = result.get("category_zh")
+        scores = result.get("scores") or {}
+        score = max(scores.values()) if scores else None
+        try:
+            await self._pool.execute(
+                SQL_VISION4_UPSERT,
+                row["id"], model_key, version, model_sha, self._vision4.mode,
+                status, category, mapped, category_zh, json.dumps(scores),
+                result.get("score_semantics"), result.get("model_load_ms"),
+                result.get("inference_ms"), result.get("error_code"),
+            )
+        except Exception:
+            logger.warning("vision4 result persistence failed (ocr_id=%s)", row["id"], exc_info=True)
+        try:
+            await self._pool.execute(
+                SQL_VISION4_ASSET_UPSERT,
+                row["media_path"], model_key, row["id"], version, model_sha,
+                self._vision4.mode, status, category, mapped, category_zh,
+                json.dumps(scores), result.get("score_semantics"),
+                result.get("model_load_ms"), result.get("inference_ms"),
+                result.get("error_code"),
+            )
+        except Exception:
+            logger.warning("vision4 asset persistence failed (ocr_id=%s)", row["id"], exc_info=True)
+        if self._vision4.mode == "active" and status == "classified" and mapped:
+            try:
+                await self._pool.execute(
+                    SQL_VISION4_PREDICTION_UPDATE,
+                    row["media_path"], mapped, score, version, model_sha,
+                    result.get("score_semantics"),
+                )
+                return True
+            except Exception:
+                logger.warning("vision4 prediction-field update failed (ocr_id=%s)", row["id"], exc_info=True)
+        return False
+
     async def _load_media(self, row):
         if row["profile_result_id"] is not None:
             return await self._pool.fetchrow(
@@ -482,17 +608,25 @@ class MediaOcrProcessor:
     ):
         import json
 
-        await self._pool.fetch(
+        finished = await self._pool.fetchrow(
             SQL_FINISH, row["id"], status, classification, review_status,
             raw_text, normalized, json.dumps(fields, ensure_ascii=False),
             json.dumps(evidence, ensure_ascii=False), confidence, ENGINE_VERSION, error,
             classification, confidence, version_id,
             json.dumps(signals or {}, ensure_ascii=False),
         )
+        if finished is None:
+            return
+        classification = finished["classification"]
+        review_status = finished["review_status"]
+        if review_status == "confirmed":
+            visibility = "admin"
+        elif review_status == "not_card":
+            visibility = "public"
         if row["profile_result_id"] is not None:
             await self._pool.fetch(
                 SQL_PROFILE_FLAGS, row["profile_result_id"], row["media_path"],
-                status, classification, review_status, raw_text, confidence,
+                status, classification, review_status, raw_text, confidence, visibility,
             )
             await self._sync_profile_listing(row["profile_result_id"])
         else:
@@ -615,11 +749,7 @@ class MediaOcrProcessor:
             elif result["status"] == "published":
                 next_status = "pending"
         await self._pool.execute(
-            "UPDATE listings SET nickname=$2,price_amount=$3,price_currency=$4,description=$5,"
-            "custom_fields=$6::jsonb,evidence_json=$7::jsonb,"
-            "media_json=CASE WHEN manual_fields ? 'media' THEN media_json ELSE $8::jsonb END,"
-            "status=$9,published_at=CASE WHEN $9='published' THEN COALESCE(published_at,NOW()) "
-            "WHEN status='published' THEN NULL ELSE published_at END,updated_at=NOW() WHERE id=$1",
+            SQL_PROFILE_LISTING_SYNC,
             result["listing_id"], nickname, price_amount, price_currency, description,
             json.dumps(custom_fields, ensure_ascii=False),
             json.dumps(listing_evidence, ensure_ascii=False), result["media_json"], next_status,

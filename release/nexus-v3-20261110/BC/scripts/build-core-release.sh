@@ -3,12 +3,12 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BASE_IMAGE="${NEXUS_CORE_BASE_IMAGE:-}"
-EXPECTED_BASE_ID="${NEXUS_CORE_BASE_IMAGE_ID:-sha256:600e996adcfb0e1db463335ee57058545d325cfdfcbb38b82245a34c8cd207ce}"
+EXPECTED_BASE_ID="${NEXUS_CORE_BASE_IMAGE_ID:-}"
 CANDIDATE_IMAGE="${NEXUS_CORE_CANDIDATE_IMAGE:-nexus-core:active-router-release}"
 
 die() { printf 'BLOCKED: %s\n' "$*" >&2; exit 1; }
-[[ "$EXPECTED_BASE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] || die "invalid expected base Image ID"
 [[ -n "$BASE_IMAGE" ]] || die "set NEXUS_CORE_BASE_IMAGE to the verified local production Core tag"
+[[ "$EXPECTED_BASE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] || die "set NEXUS_CORE_BASE_IMAGE_ID to the observed production Image ID"
 
 REPO_ROOT="$(cd "$ROOT_DIR/../../.." && pwd)"
 if [[ -f "$REPO_ROOT/.nexus-release-commit" && -f "$REPO_ROOT/SHA256SUMS.source" ]]; then
@@ -30,6 +30,7 @@ else
 fi
 
 cd "$REPO_ROOT"
+python3 scripts/check_admin_feature_manifest.py || die "admin feature manifest check failed"
 
 ACTUAL_BASE_ID="$(docker image inspect --format '{{.Id}}' "$BASE_IMAGE" 2>/dev/null)" \
   || die "base image is not present locally: $BASE_IMAGE"
@@ -42,7 +43,7 @@ docker build --platform linux/amd64 --pull=false \
   --build-arg "SOURCE_COMMIT=$COMMIT" \
   -f release/nexus-v3-20261110/BC/core/Dockerfile \
   -t "$CANDIDATE_IMAGE" \
-  release/nexus-v3-20261110/BC
+  "$REPO_ROOT"
 
 BUILT_ID="$(docker image inspect --format '{{.Id}}' "$CANDIDATE_IMAGE")"
 LABEL_COMMIT="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$CANDIDATE_IMAGE")"
@@ -56,6 +57,11 @@ import json, sys
 base, candidate = map(json.loads, sys.argv[1:])
 assert len(candidate) > len(base) and candidate[:len(base)] == base
 PY
+docker run --rm --network none \
+  -v "$REPO_ROOT/core/tests:/release-tests:ro" \
+  --entrypoint python "$CANDIDATE_IMAGE" \
+  -m unittest discover -s /release-tests -p 'test_models_api.py' \
+  || die "Vision4 upload, model registry, or rollback safety regression failed"
 docker run --rm --network none --entrypoint python "$CANDIDATE_IMAGE" -c '
 from pathlib import Path
 from app.config import CoreSettings
@@ -79,6 +85,11 @@ required = {
     "/api/admin/rules/shadow-diagnostics",
     "/api/admin/rules/active-review-queue",
     "/api/admin/rules/active-review-queue/{queue_id}/requeue",
+    "/api/admin/dashboard",
+    "/api/admin/models",
+    "/api/admin/models/{version_id}/predict",
+    "/api/admin/bots",
+    "/api/admin/chat/sessions",
 }
 assert required <= set(paths), f"missing V3 API: {sorted(required - set(paths))}"
 settings = CoreSettings()

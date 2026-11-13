@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from app import db
-from app.api import accounts, admin_bots, admin_chat, auth, chat, chat_media, gateway, health, listings, ocr_classifier, ocr_review, probe, review, review_meta, rules, settings, sources, users
+from app.api import admin_bots, admin_chat, admin_dashboard, accounts, auth, chat, chat_media, gateway, health, listings, models, ocr_classifier, ocr_review, probe, review, review_meta, rules, settings, sources, users
 from app.config import get_settings
 
 logger = logging.getLogger("nexus-core")
@@ -23,7 +23,7 @@ logging.basicConfig(
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(app: FastAPI):
     settings = get_settings()
     background_tasks = []
     ocr_worker = None
@@ -38,11 +38,30 @@ async def lifespan(_: FastAPI):
         from app.extractor.ocr_worker import OcrWorker
         from app.extractor.pipeline import Extractor
 
+        vision4_model_dir = settings.vision4_model_dir
+        try:
+            selected_model = await db.get_pool().fetchval(
+                "SELECT model_path FROM vision4_model_versions WHERE status='active' "
+                "ORDER BY activated_at DESC,id DESC LIMIT 1"
+            )
+            if selected_model and Path(selected_model).is_dir():
+                vision4_model_dir = selected_model
+        except Exception:
+            logger.info("Vision4 model registry unavailable; using configured model directory")
+
         ocr_worker = OcrWorker()
-        media_ocr_processor = MediaOcrProcessor(db.get_pool(), settings.media_dir, ocr_worker)
+        media_ocr_processor = MediaOcrProcessor(
+            db.get_pool(), settings.media_dir, ocr_worker,
+            settings.vision4_mode, vision4_model_dir,
+        )
+        app.state.media_ocr_processor = media_ocr_processor
+        await media_ocr_processor.initialize_vision4()
         extractor = Extractor(
             db.get_pool(), settings.media_dir, settings.extract_ocr_enabled,
             ocr_worker, media_ocr_processor,
+            shadow_sample_rate=settings.shadow_sample_rate,
+            shadow_trace_max_bytes=settings.shadow_trace_max_bytes,
+            shadow_error_log_interval_s=settings.shadow_error_log_interval_s,
         )
         background_tasks.append(asyncio.create_task(
             extractor.run(stop, settings.extract_batch, settings.extract_interval_s),
@@ -68,10 +87,12 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="nexus-core", version="0.1.0", lifespan=lifespan)
 app.include_router(health.router)
+app.include_router(admin_dashboard.router)
 app.include_router(auth.router)
 app.include_router(admin_bots.router)
 app.include_router(admin_chat.router)
 app.include_router(listings.router)
+app.include_router(models.router)
 app.include_router(review.router)
 app.include_router(review_meta.router)
 app.include_router(ocr_review.router)

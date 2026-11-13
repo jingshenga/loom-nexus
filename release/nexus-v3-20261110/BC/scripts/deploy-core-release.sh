@@ -65,7 +65,10 @@ required = {
     ("/api/admin/rules/active-review-queue/{queue_id}/requeue", "POST"),
     ("/api/admin/models", "GET"),
     ("/api/admin/models/vision4/upload", "POST"),
+    ("/api/admin/models/{version_id}/predict", "POST"),
     ("/api/admin/dashboard", "GET"),
+    ("/api/admin/bots", "GET"),
+    ("/api/admin/chat/sessions", "GET"),
 }
 assert not required - routes, f"missing API routes: {sorted(required - routes)}"
 assert {"vision4_mode", "vision4_model_dir", "vision4_model_store_dir", "active_router_enabled", "active_router_source_ids", "active_router_kill_switch", "ocr_review_assist_enabled"} <= set(CoreSettings.model_fields), "Vision4, Active Router, or OCR review config missing"

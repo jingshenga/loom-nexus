@@ -6,24 +6,28 @@ config, validated endpoints).
 """
 import json
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from app import db, llm, sqlres
-from app.api.auth import require_admin
+from app.api.auth import current_user_id, require_admin
+from app.config import get_settings
 from app.extractor import ast_rules
+from app.extractor.rule_config import PARSER_BY_TYPE, validate_rule_config, validate_match_mode
+from app.extractor.rule_router import business_candidate_key, config_hash, shadow_compare
+from app.extractor.rule_router import active_source_allowed
 
 router = APIRouter(
     prefix="/api/admin/rules", tags=["admin-rules"],
     dependencies=[Depends(require_admin)],
 )
 
-SQL_UPSERT = sqlres.load("rule_upsert.sql")
+SQL_UPSERT_VERSIONED = sqlres.load("rule_upsert_versioned.sql")
 SQL_DELETE = sqlres.load("rule_delete.sql")
 SQL_LIST = sqlres.load("rule_list.sql")
-SQL_BIND = sqlres.load("rule_bind.sql")
 SQL_UNBIND = sqlres.load("rule_unbind.sql")
 SQL_SAMPLES = sqlres.load("dryrun_samples.sql")
 SQL_REQUEUE = sqlres.load("requeue_source.sql")
@@ -37,6 +41,35 @@ SQL_PROFILE_COLLECTION_ENQUEUE = sqlres.load("profile_collection_enqueue_manual.
 SQL_PROFILE_COLLECTION_REQUEUE = sqlres.load("profile_collection_requeue_ineffective.sql")
 SQL_BOT_COLLECTION_RESULTS = sqlres.load("bot_collection_results.sql")
 SQL_CHECKIN_HISTORY_STATUS = sqlres.load("checkin_history_status.sql")
+SQL_BIND_VERSIONED = sqlres.load("rule_bind_versioned.sql")
+SQL_SHADOW_BINDINGS = sqlres.load("rule_shadow_bindings.sql")
+SQL_ACTIVE_REVIEW_CLASSIFIED_CTE = (
+    "WITH classified AS ("
+    " SELECT q.id,q.source_id,s.title AS source_title,q.raw_id,r.platform_msg_id,"
+    " r.posted_at,LEFT(COALESCE(r.raw_text,''),1000) AS message_preview,"
+    " COALESCE(r.media_json,'[]'::jsonb) AS media,q.reason,q.candidate_rule_ids,"
+    " q.diagnostics_json,q.candidate_json,q.status,q.listing_id,q.created_at,q.reviewed_at,q.last_action,"
+    " CASE WHEN q.reason <> 'no_rule_match' "
+    "   OR COALESCE(q.candidate_json->'fields','{}'::jsonb) <> '{}'::jsonb "
+    "   OR COALESCE(q.candidate_json->>'identity','') <> '' "
+    "   OR COALESCE(ocr.structured,false) "
+    "   OR COALESCE(r.raw_text,'') ~* '(@[a-z][a-z0-9_]{4,31}|t\\.me/[a-z][a-z0-9_]{4,31}|telegram\\.me/[a-z][a-z0-9_]{4,31})' "
+    "   OR (COALESCE(r.raw_text,'') ~* '(价格|售价|月租|日租|租金|[￥¥][[:space:]]*[0-9]|[0-9]{3,}[[:space:]]*(元|块))' "
+    "       AND COALESCE(r.raw_text,'') ~* '(昵称|区域|地址|位置|房型|面积|介绍)') "
+    "   OR COALESCE(ocr.identity_evidence,false) "
+    "   OR EXISTS(SELECT 1 FROM listings l WHERE l.source_msg_id=r.id) "
+    " THEN 'review' ELSE 'unmatched' END AS category "
+    " FROM rule_active_review_queue q JOIN ingest_sources s ON s.id=q.source_id "
+    " JOIN raw_messages r ON r.id=q.raw_id "
+    " LEFT JOIN LATERAL (SELECT "
+    "   bool_or(COALESCE(fields_json->>'username','') <> '' OR COALESCE(fields_json->>'nickname','') <> '' "
+    "     OR COALESCE(fields_json->>'price_amount','') <> '' OR COALESCE(fields_json->>'district','') <> '' "
+    "     OR COALESCE(raw_text,'') ~* '(价格|售价|月租|日租|[￥¥][[:space:]]*[0-9]|[0-9]{3,}[[:space:]]*(元|块))') AS structured,"
+    "   bool_or(COALESCE(fields_json->>'username','') <> '' "
+    "     OR COALESCE(raw_text,'') ~* '(t\\.me/[a-z][a-z0-9_]{4,31}|telegram\\.me/[a-z][a-z0-9_]{4,31}|@[a-z][a-z0-9_]{4,31})') AS identity_evidence "
+    "   FROM listing_media_ocr WHERE raw_id=r.id AND status='done') ocr ON TRUE"
+    ") "
+)
 
 LLM_SYSTEM_PROMPT = (
     "你是消息抽取规则生成器。根据用户给出的样本消息，产出一个 JSON 规则对象，"
@@ -55,11 +88,20 @@ class RuleBody(BaseModel):
     rule_type: Literal["listing", "on_duty", "profile_collection", "bot_collection", "checkin_reverse"] = "listing"
     config: dict
     is_active: bool = True
+    expected_version: int | None = None
+    template_version_id: int | None = None
+    parser_key: str | None = None
+    change_summary: str = ""
 
 
 class BindBody(BaseModel):
     source_id: int
-    priority: int = 10
+    priority: int = Field(default=10, ge=-100000, le=100000)
+    purpose: str = Field(default="", max_length=64)
+    match_group: str = Field(default="default", min_length=1, max_length=64)
+    match_mode: str = "legacy_single_selected"
+    fallback_order: int = Field(default=0, ge=0, le=100000)
+    rule_version_id: int | None = None
 
 
 class ReextractBody(BaseModel):
@@ -77,6 +119,62 @@ class GenerateBody(BaseModel):
 
 class CopyBody(BaseModel):
     rule_name: str
+
+
+class TemplateBody(BaseModel):
+    template_name: str
+    rule_type: Literal["listing", "on_duty", "profile_collection", "bot_collection", "checkin_reverse"]
+    config: dict
+    description: str = ""
+    parser_key: str | None = None
+    change_summary: str = ""
+
+
+class TemplateVersionBody(BaseModel):
+    config: dict
+    parser_key: str | None = None
+    change_summary: str = ""
+
+
+class TemplateInstanceBody(BaseModel):
+    template_version_id: int
+    rule_name: str
+    change_summary: str = ""
+
+
+class RollbackBody(BaseModel):
+    target_version: int
+    change_summary: str = ""
+
+
+class RouterModeBody(BaseModel):
+    mode: Literal["legacy", "shadow", "active"]
+
+
+class RouterDryRunBody(BaseModel):
+    source_id: int
+    purpose: str = "listing"
+    raw_message_ids: list[int] = Field(default_factory=list)
+    sample_limit: int = 50
+    rule_version_id: int | None = None
+
+
+class ActiveReviewResolutionBody(BaseModel):
+    action: Literal["dismiss", "no_action", "create_pending_listing"]
+    reason: str = Field(default="", max_length=500)
+    confirmed_fields: dict | None = None
+
+
+class LifecycleResolutionBody(BaseModel):
+    action: Literal["approve", "reject"]
+    listing_id: int | None = None
+    reason: str = Field(default="", max_length=500)
+
+
+class ShadowPruneBody(BaseModel):
+    older_than_days: int = Field(default=30, ge=7, le=365)
+    batch_size: int = Field(default=250, ge=1, le=1000)
+    max_batches: int = Field(default=4, ge=1, le=8)
 
 
 class ProfileCollectionEnqueueBody(BaseModel):
@@ -147,10 +245,12 @@ async def list_rules() -> dict:
 
 
 @router.put("")
-async def upsert_rule(body: RuleBody) -> dict:
+async def upsert_rule(body: RuleBody, authorization: str = Header(default="")) -> dict:
     pool = _pool()
     if body.rule_type == "bot_collection":
         body.config = {}
+    parser_key = body.parser_key or body.config.get("parser_key") or PARSER_BY_TYPE[body.rule_type]
+    body.config["parser_key"] = parser_key
     if body.rule_type == "profile_collection":
         body.config.pop("stale_channel_days", None)
         body.config.setdefault("pinned_followup_messages", 5)
@@ -199,25 +299,713 @@ async def upsert_rule(body: RuleBody) -> dict:
                 raise HTTPException(status_code=422, detail="请选择自动补采的名片来源")
             if not await pool.fetch(SQL_DUTY_COLLECTION_SOURCE_VALIDATE, collection_source_id):
                 raise HTTPException(status_code=422, detail="自动补采来源需启用且绑定名片抓取规则")
-    rows = await pool.fetch(
-        SQL_UPSERT, body.rule_name, body.rule_type,
-        json.dumps(body.config, ensure_ascii=False), body.is_active,
+    errors = validate_rule_config(body.rule_type, body.config, strict=True)
+    if errors:
+        raise HTTPException(status_code=422, detail=errors)
+    try:
+        rows = await pool.fetch(
+            SQL_UPSERT_VERSIONED,
+            body.rule_name.strip(), body.rule_type,
+            json.dumps(body.config, ensure_ascii=False), body.is_active,
+            config_hash(body.config), parser_key, body.template_version_id,
+            body.expected_version, str(current_user_id(authorization)), body.change_summary,
+        )
+    except Exception as exc:
+        message = str(exc).lower()
+        if "unique" in message:
+            raise HTTPException(status_code=409, detail="规则名已存在") from exc
+        if "stale rule version" in message:
+            raise HTTPException(status_code=409, detail="规则已被其他操作更新，请刷新后再保存") from exc
+        if "template version" in message:
+            raise HTTPException(status_code=422, detail="模板版本不存在或类型不匹配") from exc
+        raise
+    return {
+        "rule_id": rows[0]["rule_id"], "version": rows[0]["version"],
+        "rule_version_id": rows[0]["rule_version_id"],
+        "config_hash": config_hash(body.config),
+    }
+
+
+@router.get("/templates")
+async def list_rule_templates() -> dict:
+    rows = await _pool().fetch(
+        "SELECT t.id,t.template_name,t.rule_type,t.description,t.created_at, "
+        "COALESCE(jsonb_agg(jsonb_build_object('version',v.version,'id',v.id,"
+        "'config_hash',v.config_hash,'parser_key',v.parser_key,'created_at',v.created_at) "
+        "ORDER BY v.version) FILTER (WHERE v.id IS NOT NULL),'[]'::jsonb) AS versions "
+        "FROM rule_templates t LEFT JOIN rule_template_versions v ON v.template_id=t.id "
+        "GROUP BY t.id ORDER BY t.id"
     )
-    return {"rule_id": rows[0]["rule_id"], "version": rows[0]["version"]}
+    return {"items": [{**dict(row), "versions": _decode_jsonb(row["versions"], [])} for row in rows]}
+
+
+@router.post("/templates")
+async def create_rule_template(body: TemplateBody, authorization: str = Header(default="")) -> dict:
+    config = dict(body.config)
+    parser_key = body.parser_key or config.get("parser_key") or PARSER_BY_TYPE[body.rule_type]
+    config["parser_key"] = parser_key
+    errors = validate_rule_config(body.rule_type, config, strict=True)
+    if errors:
+        raise HTTPException(status_code=422, detail=errors)
+    try:
+        rows = await _pool().fetch(
+            "SELECT * FROM rule_template_create($1,$2,$3,$4::jsonb,$5,$6,$7,$8)",
+            body.template_name.strip(), body.rule_type, body.description,
+            json.dumps(config, ensure_ascii=False), config_hash(config), parser_key,
+            str(current_user_id(authorization)), body.change_summary,
+        )
+    except Exception as exc:
+        if "unique" in str(exc).lower():
+            raise HTTPException(status_code=409, detail="模板名已存在") from exc
+        raise
+    return {"template_id": rows[0]["template_id"], "version": rows[0]["version"],
+            "template_version_id": rows[0]["template_version_id"]}
+
+
+@router.post("/templates/{template_id}/versions")
+async def create_rule_template_version(
+    template_id: int, body: TemplateVersionBody, authorization: str = Header(default=""),
+) -> dict:
+    row = await _pool().fetchrow("SELECT rule_type FROM rule_templates WHERE id=$1", template_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="template not found")
+    config = dict(body.config)
+    parser_key = body.parser_key or config.get("parser_key") or PARSER_BY_TYPE[row["rule_type"]]
+    config["parser_key"] = parser_key
+    errors = validate_rule_config(row["rule_type"], config, strict=True)
+    if errors:
+        raise HTTPException(status_code=422, detail=errors)
+    rows = await _pool().fetch(
+        "SELECT * FROM rule_template_version_create($1,$2::jsonb,$3,$4,$5,$6)",
+        template_id, json.dumps(config, ensure_ascii=False), config_hash(config), parser_key,
+        str(current_user_id(authorization)), body.change_summary,
+    )
+    return {"template_id": rows[0]["template_id"], "version": rows[0]["version"],
+            "template_version_id": rows[0]["template_version_id"]}
+
+
+@router.post("/templates/instances")
+async def instantiate_rule_template(
+    body: TemplateInstanceBody, authorization: str = Header(default=""),
+) -> dict:
+    try:
+        rows = await _pool().fetch(
+            "SELECT * FROM rule_instance_from_template($1,$2,$3,$4)",
+            body.template_version_id, body.rule_name.strip(),
+            str(current_user_id(authorization)), body.change_summary,
+        )
+    except Exception as exc:
+        message = str(exc).lower()
+        if "unique" in message:
+            raise HTTPException(status_code=409, detail="规则名已存在") from exc
+        if "template version not found" in message:
+            raise HTTPException(status_code=404, detail="template version not found") from exc
+        raise
+    return {"rule_id": rows[0]["rule_id"], "version": rows[0]["version"],
+            "rule_version_id": rows[0]["rule_version_id"]}
+
+
+@router.get("/{rule_id}/versions")
+async def list_rule_versions(rule_id: int) -> dict:
+    rows = await _pool().fetch(
+        "SELECT id,version,rule_type,config_json,config_hash,hash_algorithm,schema_version,"
+        "parser_key,template_version_id,snapshot_origin,history_complete,created_by,"
+        "change_summary,created_at FROM rule_instance_versions WHERE rule_id=$1 ORDER BY version DESC",
+        rule_id,
+    )
+    return {"items": [{**dict(row), "config_json": _decode_jsonb(row["config_json"], {})}
+                       for row in rows]}
+
+
+@router.post("/{rule_id}/rollback")
+async def rollback_rule(
+    rule_id: int, body: RollbackBody, authorization: str = Header(default=""),
+) -> dict:
+    try:
+        rows = await _pool().fetch(
+            "SELECT * FROM rule_instance_rollback($1,$2,$3,$4)",
+            rule_id, body.target_version, str(current_user_id(authorization)), body.change_summary,
+        )
+    except Exception as exc:
+        if "rule version not found" in str(exc).lower():
+            raise HTTPException(status_code=404, detail="rule version not found") from exc
+        raise
+    return {"rule_id": rows[0]["rule_id"], "version": rows[0]["version"],
+            "rule_version_id": rows[0]["rule_version_id"]}
+
+
+@router.get("/router-management")
+async def router_management() -> dict:
+    rows = await _pool().fetch(
+        "SELECT s.id AS source_id,s.peer_id,s.title,s.username,s.router_mode,"
+        "COALESCE(jsonb_agg(jsonb_build_object('rule_id',r.id,'rule_name',r.rule_name,"
+        "'rule_type',r.rule_type,'priority',b.priority,'rule_version_id',v.id,"
+        "'version',COALESCE(v.version,r.version),'config',COALESCE(v.config_json,r.config_json),"
+        "'template_version_id',tv.id,'template_id',t.id,"
+        "'template_name',t.template_name,'independent_instance',v.template_version_id IS NULL) "
+        "ORDER BY b.priority DESC,r.id) FILTER (WHERE r.id IS NOT NULL),'[]'::jsonb) AS bindings,"
+        "(SELECT jsonb_build_object('observed_at',c.observed_at,'changed',c.changed,'raw_id',c.raw_id) "
+        " FROM rule_shadow_comparisons c WHERE c.source_id=s.id ORDER BY c.observed_at DESC,c.id DESC LIMIT 1) AS last_shadow,"
+        "(SELECT jsonb_build_object('previous_mode',e.previous_mode,'new_mode',e.new_mode,"
+        "'changed_at',e.changed_at,'actor_user_id',e.actor_user_id) "
+        " FROM rule_router_mode_events e WHERE e.source_id=s.id ORDER BY e.changed_at DESC,e.id DESC LIMIT 1) AS last_mode_event "
+        "FROM ingest_sources s LEFT JOIN source_rule_bindings b ON b.source_id=s.id "
+        "LEFT JOIN ingest_rules r ON r.id=b.rule_id "
+        "LEFT JOIN rule_instance_versions v ON v.id=b.rule_version_id "
+        "LEFT JOIN rule_template_versions tv ON tv.id=v.template_version_id "
+        "LEFT JOIN rule_templates t ON t.id=tv.template_id "
+        "GROUP BY s.id ORDER BY s.title,s.id"
+    )
+    error_rows = await _pool().fetch(
+        "SELECT source_id,error_class,occurrences,last_occurred_at,last_raw_id "
+        "FROM rule_shadow_error_counts WHERE last_occurred_at >= NOW()-INTERVAL '24 hours' "
+        "ORDER BY last_occurred_at DESC LIMIT 200"
+    )
+    errors = {}
+    for row in error_rows:
+        errors.setdefault(row["source_id"], []).append(dict(row))
+    settings = get_settings()
+    allowed_ids = sorted({int(value.strip()) for value in settings.active_router_source_ids.split(",")
+                          if value.strip().isdigit()})
+    active_available = (
+        settings.active_router_enabled and not settings.active_router_kill_switch
+        and len(allowed_ids) == 1
+    )
+    return {"items": [{**dict(row),
+                       "bindings": _decode_jsonb(row["bindings"], []),
+                       "last_shadow": _decode_jsonb(row["last_shadow"], None),
+                       "last_mode_event": _decode_jsonb(row["last_mode_event"], None),
+                       "recent_errors": errors.get(row["source_id"], [])}
+                      for row in rows],
+            "active_mode_available": active_available,
+            "active_source_ids": allowed_ids if active_available else []}
+
+
+@router.get("/active-review-queue")
+async def active_review_queue(
+    limit: int = 100, status: Literal["open", "resolved", "dismissed"] = "open",
+    source_id: int | None = None, rule_id: int | None = None,
+    reason: str | None = None, since: datetime | None = None,
+    until: datetime | None = None,
+    category: Literal["review", "unmatched", "all"] = "review",
+) -> dict:
+    if not 1 <= limit <= 500:
+        raise HTTPException(status_code=422, detail="limit must be 1-500")
+    if since and until and since >= until:
+        raise HTTPException(status_code=422, detail="since must be earlier than until")
+    rows = await _pool().fetch(
+        SQL_ACTIVE_REVIEW_CLASSIFIED_CTE +
+        "SELECT *,count(*) OVER() AS total_count FROM classified WHERE status=$1 "
+        "AND ($2::bigint IS NULL OR source_id=$2) "
+        "AND ($3::bigint IS NULL OR $3=ANY(candidate_rule_ids)) "
+        "AND ($4::text IS NULL OR reason=$4) AND ($5::timestamptz IS NULL OR created_at >= $5) "
+        "AND ($6::timestamptz IS NULL OR created_at < $6) "
+        "AND ($7::text='all' OR category=$7) "
+        "ORDER BY created_at DESC,id DESC LIMIT $8",
+        status, source_id, rule_id, reason, since, until, category, limit,
+    )
+    counts = await _pool().fetchrow(
+        SQL_ACTIVE_REVIEW_CLASSIFIED_CTE +
+        "SELECT count(*) FILTER (WHERE category='review') AS review,"
+        " count(*) FILTER (WHERE category='unmatched') AS unmatched "
+        "FROM classified WHERE status=$1 AND ($2::bigint IS NULL OR source_id=$2) "
+        "AND ($3::bigint IS NULL OR $3=ANY(candidate_rule_ids)) "
+        "AND ($4::text IS NULL OR reason=$4) AND ($5::timestamptz IS NULL OR created_at >= $5) "
+        "AND ($6::timestamptz IS NULL OR created_at < $6)",
+        status, source_id, rule_id, reason, since, until,
+    )
+    return {"items": [{**dict(row), "candidate_rule_ids": list(row["candidate_rule_ids"] or []),
+                        "diagnostics_json": _decode_jsonb(row["diagnostics_json"], {}),
+                        "candidate_json": _decode_jsonb(row["candidate_json"], {}),
+                        "media": _decode_jsonb(row["media"], [])}
+                      for row in rows], "total_count": rows[0]["total_count"] if rows else 0,
+            "counts": {"review": counts["review"], "unmatched": counts["unmatched"]}}
+
+
+@router.get("/active-review-queue/{queue_id}")
+async def active_review_detail(queue_id: int) -> dict:
+    row = await _pool().fetchrow(
+        "SELECT q.*,s.title AS source_title,r.platform_msg_id,r.posted_at,r.raw_text,r.media_json "
+        "FROM rule_active_review_queue q JOIN ingest_sources s ON s.id=q.source_id "
+        "JOIN raw_messages r ON r.id=q.raw_id WHERE q.id=$1", queue_id,
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="review candidate not found")
+    events = await _pool().fetch(
+        "SELECT e.id,e.actor_user_id,e.action,e.listing_id,e.reason,e.created_at "
+        "FROM rule_active_review_events e WHERE e.queue_id=$1 ORDER BY e.created_at,e.id", queue_id,
+    )
+    diagnostics = _decode_jsonb(row["diagnostics_json"], {})
+    trace = diagnostics.get("trace") or []
+    version_ids = sorted({int(item["rule_version_id"]) for item in trace
+                          if str(item.get("rule_version_id", "")).isdigit()})
+    rule_versions = await _pool().fetch(
+        "SELECT v.id AS rule_version_id,v.rule_id,v.version,r.rule_name,v.rule_type "
+        "FROM rule_instance_versions v JOIN ingest_rules r ON r.id=v.rule_id "
+        "WHERE v.id=ANY($1::bigint[]) ORDER BY v.rule_id,v.version", version_ids,
+    ) if version_ids else []
+    ocr_rows = await _pool().fetch(
+        "SELECT o.media_path,o.status,o.classification,o.review_status,o.raw_text,o.normalized_text,"
+        "o.fields_json,o.evidence_json,o.confidence,o.engine_version,o.created_at,"
+        "to_jsonb(o)->>'predicted_classification' AS predicted_classification,"
+        "to_jsonb(o)->>'predicted_confidence' AS predicted_confidence,"
+        "to_jsonb(o)->>'human_classification' AS human_classification,"
+        "to_jsonb(o)->>'classifier_version_id' AS classifier_version_id,"
+        "to_jsonb(o)->'classifier_signals_json' AS classifier_signals_json "
+        "FROM listing_media_ocr o WHERE o.raw_id=$1 ORDER BY o.id", row["raw_id"],
+    )
+    media = _decode_jsonb(row["media_json"], [])
+    ocr_by_path = {}
+    for item in ocr_rows:
+        record = dict(item)
+        record["fields_json"] = _decode_jsonb(record["fields_json"], {})
+        record["evidence_json"] = _decode_jsonb(record["evidence_json"], {})
+        record["classifier_signals_json"] = _decode_jsonb(record["classifier_signals_json"], {})
+        ocr_by_path[item["media_path"]] = record
+    for item in media:
+        if item.get("path") in ocr_by_path:
+            item["ocr_result"] = ocr_by_path[item["path"]]
+    return {**dict(row),
+            "candidate_rule_ids": list(row["candidate_rule_ids"] or []),
+            "diagnostics_json": diagnostics,
+            "candidate_json": _decode_jsonb(row["candidate_json"], {}),
+            "media": media,
+            "rule_versions": [dict(item) for item in rule_versions],
+            "events": [dict(item) for item in events]}
+
+
+@router.post("/active-review-queue/{queue_id}/requeue")
+async def requeue_unmatched_active_review(
+    queue_id: int, authorization: str = Header(default=""),
+) -> dict:
+    actor_id = current_user_id(authorization)
+    pool = _pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT * FROM rule_active_review_queue WHERE id=$1 FOR UPDATE", queue_id,
+            )
+            if row is None:
+                raise HTTPException(status_code=404, detail="review candidate not found")
+            if row["status"] != "open" or row["reason"] != "no_rule_match":
+                raise HTTPException(status_code=409, detail="only an open no-match record can be sent to review")
+            await conn.execute(
+                "UPDATE rule_active_review_queue SET reason='manual_review_requested',"
+                "diagnostics_json=diagnostics_json || jsonb_build_object('manual_review_requested',true),"
+                "updated_at=NOW() WHERE id=$1", queue_id,
+            )
+            await conn.execute(
+                "INSERT INTO rule_active_review_events(queue_id,actor_user_id,action,reason,decision_json) "
+                "VALUES($1,$2,'manual_requeue','管理员从未命中视图送入人工审核',"
+                "jsonb_build_object('original_reason','no_rule_match'))", queue_id, actor_id,
+            )
+    return {"queue_id": queue_id, "status": "open", "reason": "manual_review_requested",
+            "actor_user_id": actor_id}
+
+
+@router.post("/active-review-queue/{queue_id}/resolve")
+async def resolve_active_review(
+    queue_id: int, body: ActiveReviewResolutionBody,
+    authorization: str = Header(default=""),
+) -> dict:
+    pool = _pool()
+    actor_id = current_user_id(authorization)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT q.*,r.media_json,r.posted_at FROM rule_active_review_queue q "
+                "JOIN raw_messages r ON r.id=q.raw_id WHERE q.id=$1 FOR UPDATE OF q", queue_id,
+            )
+            if row is None:
+                raise HTTPException(status_code=404, detail="review candidate not found")
+            if row["status"] != "open":
+                raise HTTPException(status_code=409, detail="review candidate was already handled")
+
+            listing_id = None
+            if body.action == "create_pending_listing":
+                candidate = _decode_jsonb(row["candidate_json"], {})
+                fields = body.confirmed_fields or candidate.get("fields") or {}
+                username_value = fields.get("username")
+                if username_value is None and body.confirmed_fields is None:
+                    username_value = candidate.get("identity")
+                username = str(username_value or "").strip().lstrip("@")
+                if not username:
+                    raise HTTPException(status_code=409, detail="candidate has no confirmed Telegram identity")
+                existing = await conn.fetchval(
+                    "SELECT id FROM listings WHERE source_msg_id=$1 LIMIT 1", row["raw_id"],
+                )
+                if existing is not None:
+                    raise HTTPException(status_code=409, detail="this source message already has a Listing")
+                duplicate = await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM listings WHERE lower(contact_username)=lower($1) "
+                    "AND status IN ('published','pending','duplicate_pending','archived'))", username,
+                )
+                price = fields.get("price_amount")
+                if price not in (None, ""):
+                    try:
+                        price = str(float(price))
+                    except (TypeError, ValueError):
+                        raise HTTPException(status_code=422, detail="price_amount must be numeric")
+                else:
+                    price = None
+                listing_id = await conn.fetchval(
+                    "INSERT INTO listings(source_msg_id,contact_username,nickname,district,price_amount,"
+                    "price_currency,description,media_json,manual_fields,evidence_json,custom_fields,"
+                    "confidence,status,published_at) VALUES($1,$2,$3,$4,$5::numeric,$6,$7,$8::jsonb,"
+                    "'{}'::jsonb,$9::jsonb,$10::jsonb,0.5,$11,NULL) RETURNING id",
+                    row["raw_id"], username,
+                    str(fields.get("nickname") or "") or None,
+                    str(fields.get("district") or "") or None,
+                    price, str(fields.get("price_currency") or "CNY"),
+                    str(fields.get("description") or ""),
+                    json.dumps(_decode_jsonb(row["media_json"], []), ensure_ascii=False),
+                    json.dumps(candidate.get("evidence") or {}, ensure_ascii=False),
+                    json.dumps(fields.get("custom_fields") or {}, ensure_ascii=False),
+                    "duplicate_pending" if duplicate else "pending",
+                )
+
+            new_status = "dismissed" if body.action == "dismiss" else "resolved"
+            decision = {"confirmed_fields": body.confirmed_fields} if body.confirmed_fields is not None else {}
+            await conn.execute(
+                    "INSERT INTO rule_active_review_events(queue_id,actor_user_id,action,listing_id,reason,decision_json) "
+                    "VALUES($1,$2,$3,$4,$5,$6::jsonb)", queue_id, actor_id, body.action, listing_id,
+                    body.reason, json.dumps(decision, ensure_ascii=False),
+            )
+            await conn.execute(
+                "UPDATE rule_active_review_queue SET status=$2,listing_id=$3,reviewed_by=$4,"
+                "reviewed_at=NOW(),last_action=$5,updated_at=NOW() WHERE id=$1",
+                queue_id, new_status, listing_id, actor_id, body.action,
+            )
+    return {"queue_id": queue_id, "status": new_status, "action": body.action,
+            "listing_id": listing_id, "actor_user_id": actor_id}
+
+
+@router.get("/sources/{source_id}/raw-samples")
+async def router_raw_samples(source_id: int, limit: int = 50) -> dict:
+    if not 1 <= limit <= 100:
+        raise HTTPException(status_code=422, detail="limit must be 1-100")
+    rows = await _pool().fetch(
+        "SELECT id AS raw_id,platform_msg_id,posted_at,LEFT(COALESCE(raw_text,''),500) AS text_preview,"
+        "jsonb_array_length(COALESCE(media_json,'[]'::jsonb)) AS media_count "
+        "FROM raw_messages WHERE source_id=$1 ORDER BY posted_at DESC NULLS LAST,id DESC LIMIT $2",
+        source_id, limit,
+    )
+    return {"source_id": source_id, "items": [dict(row) for row in rows]}
+
+
+@router.put("/sources/{source_id}/router-mode")
+async def set_source_router_mode(source_id: int, body: RouterModeBody,
+                                 authorization: str = Header(default="")) -> dict:
+    pool = _pool()
+    actor_id = current_user_id(authorization)
+    settings = get_settings()
+    allowed_ids = {int(value.strip()) for value in settings.active_router_source_ids.split(",")
+                   if value.strip().isdigit()}
+    if body.mode == "active" and (
+        not settings.active_router_enabled or settings.active_router_kill_switch
+        or allowed_ids != {source_id}
+        or not active_source_allowed(
+            source_id, enabled=settings.active_router_enabled,
+            allowed_source_ids=settings.active_router_source_ids,
+            kill_switch=settings.active_router_kill_switch,
+        )
+    ):
+        raise HTTPException(status_code=409, detail="Active 未获准：需开启全局开关、关闭急停并仅白名单此来源")
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            if body.mode == "active":
+                await conn.fetchval("SELECT pg_advisory_xact_lock($1)", 814271002)
+            row = await conn.fetchrow(
+                "SELECT router_mode FROM ingest_sources WHERE id=$1 FOR UPDATE", source_id,
+            )
+            if row is None:
+                raise HTTPException(status_code=404, detail="source not found")
+            previous = row["router_mode"]
+            if previous != body.mode:
+                if body.mode == "active":
+                    active_rows = await conn.fetch(
+                        "SELECT id FROM ingest_sources WHERE router_mode='active' AND id<>$1 FOR UPDATE",
+                        source_id,
+                    )
+                    if active_rows:
+                        raise HTTPException(status_code=409, detail="已有其他来源处于 Active；同一时间只允许一个试点")
+                await conn.execute("UPDATE ingest_sources SET router_mode=$2 WHERE id=$1", source_id, body.mode)
+                await conn.execute(
+                    "INSERT INTO rule_router_mode_events(source_id,previous_mode,new_mode,actor_user_id) "
+                    "VALUES($1,$2,$3,$4)", source_id, previous, body.mode, actor_id,
+                )
+    return {"source_id": source_id, "previous_mode": previous,
+            "mode": body.mode, "actor_user_id": actor_id}
+
+
+@router.post("/router-dryrun")
+async def router_dry_run(body: RouterDryRunBody) -> dict:
+    pool = _pool()
+    if body.sample_limit < 1 or body.sample_limit > 200:
+        raise HTTPException(status_code=422, detail="sample_limit must be 1-200")
+    if len(body.raw_message_ids) > 200:
+        raise HTTPException(status_code=422, detail="最多指定 200 条消息")
+    bindings = [dict(row) for row in await pool.fetch(SQL_SHADOW_BINDINGS, body.source_id)]
+    bindings = [b for b in bindings if b.get("purpose") == body.purpose]
+    if not bindings:
+        raise HTTPException(status_code=404, detail="source has no active rules for this purpose")
+    if body.rule_version_id is not None:
+        version = await pool.fetchrow(
+            "SELECT id,rule_id,config_json,config_hash FROM rule_instance_versions WHERE id=$1",
+            body.rule_version_id,
+        )
+        target = next((b for b in bindings if b["rule_id"] == version["rule_id"]), None) if version else None
+        if target is None:
+            raise HTTPException(status_code=422, detail="指定版本不属于该来源当前绑定的规则")
+        target["rule_version_id"] = version["id"]
+        target["config_json"] = version["config_json"]
+        target["config_hash"] = version["config_hash"]
+    if body.raw_message_ids:
+        samples = await pool.fetch(
+            "SELECT id AS raw_id,platform_msg_id,sender_peer_id,raw_text,media_json FROM raw_messages "
+            "WHERE source_id=$1 AND id=ANY($2::bigint[]) ORDER BY id LIMIT $3",
+            body.source_id, body.raw_message_ids, body.sample_limit,
+        )
+    else:
+        samples = await pool.fetch(
+            "SELECT id AS raw_id,platform_msg_id,sender_peer_id,raw_text,media_json FROM raw_messages "
+            "WHERE source_id=$1 ORDER BY posted_at DESC NULLS LAST,id DESC LIMIT $2",
+            body.source_id, body.sample_limit,
+        )
+    results = []
+    for sample in samples:
+        comparison = shadow_compare(
+            bindings, sample["raw_text"] or "", sample["sender_peer_id"],
+        )
+        selected = next((item.get("selected") for item in comparison["shadow_predictions"]
+                         if item.get("purpose") == body.purpose and item.get("selected")), None)
+        identity = (selected or {}).get("identity", "")
+        fields = (selected or {}).get("fields", {})
+        legacy = comparison.get("actual_legacy") or {}
+        legacy_fields = legacy.get("fields", {})
+        results.append({
+            "raw_id": sample["raw_id"], "platform_msg_id": sample["platform_msg_id"],
+            "media_count": len(_decode_jsonb(sample["media_json"], [])),
+            "description_present": bool((sample["raw_text"] or "").strip()),
+            "legacy": legacy, "router": comparison["shadow_predictions"],
+            "field_diff": {key: {"legacy": legacy_fields.get(key), "router": fields.get(key)}
+                           for key in sorted(set(legacy_fields) | set(fields))
+                           if legacy_fields.get(key) != fields.get(key)},
+            "identity_diff": {"legacy": legacy.get("identity", ""), "router": identity},
+            "conflicts": [c for item in comparison["shadow_predictions"] for c in item.get("conflicts", [])],
+            "candidate_key": business_candidate_key(
+                body.source_id, sample["platform_msg_id"], body.purpose, identity,
+            ),
+            "ocr_would_be_considered": any(
+                trace.get("ocr_would_be_considered")
+                for item in comparison["shadow_predictions"] for trace in item.get("trace", [])
+            ),
+            "publication_blockers": sorted(set((selected or {}).get("missing_fields", [])) | {
+                "media/custom-field eligibility requires full processing context",
+                "publish authorization and explicit state transition are not evaluated by dry-run",
+            }),
+            "estimated_action": "review" if not fields or (selected or {}).get("missing_fields") else "needs_publish_gate_check",
+            "changed": comparison["changed"],
+        })
+    return {"source_id": body.source_id, "purpose": body.purpose, "count": len(results),
+            "read_only": True, "telegram_requests": 0, "ocr_runs": 0, "results": results}
+
+
+@router.get("/lifecycle-review")
+async def list_lifecycle_review_events(
+    status: Literal["pending", "approved", "rejected", "all"] = "pending",
+    source_id: int | None = None,
+    rule_id: int | None = None,
+    created_after: datetime | None = None,
+    created_before: datetime | None = None,
+    limit: int = 25,
+    offset: int = 0,
+) -> dict:
+    if not 1 <= limit <= 100 or offset < 0:
+        raise HTTPException(status_code=422, detail="limit must be 1-100 and offset >= 0")
+    rows = await _pool().fetch(
+        "SELECT e.id,e.raw_id,e.rule_version_id,e.sender_peer_id,e.lifecycle_term,"
+        "e.candidate_username,e.review_reason,e.status,e.resolved_listing_id,e.review_action,"
+        "e.review_reason_text,e.identity_evidence,e.reviewed_by,e.reviewed_at,e.created_at,"
+        "r.source_id,r.platform_msg_id,r.raw_text,r.media_json,r.posted_at,"
+        "s.title AS source_title,s.username AS source_username,rv.rule_id,ir.rule_name,rv.version AS rule_version,"
+        "u.username AS reviewer_username,u.display_name AS reviewer_display_name,"
+        "COALESCE((SELECT jsonb_agg(jsonb_build_object('id',l.id,'nickname',l.nickname,"
+        "'status',l.status,'contact_username',l.contact_username,'price_amount',l.price_amount) "
+        "ORDER BY l.updated_at DESC,l.id DESC) "
+        "FROM listings l WHERE e.candidate_username<>'' AND lower(l.contact_username)=e.candidate_username),'[]'::jsonb) AS candidates "
+        "FROM lifecycle_review_events e JOIN raw_messages r ON r.id=e.raw_id "
+        "JOIN ingest_sources s ON s.id=r.source_id "
+        "LEFT JOIN rule_instance_versions rv ON rv.id=e.rule_version_id "
+        "LEFT JOIN ingest_rules ir ON ir.id=rv.rule_id "
+        "LEFT JOIN site_users u ON u.id::text=e.reviewed_by "
+        "WHERE ($1='all' OR e.status=$1) AND ($2::bigint IS NULL OR r.source_id=$2) "
+        "AND ($3::bigint IS NULL OR rv.rule_id=$3) "
+        "AND ($4::timestamptz IS NULL OR e.created_at >= $4) "
+        "AND ($5::timestamptz IS NULL OR e.created_at < $5) "
+        "ORDER BY e.created_at DESC,e.id DESC LIMIT $6 OFFSET $7",
+        status, source_id, rule_id, created_after, created_before, limit + 1, offset,
+    )
+    has_more = len(rows) > limit
+    return {"items": [{**dict(row),
+                       "candidates": _decode_jsonb(row["candidates"], []),
+                       "identity_evidence": _decode_jsonb(row["identity_evidence"], {}),
+                       "media_json": _decode_jsonb(row["media_json"], [])}
+                       for row in rows[:limit]],
+            "has_more": has_more, "next_offset": offset + limit if has_more else None}
+
+
+@router.post("/lifecycle-review/{event_id}/resolve")
+async def resolve_lifecycle_review_event(
+    event_id: int, body: LifecycleResolutionBody, authorization: str = Header(default=""),
+) -> dict:
+    if body.action == "approve" and body.listing_id is None:
+        raise HTTPException(status_code=422, detail="approve 需要明确选择一张卡片")
+    if body.action == "reject" and body.listing_id is not None:
+        raise HTTPException(status_code=422, detail="reject 不应包含 listing_id")
+    try:
+        resolved = await _pool().fetchval(
+            "SELECT lifecycle_review_resolve($1,$2,$3,$4,$5)",
+            event_id, body.action, body.listing_id,
+            str(current_user_id(authorization)), body.reason,
+        )
+    except Exception as exc:
+        message = str(exc).lower()
+        if "does not match" in message or "only a published listing" in message:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if "listing not found" in message:
+            raise HTTPException(status_code=404, detail="卡片不存在") from exc
+        raise
+    if not resolved:
+        raise HTTPException(status_code=409, detail="事件不存在或已处理")
+    return {"event_id": event_id, "action": body.action, "listing_id": body.listing_id}
+
+
+@router.get("/shadow-diagnostics")
+async def shadow_diagnostics() -> dict:
+    pool = _pool()
+    counts = await pool.fetchrow(
+        "SELECT (SELECT count(*) FROM rule_shadow_comparisons) AS comparisons,"
+        "(SELECT count(*) FROM rule_parse_runs WHERE run_reason='shadow') AS shadow_runs,"
+        "(SELECT count(*) FROM rule_shadow_error_counts WHERE last_occurred_at>=NOW()-INTERVAL '24 hours') AS error_buckets,"
+        "(SELECT COALESCE(sum(occurrences),0) FROM rule_shadow_error_counts WHERE last_occurred_at>=NOW()-INTERVAL '24 hours') AS recent_errors,"
+        "(SELECT count(*) FROM rule_shadow_comparisons WHERE observed_at<NOW()-INTERVAL '30 days') AS expired_comparisons,"
+        "(SELECT count(*) FROM rule_parse_runs WHERE run_reason='shadow' AND created_at<NOW()-INTERVAL '30 days') AS expired_runs,"
+        "(SELECT count(*) FROM rule_shadow_error_counts WHERE last_occurred_at<NOW()-INTERVAL '30 days') AS expired_error_buckets,"
+        "pg_total_relation_size('rule_shadow_comparisons') AS comparison_bytes,"
+        "pg_total_relation_size('rule_parse_runs') AS parse_run_bytes,"
+        "pg_total_relation_size('rule_shadow_error_counts') AS error_count_bytes"
+    )
+    errors = await pool.fetch(
+        "SELECT source_id,error_class,occurrences,last_occurred_at,last_raw_id "
+        "FROM rule_shadow_error_counts WHERE last_occurred_at>=NOW()-INTERVAL '24 hours' "
+        "ORDER BY last_occurred_at DESC LIMIT 100"
+    )
+    last_run = await pool.fetchrow(
+        "SELECT c.id,c.status,c.cutoff_at,c.preview_json,c.deleted_json,c.started_at,c.finished_at,"
+        "u.username AS actor_username FROM rule_shadow_cleanup_runs c "
+        "LEFT JOIN site_users u ON u.id=c.actor_user_id ORDER BY c.id DESC LIMIT 1"
+    )
+    settings = get_settings()
+    sizes = sum(int(counts[key] or 0) for key in
+                ("comparison_bytes", "parse_run_bytes", "error_count_bytes"))
+    warnings = []
+    if sizes >= settings.shadow_capacity_warn_bytes:
+        warnings.append("shadow_storage_capacity")
+    if counts["recent_errors"] >= settings.shadow_recent_error_warn_count:
+        warnings.append("shadow_error_rate")
+    return {"counts": dict(counts), "errors": [dict(row) for row in errors],
+            "last_cleanup": dict(last_run) if last_run else None,
+            "thresholds": {"storage_bytes": settings.shadow_capacity_warn_bytes,
+                           "recent_errors": settings.shadow_recent_error_warn_count},
+            "warnings": warnings}
+
+
+@router.post("/shadow-diagnostics/prune")
+async def prune_shadow_diagnostics(body: ShadowPruneBody,
+                                   authorization: str = Header(default="")) -> dict:
+    pool = _pool()
+    actor_id = current_user_id(authorization)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=body.older_than_days)
+    preview = await pool.fetchrow(
+        "SELECT (SELECT count(*) FROM rule_parse_runs WHERE run_reason='shadow' AND created_at<$1) AS shadow_runs,"
+        "(SELECT count(*) FROM rule_shadow_comparisons WHERE observed_at<$1) AS comparisons,"
+        "(SELECT count(*) FROM rule_shadow_error_counts WHERE last_occurred_at<$1) AS error_buckets",
+        cutoff,
+    )
+    run_id = await pool.fetchval(
+        "INSERT INTO rule_shadow_cleanup_runs(actor_user_id,cutoff_at,requested_batch_size,preview_json,status) "
+        "VALUES($1,$2,$3,$4::jsonb,'running') RETURNING id",
+        actor_id, cutoff, body.batch_size, json.dumps(dict(preview)),
+    )
+    deleted = {"shadow_runs": 0, "comparisons": 0, "error_buckets": 0}
+    try:
+        for _ in range(body.max_batches):
+            statuses = [
+                await pool.execute(
+                    "WITH victims AS (SELECT id FROM rule_parse_runs WHERE run_reason='shadow' AND created_at<$1 "
+                    "ORDER BY created_at,id LIMIT $2 FOR UPDATE SKIP LOCKED) "
+                    "DELETE FROM rule_parse_runs r USING victims v WHERE r.id=v.id",
+                    cutoff, body.batch_size,
+                ),
+                await pool.execute(
+                    "WITH victims AS (SELECT id FROM rule_shadow_comparisons WHERE observed_at<$1 "
+                    "ORDER BY observed_at,id LIMIT $2 FOR UPDATE SKIP LOCKED) "
+                    "DELETE FROM rule_shadow_comparisons c USING victims v WHERE c.id=v.id",
+                    cutoff, body.batch_size,
+                ),
+                await pool.execute(
+                    "WITH victims AS (SELECT source_id,error_class,window_started_at "
+                    "FROM rule_shadow_error_counts WHERE last_occurred_at<$1 "
+                    "ORDER BY last_occurred_at LIMIT $2 FOR UPDATE SKIP LOCKED) "
+                    "DELETE FROM rule_shadow_error_counts e USING victims v "
+                    "WHERE (e.source_id,e.error_class,e.window_started_at)="
+                    "(v.source_id,v.error_class,v.window_started_at)",
+                    cutoff, body.batch_size,
+                ),
+            ]
+            batch_counts = [int(value.split()[-1]) for value in statuses]
+            deleted["shadow_runs"] += batch_counts[0]
+            deleted["comparisons"] += batch_counts[1]
+            deleted["error_buckets"] += batch_counts[2]
+            if not any(batch_counts):
+                break
+        await pool.execute(
+            "UPDATE rule_shadow_cleanup_runs SET deleted_json=$2::jsonb,status='completed',finished_at=NOW() WHERE id=$1",
+            run_id, json.dumps(deleted),
+        )
+    except Exception as exc:
+        await pool.execute(
+            "UPDATE rule_shadow_cleanup_runs SET deleted_json=$2::jsonb,status='failed',error_class=$3,finished_at=NOW() WHERE id=$1",
+            run_id, json.dumps(deleted), type(exc).__name__,
+        )
+        raise
+    return {"run_id": run_id, "cutoff_at": cutoff.isoformat(), "preview": dict(preview),
+            "deleted": deleted, "batch_size": body.batch_size, "max_batches": body.max_batches}
 
 
 @router.post("/{rule_id}/copy")
-async def copy_rule(rule_id: int, body: CopyBody) -> dict:
+async def copy_rule(
+    rule_id: int, body: CopyBody, authorization: str = Header(default=""),
+) -> dict:
     pool = _pool()
     try:
-        rows = await pool.fetch(SQL_COPY, rule_id, body.rule_name.strip())
+        rows = await pool.fetch(
+            SQL_COPY, rule_id, body.rule_name.strip(), str(current_user_id(authorization)),
+        )
     except Exception as exc:
-        if "unique" in str(exc).lower():
+        message = str(exc).lower()
+        if "unique" in message:
             raise HTTPException(status_code=409, detail="规则名已存在") from exc
+        if "private credentials" in message:
+            raise HTTPException(status_code=409, detail="源规则含账号密钥，移除后才能复制") from exc
         raise
     if not rows:
         raise HTTPException(status_code=404, detail="not found or protected")
-    return {"rule_id": rows[0]["rule_id"], "version": rows[0]["version"]}
+    return {
+        "rule_id": rows[0]["rule_id"], "version": rows[0]["version"],
+        "rule_version_id": rows[0]["rule_version_id"],
+    }
 
 
 @router.delete("/{rule_id}")
@@ -232,8 +1020,20 @@ async def delete_rule(rule_id: int) -> dict:
 @router.post("/{rule_id}/bind")
 async def bind_rule(rule_id: int, body: BindBody) -> dict:
     pool = _pool()
-    await pool.fetch(SQL_BIND, rule_id, body.source_id, body.priority)
-    return {"ok": True}
+    if not validate_match_mode(body.match_mode):
+        raise HTTPException(status_code=422, detail="unsupported match_mode")
+    try:
+        row = await pool.fetchval(
+            SQL_BIND_VERSIONED, rule_id, body.source_id, body.priority,
+            body.purpose, body.match_group, body.match_mode, body.fallback_order,
+            body.rule_version_id,
+        )
+    except Exception as exc:
+        message = str(exc).lower()
+        if "not found" in message or "does not belong" in message:
+            raise HTTPException(status_code=422, detail="规则、来源或规则版本无效") from exc
+        raise
+    return {"ok": bool(row)}
 
 
 @router.get("/{rule_id}/profile-collection")
