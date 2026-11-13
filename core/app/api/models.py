@@ -115,9 +115,15 @@ async def _register_configured_baseline(pool) -> None:
         version, str(source),
     )
     if existing:
-        if (existing["version_key"] != version or existing["model_path"] != str(source)
-                or existing["model_sha256"] != model_sha):
+        if existing["version_key"] != version or existing["model_sha256"] != model_sha:
             raise HTTPException(status_code=409, detail="原始 Vision4 基线与登记版本不一致")
+        try:
+            registered = _validate_managed_version(existing["model_path"], version, model_sha)
+            if any((registered / name).read_bytes() != (source / name).read_bytes()
+                   for name in ("labels.json", "preprocess.json")):
+                raise ValueError("注册版本配置与原始基线不一致")
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail="原始 Vision4 基线与登记版本不一致") from exc
         return
     status = await pool.fetchval(
         "SELECT EXISTS(SELECT 1 FROM vision4_model_versions WHERE status='active')"
