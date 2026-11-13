@@ -130,7 +130,7 @@ onUnmounted(() => unreadTimer && clearInterval(unreadTimer));
       </div>
     </header>
 
-    <main :class="isAdminPage ? 'min-h-screen w-full min-w-0 p-0' : 'mx-auto max-w-7xl px-3 py-4 pb-24 sm:px-4 sm:py-6 lg:pb-6'>
+    <main :class="isAdminPage ? 'min-h-screen w-full min-w-0 p-0' : 'mx-auto max-w-7xl px-3 py-4 pb-24 sm:px-4 sm:py-6 lg:pb-6'">
       <RouterView />
     </main>
 
