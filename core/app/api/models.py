@@ -27,6 +27,10 @@ MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_PACKAGE_BYTES = 200 * 1024 * 1024
 MAX_FILES = 8
 _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$")
+_IMAGE_SUFFIXES = {
+    "image/bmp": ".bmp", "image/gif": ".gif", "image/jpeg": ".jpg",
+    "image/png": ".png", "image/tiff": ".tiff", "image/webp": ".webp",
+}
 
 
 def _pool():
@@ -395,7 +399,8 @@ async def predict_vision4_model(version_id: int, request: Request) -> dict:
     if row is None or row["status"] not in {"ready", "active", "rollback"}:
         raise HTTPException(status_code=404, detail="可测试模型版本不存在")
     media_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
-    if not media_type.startswith("image/"):
+    suffix = _IMAGE_SUFFIXES.get(media_type)
+    if not suffix:
         raise HTTPException(status_code=415, detail="请上传图片文件")
     declared = request.headers.get("content-length")
     if declared:
@@ -411,7 +416,7 @@ async def predict_vision4_model(version_id: int, request: Request) -> dict:
         raise HTTPException(status_code=409, detail="模型文件校验失败") from exc
     total = 0
     with tempfile.TemporaryDirectory(prefix="nexus-model-test-") as temp:
-        image = Path(temp) / "input-image"
+        image = Path(temp) / f"input-image{suffix}"
         with image.open("xb") as output:
             async for chunk in request.stream():
                 total += len(chunk)
