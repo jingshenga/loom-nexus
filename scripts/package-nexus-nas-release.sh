@@ -13,6 +13,8 @@ mkdir -p "$OUT_DIR"
 STAGE="$(mktemp -d "$OUT_DIR/.stage.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
 
+(cd "$ROOT/core/frontend" && npm ci --no-audit --no-fund && npm run build)
+
 git -C "$ROOT" archive --format=tar "$COMMIT" \
   scripts/nexus-release-entrypoint.sh \
   scripts/check_admin_feature_manifest.py \
@@ -26,6 +28,8 @@ git -C "$ROOT" archive --format=tar "$COMMIT" \
   release/nexus-v3-20261110/BC/scripts/deploy-core-release.sh \
   release/nexus-v3-20261110/BC/scripts/release-core-unified.sh \
   | tar -xf - -C "$STAGE"
+mkdir -p "$STAGE/core/frontend/dist"
+cp -R "$ROOT/core/frontend/dist/." "$STAGE/core/frontend/dist/"
 printf '%s\n' "$COMMIT" > "$STAGE/.nexus-release-commit"
 cat > "$STAGE/README.txt" <<'EOF'
 Nexus V3 one-shot NAS release package

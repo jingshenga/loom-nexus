@@ -4,6 +4,10 @@
 data
 **/node_modules
 **/dist
+!core/frontend/dist/
+!core/frontend/dist/**
+release/**/frontend/dist
+release/**/core/static
 **/__pycache__
 **/*.py[cod]
 **/.DS_Store
