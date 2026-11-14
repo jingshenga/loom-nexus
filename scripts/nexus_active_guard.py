@@ -72,6 +72,16 @@ def core_health():
     return result.get("status") == "ok" and result.get("db") == "up"
 
 
+def _json_object(value):
+    """asyncpg returns json/jsonb as text unless a custom codec is installed."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
 async def write_heartbeat(conn, healthy, metrics=None, error=None):
     await conn.execute(
         "INSERT INTO active_router_guard_state(source_id,heartbeat_at,health_status,last_metrics_json,last_error,updated_at) "
@@ -121,7 +131,7 @@ def anomaly_reason(metrics, state):
         return "source_set_changed"
     if any(mode != "legacy" for source_id, mode in modes.items() if source_id != SOURCE_ID):
         return "unexpected_active_source"
-    baseline = state["active_baseline_json"] or {}
+    baseline = _json_object(state["active_baseline_json"])
     if not baseline:
         return "missing_activation_baseline"
     if metrics.get("binding_signature") != baseline.get("binding_signature"):

@@ -130,6 +130,12 @@ apply_migration 2026-11-14-active-router-supervisor-engine-audit.sql
 
 GUARD_SOURCE="$REPO_DIR/scripts/nexus_active_guard.py"
 [[ -f "$GUARD_SOURCE" ]] || die "continuous Active supervisor source is missing"
+docker run --rm --network none --entrypoint python \
+    -e PYTHONPATH=/release-guard \
+    -v "$GUARD_SOURCE:/release-guard/nexus_active_guard.py:ro" \
+    -v "$REPO_DIR/scripts/test_nexus_active_guard.py:/release-tests/test_nexus_active_guard.py:ro" \
+    "$CANDIDATE_IMAGE" -m unittest discover -s /release-tests -p 'test_nexus_active_guard.py' \
+    || die "Active supervisor JSONB/fail-closed regression failed"
 install -m 0644 "$GUARD_SOURCE" "$PROJECT_DIR/scripts/nexus_active_guard.py" \
     || die "could not install the Active supervisor script"
 sha256sum "$PROJECT_DIR/scripts/nexus_active_guard.py" > "$BACKUP_DIR/nexus_active_guard.py.sha256"
