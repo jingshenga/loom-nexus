@@ -133,6 +133,10 @@ async def _recognition_overview(pool, request: Request, now: datetime) -> dict:
         " jsonb_each(COALESCE(q.candidate_json->'evidence','{}'::jsonb)) field "
         " WHERE q.source_id=2 AND q.created_at>=g.active_started_at AND field.value->>'src'='ocr') "
         " AS ocr_adopted_field_values,"
+        "(SELECT count(*) FROM rule_active_review_queue q CROSS JOIN LATERAL "
+        " jsonb_array_elements(COALESCE(q.candidate_json->'ocr_assist','[]'::jsonb)) assist "
+        " CROSS JOIN LATERAL jsonb_object_keys(COALESCE(assist.value->'fields','{}'::jsonb)) field "
+        " WHERE q.source_id=2 AND q.created_at>=g.active_started_at) AS ocr_evidence_field_values,"
         "(SELECT count(*) FROM rule_active_review_queue q WHERE q.source_id=2 "
         " AND q.created_at>=g.active_started_at AND "
         " jsonb_array_length(COALESCE(q.diagnostics_json->'conflict_kinds','[]'::jsonb))>0) AS conflicted_candidates,"
@@ -279,6 +283,7 @@ async def _recognition_overview(pool, request: Request, now: datetime) -> dict:
                 "review_candidates": source2["review_candidates"],
                 "ocr_assisted_candidates": source2["ocr_assisted_candidates"],
                 "ocr_adopted_field_values": source2["ocr_adopted_field_values"],
+                "ocr_evidence_field_values": source2["ocr_evidence_field_values"],
                 "conflicted_candidates": source2["conflicted_candidates"],
                 "new_open_reviews": source2["new_open_reviews"],
                 "open_reviews": source2["open_reviews"], "ocr_rechecks": source2["ocr_rechecks"],
