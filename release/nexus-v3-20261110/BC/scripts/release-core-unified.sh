@@ -54,6 +54,13 @@ CURRENT_REF="$(docker inspect --format '{{.Config.Image}}' nexus-core)"
 [[ "$CURRENT_ID" =~ ^sha256:[0-9a-f]{64}$ ]] \
     || die "running Core Image ID is invalid; stop and reconcile source first"
 
+router_runtime_settings() {
+    docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' nexus-core \
+      | awk -F= '$1 ~ /^(NEXUS_VISION4_MODE|NEXUS_ACTIVE_ROUTER_ENABLED|NEXUS_ACTIVE_ROUTER_SOURCE_IDS|NEXUS_ACTIVE_ROUTER_KILL_SWITCH|NEXUS_OCR_REVIEW_ASSIST_ENABLED)$/ {print}' \
+      | LC_ALL=C sort
+}
+PREDEPLOY_ROUTER_SETTINGS="$(router_runtime_settings)"
+
 export NEXUS_CORE_BASE_IMAGE="$CURRENT_REF"
 export NEXUS_CORE_BASE_IMAGE_ID="$CURRENT_ID"
 export NEXUS_CORE_CANDIDATE_IMAGE="$CANDIDATE_IMAGE"
@@ -127,8 +134,6 @@ from PIL import Image
 from app.config import CoreSettings
 from app.extractor.vision4_classifier import Vision4Classifier
 settings = CoreSettings()
-assert not settings.active_router_enabled and not settings.active_router_source_ids and settings.active_router_kill_switch
-assert not settings.ocr_review_assist_enabled
 processor = __import__("app.main", fromlist=["app"])
 processor_state = getattr(processor.app.state, "media_ocr_processor", None)
 model_dir = processor_state._vision4.model_dir if processor_state else Path(settings.vision4_model_dir)
@@ -143,6 +148,8 @@ ACTIVE_COUNT="$(docker compose -f "$COMPOSE_FILE" exec -T nexus-db sh -lc \
   'exec psql -XAtq -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT count(*) FROM ingest_sources WHERE router_mode<>chr(108)||chr(101)||chr(103)||chr(97)||chr(99)||chr(121)"' \
 )" || die "could not verify post-deploy source modes"
 [[ "$ACTIVE_COUNT" == "0" ]] || die "post-deploy source mode is not all Legacy"
+[[ "$(router_runtime_settings)" == "$PREDEPLOY_ROUTER_SETTINGS" ]] \
+  || die "post-deploy Vision4/Router runtime settings changed"
 docker compose -f "$COMPOSE_FILE" exec -T nexus-db sh -lc \
   'exec psql -XAtq -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT count(*) FROM vision4_model_versions"' \
   >/dev/null || die "model registry is unavailable after deployment"
@@ -156,8 +163,8 @@ cat > "$BACKUP_DIR/release-record.json" <<EOF
   "rollback_image": "nexus-core:rollback-nexus-v3-unified-$STAMP",
   "backup_dir": "$BACKUP_DIR",
   "deployed_at_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "active_source_ids": [],
-  "ocr_review_assist_enabled": false
+  "runtime_router_settings_unchanged": true,
+  "all_sources_legacy": true
 }
 EOF
 chmod 0600 "$BACKUP_DIR/release-record.json"
