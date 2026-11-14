@@ -17,6 +17,8 @@ trap 'rm -rf "$STAGE"' EXIT
 
 git -C "$ROOT" archive --format=tar "$COMMIT" \
   scripts/nexus-release-entrypoint.sh \
+  scripts/nexus_active_guard.py \
+  scripts/test_nexus_active_guard.py \
   scripts/check_admin_feature_manifest.py \
   scripts/admin-feature-manifest.json \
   scripts/migrations \
