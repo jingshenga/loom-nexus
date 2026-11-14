@@ -7,11 +7,12 @@ import re
 import shutil
 import stat
 import tempfile
+from typing import Literal
 import zipfile
 from pathlib import Path, PurePosixPath
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
-from pydantic import BaseModel, Literal
+from pydantic import BaseModel
 
 from app import db
 from app.api.auth import current_user_id, require_admin
