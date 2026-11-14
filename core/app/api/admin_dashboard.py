@@ -95,6 +95,71 @@ async def _recognition_overview(pool, request: Request, now: datetime) -> dict:
     classifier = await pool.fetchrow(
         "SELECT id,status FROM ocr_classifier_versions WHERE status='active' ORDER BY id DESC LIMIT 1"
     )
+    source2 = await pool.fetchrow(
+        "SELECT s.is_active,s.router_mode,g.active_started_at,g.heartbeat_at,g.health_status,"
+        "g.last_error,g.last_rollback_reason,g.last_metrics_json,"
+        "(SELECT max(r.posted_at) FROM raw_messages r WHERE r.source_id=2) AS latest_message_posted_at,"
+        "(SELECT max(rv.observed_at) FROM raw_messages r JOIN raw_message_revisions rv ON rv.raw_id=r.id "
+        " WHERE r.source_id=2) AS latest_revision_observed_at,"
+        "(SELECT count(*) FROM raw_messages r JOIN raw_message_revisions rv ON rv.raw_id=r.id "
+        " WHERE r.source_id=2 AND rv.observed_at>=g.active_started_at) AS new_revisions,"
+        "(SELECT count(DISTINCT r.id) FROM raw_messages r JOIN raw_message_revisions rv ON rv.raw_id=r.id "
+        " WHERE r.source_id=2 AND rv.observed_at>=g.active_started_at) AS new_raws,"
+        "(SELECT count(DISTINCT r.id) FROM raw_messages r JOIN raw_message_revisions rv ON rv.raw_id=r.id "
+        " WHERE r.source_id=2 AND rv.observed_at>=g.active_started_at "
+        " AND r.extract_state IN ('done','dropped')) AS processed_raws,"
+        "(SELECT count(*) FROM rule_parse_runs p JOIN raw_message_revisions rv ON rv.id=p.raw_revision_id "
+        " JOIN raw_messages r ON r.id=rv.raw_id WHERE r.source_id=2 AND p.run_reason='active' "
+        " AND p.created_at>=g.active_started_at) AS active_runs,"
+        "(SELECT count(*) FROM rule_parse_runs p JOIN raw_message_revisions rv ON rv.id=p.raw_revision_id "
+        " JOIN raw_messages r ON r.id=rv.raw_id WHERE r.source_id=2 AND p.run_reason='active' "
+        " AND p.created_at>=g.active_started_at AND "
+        " jsonb_array_length(COALESCE(p.result_json->'selected_rule_ids','[]'::jsonb))>0) AS rule_hits,"
+        "(SELECT count(*) FROM listing_media_ocr o JOIN raw_messages r ON r.id=o.raw_id "
+        " WHERE r.source_id=2 AND o.created_at>=g.active_started_at) AS ocr_records,"
+        "(SELECT count(*) FROM listing_media_ocr o JOIN raw_messages r ON r.id=o.raw_id "
+        " WHERE r.source_id=2 AND o.created_at>=g.active_started_at AND o.fields_json IS NOT NULL "
+        " AND o.fields_json<>'{}'::jsonb AND o.fields_json<>'[]'::jsonb) AS ocr_field_records,"
+        "(SELECT COALESCE(sum((SELECT count(*) FROM jsonb_object_keys(o.fields_json))),0) "
+        " FROM listing_media_ocr o "
+        " JOIN raw_messages r ON r.id=o.raw_id WHERE r.source_id=2 AND o.created_at>=g.active_started_at "
+        " AND jsonb_typeof(o.fields_json)='object') AS ocr_field_values,"
+        "(SELECT count(*) FROM rule_active_review_queue q WHERE q.source_id=2 "
+        " AND q.created_at>=g.active_started_at) AS review_candidates,"
+        "(SELECT count(*) FROM rule_active_review_queue q WHERE q.source_id=2 "
+        " AND q.created_at>=g.active_started_at AND "
+        " jsonb_array_length(COALESCE(q.candidate_json->'ocr_assist','[]'::jsonb))>0) AS ocr_assisted_candidates,"
+        "(SELECT count(*) FROM rule_active_review_queue q CROSS JOIN LATERAL "
+        " jsonb_each(COALESCE(q.candidate_json->'evidence','{}'::jsonb)) field "
+        " WHERE q.source_id=2 AND q.created_at>=g.active_started_at AND field.value->>'src'='ocr') "
+        " AS ocr_adopted_field_values,"
+        "(SELECT count(*) FROM rule_active_review_queue q WHERE q.source_id=2 "
+        " AND q.created_at>=g.active_started_at AND "
+        " jsonb_array_length(COALESCE(q.diagnostics_json->'conflict_kinds','[]'::jsonb))>0) AS conflicted_candidates,"
+        "(SELECT count(*) FROM rule_active_review_queue q WHERE q.source_id=2 "
+        " AND q.created_at>=g.active_started_at AND q.status='open') AS new_open_reviews,"
+        "(SELECT count(*) FROM rule_active_review_queue q WHERE q.source_id=2 AND q.status='open') AS open_reviews,"
+        "(SELECT count(*) FROM rule_active_ocr_rechecks x WHERE x.source_id=2 "
+        " AND x.created_at>=g.active_started_at) AS ocr_rechecks "
+        "FROM ingest_sources s LEFT JOIN active_router_guard_state g ON g.source_id=s.id WHERE s.id=2"
+    )
+    guard_heartbeat = source2["heartbeat_at"]
+    guard_healthy = bool(
+        source2["health_status"] == "healthy" and guard_heartbeat
+        and (now - guard_heartbeat).total_seconds() <= 90
+    )
+    if not source2["active_started_at"]:
+        source2_diagnosis = "没有找到本次 Active 启用时间，无法计算本次处理量。"
+    elif not source2["is_active"] or source2["router_mode"] != "active":
+        source2_diagnosis = "来源 2 当前未处于 Active；以下处理量仍按最近一次启用时间统计。"
+    elif not guard_healthy:
+        source2_diagnosis = "来源 2 当前为 Active，但 Guard 心跳异常或过期；请先检查守护状态。"
+    elif source2["new_revisions"] == 0:
+        source2_diagnosis = "启用后没有新的来源 2 raw 修订进入数据库，因此尚无消息可供 Active 解析、OCR 或分流。"
+    elif source2["active_runs"] == 0:
+        source2_diagnosis = "已有新 raw 修订，但没有 Active 解析审计；请检查 Bridge 到 Core 的入站与解析日志。"
+    else:
+        source2_diagnosis = "已收到并运行 Active；解析、字段和审核数量见下方。"
     active_model = await pool.fetchrow(
         "SELECT version_key,model_sha256 FROM vision4_model_versions WHERE status='active' "
         "ORDER BY activated_at DESC NULLS LAST,id DESC LIMIT 1"
@@ -192,6 +257,33 @@ async def _recognition_overview(pool, request: Request, now: datetime) -> dict:
             "source_modes": source_mode_counts,
             "sources": [{"id": row["id"], "title": row["title"], "is_active": row["is_active"],
                          "router_mode": row["router_mode"]} for row in source_rows],
+        },
+        "source2_activity": {
+            "source_id": 2, "is_active": source2["is_active"], "router_mode": source2["router_mode"],
+            "active_started_at": source2["active_started_at"].isoformat() if source2["active_started_at"] else None,
+            "guard_health_status": source2["health_status"], "guard_healthy": guard_healthy,
+            "guard_heartbeat_at": guard_heartbeat.isoformat() if guard_heartbeat else None,
+            "guard_last_error": source2["last_error"],
+            "guard_last_rollback_reason": source2["last_rollback_reason"],
+            "last_metrics": _decode_json(source2["last_metrics_json"], {}),
+            "latest_message_posted_at": source2["latest_message_posted_at"].isoformat()
+            if source2["latest_message_posted_at"] else None,
+            "latest_revision_observed_at": source2["latest_revision_observed_at"].isoformat()
+            if source2["latest_revision_observed_at"] else None,
+            "metrics": {
+                "new_raws": source2["new_raws"], "new_revisions": source2["new_revisions"],
+                "processed_raws": source2["processed_raws"], "active_runs": source2["active_runs"],
+                "rule_hits": source2["rule_hits"], "ocr_records": source2["ocr_records"],
+                "ocr_field_records": source2["ocr_field_records"],
+                "ocr_field_values": source2["ocr_field_values"],
+                "review_candidates": source2["review_candidates"],
+                "ocr_assisted_candidates": source2["ocr_assisted_candidates"],
+                "ocr_adopted_field_values": source2["ocr_adopted_field_values"],
+                "conflicted_candidates": source2["conflicted_candidates"],
+                "new_open_reviews": source2["new_open_reviews"],
+                "open_reviews": source2["open_reviews"], "ocr_rechecks": source2["ocr_rechecks"],
+            },
+            "diagnosis": source2_diagnosis,
         },
         "metrics": {
             "vision4_calls": stats["vision4_calls"], "classifier_v2_calls": stats["classifier_v2_calls"],

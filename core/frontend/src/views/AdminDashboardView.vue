@@ -96,6 +96,30 @@ function processingLabel(image) {
         </article>
       </section>
 
+      <section v-if="data.recognition.source2_activity" class="space-y-4 rounded-2xl border border-amber-900/60 bg-slate-900 p-5">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p class="text-xs font-semibold uppercase tracking-[.16em] text-amber-300">SOURCE 2 · ACTIVE LIFETIME</p>
+            <h2 class="mt-1 text-lg font-semibold">来源 2 自本次启用以来</h2>
+            <p class="mt-1 text-xs text-slate-500">起点 {{ timeText(data.recognition.source2_activity.active_started_at) }} · 按新 raw revision、Active 解析审计、OCR 与审核队列分别统计。</p>
+          </div>
+          <span class="rounded-full px-3 py-1.5 text-xs" :class="data.recognition.source2_activity.is_active && data.recognition.source2_activity.router_mode === 'active' && data.recognition.source2_activity.guard_healthy ? 'bg-emerald-500/10 text-emerald-200' : 'bg-amber-500/10 text-amber-200'">
+            {{ data.recognition.source2_activity.router_mode }} · Guard {{ data.recognition.source2_activity.guard_healthy ? '心跳正常' : '异常/过期' }}
+          </span>
+        </div>
+        <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <article class="rounded-xl bg-slate-950/70 p-3"><div class="text-xs text-slate-400">新消息 / 修订</div><div class="mt-2 text-lg font-semibold">{{ data.recognition.source2_activity.metrics.new_raws }} 条 / {{ data.recognition.source2_activity.metrics.new_revisions }} 次</div><div class="text-xs text-slate-500">已处理 raw {{ data.recognition.source2_activity.metrics.processed_raws }} · 最近来源消息 {{ timeText(data.recognition.source2_activity.latest_message_posted_at) }}</div></article>
+          <article class="rounded-xl bg-slate-950/70 p-3"><div class="text-xs text-slate-400">Active 实际解析</div><div class="mt-2 text-lg font-semibold">{{ data.recognition.source2_activity.metrics.active_runs }} 次 · 规则命中 {{ data.recognition.source2_activity.metrics.rule_hits }}</div><div class="text-xs text-slate-500">以 rule_parse_runs 审计记录为准</div></article>
+          <article class="rounded-xl bg-slate-950/70 p-3"><div class="text-xs text-slate-400">OCR 字段提取 / 采用</div><div class="mt-2 text-lg font-semibold">{{ data.recognition.source2_activity.metrics.ocr_records }} 条 · {{ data.recognition.source2_activity.metrics.ocr_field_records }} 条有字段</div><div class="text-xs text-slate-500">fields_json {{ data.recognition.source2_activity.metrics.ocr_field_values }} 项 · 候选采用 {{ data.recognition.source2_activity.metrics.ocr_adopted_field_values }} 项；非人工确认准确率</div></article>
+          <article class="rounded-xl bg-slate-950/70 p-3"><div class="text-xs text-slate-400">审核候选</div><div class="mt-2 text-lg font-semibold">新建 {{ data.recognition.source2_activity.metrics.review_candidates }} · 新增待审 {{ data.recognition.source2_activity.metrics.new_open_reviews }}</div><div class="text-xs text-slate-500">OCR 辅助 {{ data.recognition.source2_activity.metrics.ocr_assisted_candidates }} · 冲突 {{ data.recognition.source2_activity.metrics.conflicted_candidates }} · 当前待审 {{ data.recognition.source2_activity.metrics.open_reviews }} · 回补 {{ data.recognition.source2_activity.metrics.ocr_rechecks }}</div></article>
+        </div>
+        <div class="rounded-xl border border-slate-800 bg-slate-950/60 p-3 text-sm text-slate-300">
+          <div>{{ data.recognition.source2_activity.diagnosis }}</div>
+          <div v-if="data.recognition.source2_activity.guard_last_error || data.recognition.source2_activity.guard_last_rollback_reason" class="mt-2 break-words text-xs text-amber-200">Guard 记录：{{ data.recognition.source2_activity.guard_last_error || data.recognition.source2_activity.guard_last_rollback_reason }}</div>
+          <div v-if="data.recognition.source2_activity.latest_revision_observed_at" class="mt-2 text-xs text-slate-500">数据库最近一次观察来源消息修订：{{ timeText(data.recognition.source2_activity.latest_revision_observed_at) }}；Guard 心跳：{{ timeText(data.recognition.source2_activity.guard_heartbeat_at) }}</div>
+        </div>
+      </section>
+
       <section class="space-y-4 rounded-2xl border border-sky-900/60 bg-slate-900 p-5">
         <div class="flex flex-wrap items-start justify-between gap-3">
           <div>
