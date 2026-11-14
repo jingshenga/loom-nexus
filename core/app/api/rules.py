@@ -471,12 +471,57 @@ async def router_management() -> dict:
         settings.active_router_enabled and not settings.active_router_kill_switch
         and len(allowed_ids) == 1
     )
+    guard_rows = await _pool().fetch(
+        "SELECT source_id,heartbeat_at,health_status,active_started_at,last_metrics_json,last_error,"
+        "last_rollback_reason FROM active_router_guard_state"
+    )
+    guards = {int(row["source_id"]): dict(row) for row in guard_rows}
+    metric_rows = await _pool().fetch(
+        "SELECT s.id AS source_id,"
+        "COUNT(r.id) FILTER (WHERE r.posted_at >= NOW()-INTERVAL '30 days') AS messages_30d,"
+        "COUNT(r.id) FILTER (WHERE r.extract_state IN ('done','dropped') AND r.posted_at >= NOW()-INTERVAL '30 days') AS processed_30d,"
+        "(SELECT COUNT(*) FROM rule_parse_runs p JOIN raw_message_revisions rv ON rv.id=p.raw_revision_id "
+        " JOIN raw_messages rm ON rm.id=rv.raw_id WHERE rm.source_id=s.id AND p.run_reason='active' "
+        " AND p.created_at >= NOW()-INTERVAL '30 days') AS active_runs_30d,"
+        "(SELECT COUNT(*) FROM rule_parse_runs p JOIN raw_message_revisions rv ON rv.id=p.raw_revision_id "
+        " JOIN raw_messages rm ON rm.id=rv.raw_id WHERE rm.source_id=s.id AND p.run_reason='active' "
+        " AND p.created_at >= NOW()-INTERVAL '30 days' AND p.result_json->>'reason'='active_match') AS active_hits_30d,"
+        "(SELECT COUNT(*) FROM rule_shadow_comparisons c WHERE c.source_id=s.id "
+        " AND c.observed_at >= NOW()-INTERVAL '30 days') AS shadow_comparisons_30d,"
+        "(SELECT COUNT(*) FROM rule_shadow_comparisons c WHERE c.source_id=s.id AND c.changed IS TRUE "
+        " AND c.observed_at >= NOW()-INTERVAL '30 days') AS shadow_differences_30d,"
+        "(SELECT COUNT(*) FROM rule_active_review_queue q WHERE q.source_id=s.id AND q.status='open') AS open_active_reviews "
+        "FROM ingest_sources s LEFT JOIN raw_messages r ON r.source_id=s.id GROUP BY s.id"
+    )
+    metrics = {int(row["source_id"]): dict(row) for row in metric_rows}
+    items = []
+    for row in rows:
+        source_id = int(row["source_id"])
+        bindings = _decode_jsonb(row["bindings"], [])
+        guard = guards.get(source_id)
+        guard_healthy = bool(
+            guard and guard.get("health_status") == "healthy" and guard.get("heartbeat_at")
+            and (datetime.now(timezone.utc) - guard["heartbeat_at"]).total_seconds() <= 90
+        )
+        block_reason = None
+        if not active_available:
+            block_reason = "Active 全局门禁未开启或急停已启用"
+        elif source_id not in allowed_ids:
+            block_reason = "来源未加入 Active 允许名单"
+        elif source_id != 2:
+            block_reason = "当前 OCR Review Assist 已验证支持来源 2；此来源的整合链路未验证"
+        elif not any(item.get("rule_type") == "listing" for item in bindings):
+            block_reason = "当前绑定没有 listing 规则，Active 无法处理该业务类型"
+        items.append({
+            **dict(row), "bindings": bindings,
+            "last_shadow": _decode_jsonb(row["last_shadow"], None),
+            "last_mode_event": _decode_jsonb(row["last_mode_event"], None),
+            "recent_errors": errors.get(source_id, []), "metrics": metrics.get(source_id, {}),
+            "guard": guard, "guard_healthy": guard_healthy,
+            "active_compatible": block_reason is None, "active_block_reason": block_reason,
+        })
     return {"items": [{**dict(row),
-                       "bindings": _decode_jsonb(row["bindings"], []),
-                       "last_shadow": _decode_jsonb(row["last_shadow"], None),
-                       "last_mode_event": _decode_jsonb(row["last_mode_event"], None),
-                       "recent_errors": errors.get(row["source_id"], [])}
-                      for row in rows],
+                       **items[index]} for index, row in enumerate(rows)],
             "active_mode_available": active_available,
             "active_source_ids": allowed_ids if active_available else []}
 
@@ -715,6 +760,20 @@ async def set_source_router_mode(source_id: int, body: RouterModeBody,
         async with conn.transaction():
             if body.mode == "active":
                 await conn.fetchval("SELECT pg_advisory_xact_lock($1)", 814271002)
+                supported_rules = await conn.fetch(
+                    "SELECT DISTINCT r.rule_type FROM source_rule_bindings b "
+                    "JOIN ingest_rules r ON r.id=b.rule_id WHERE b.source_id=$1 AND r.is_active",
+                    source_id,
+                )
+                if source_id != 2 or not any(row["rule_type"] == "listing" for row in supported_rules):
+                    raise HTTPException(status_code=409, detail="该来源尚未通过 Active OCR 兼容检查")
+                guard = await conn.fetchrow(
+                    "SELECT heartbeat_at,health_status FROM active_router_guard_state "
+                    "WHERE source_id=$1 FOR UPDATE", source_id,
+                )
+                if (not guard or guard["health_status"] != "healthy" or not guard["heartbeat_at"]
+                        or (datetime.now(timezone.utc) - guard["heartbeat_at"]).total_seconds() > 90):
+                    raise HTTPException(status_code=409, detail="Active Guard 未在线，拒绝切换")
             row = await conn.fetchrow(
                 "SELECT router_mode FROM ingest_sources WHERE id=$1 FOR UPDATE", source_id,
             )
@@ -728,12 +787,36 @@ async def set_source_router_mode(source_id: int, body: RouterModeBody,
                         source_id,
                     )
                     if active_rows:
-                        raise HTTPException(status_code=409, detail="已有其他来源处于 Active；同一时间只允许一个试点")
+                        raise HTTPException(status_code=409, detail="已有其他来源处于 Active；当前 Guard 仅允许来源 2")
+                    baseline = await conn.fetchrow(
+                        "SELECT (SELECT md5(COALESCE(string_agg(concat_ws(':',rule_id,rule_type,purpose,match_group,mode,"
+                        "priority,rule_version_id,config_hash),'|' ORDER BY purpose,priority DESC,rule_id),'')) "
+                        "FROM rule_shadow_bindings_for_source($1)) AS binding_signature,"
+                        "(SELECT md5(COALESCE(string_agg(concat_ws(':',l.id,l.status,"
+                        "md5(COALESCE(l.manual_fields,'{}'::jsonb)::text)),'|' ORDER BY l.id),'')) "
+                        "FROM listings l JOIN raw_messages r ON r.id=l.source_msg_id "
+                        "WHERE r.source_id=$1 AND l.status='published') AS source2_published_signature,"
+                        "(SELECT count(*) FROM listings l JOIN raw_messages r ON r.id=l.source_msg_id "
+                        "WHERE r.source_id=$1 AND l.status='published') AS source2_published_count",
+                        source_id,
+                    )
+                    await conn.execute(
+                        "INSERT INTO active_router_guard_state(source_id,active_started_at,active_baseline_json,"
+                        "last_rollback_reason,updated_at) VALUES($1,NOW(),$2::jsonb,NULL,NOW()) "
+                        "ON CONFLICT(source_id) DO UPDATE SET active_started_at=NOW(),"
+                        "active_baseline_json=EXCLUDED.active_baseline_json,last_rollback_reason=NULL,updated_at=NOW()",
+                        source_id, json.dumps(dict(baseline)),
+                    )
                 await conn.execute("UPDATE ingest_sources SET router_mode=$2 WHERE id=$1", source_id, body.mode)
                 await conn.execute(
                     "INSERT INTO rule_router_mode_events(source_id,previous_mode,new_mode,actor_user_id) "
                     "VALUES($1,$2,$3,$4)", source_id, previous, body.mode, actor_id,
                 )
+                if body.mode == "legacy":
+                    await conn.execute(
+                        "UPDATE active_router_guard_state SET active_started_at=NULL,"
+                        "active_baseline_json='{}'::jsonb,updated_at=NOW() WHERE source_id=$1", source_id,
+                    )
     return {"source_id": source_id, "previous_mode": previous,
             "mode": body.mode, "actor_user_id": actor_id}
 

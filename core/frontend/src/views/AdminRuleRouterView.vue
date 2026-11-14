@@ -51,6 +51,11 @@ function json(value) {
   return JSON.stringify(value ?? null, null, 2);
 }
 
+function percent(part, total) {
+  const denominator = Number(total || 0);
+  return denominator ? (Number(part || 0) * 100 / denominator).toFixed(1) + "%" : "—";
+}
+
 async function loadVersions() {
   versions.value = [];
   const rule = selectedRule.value;
@@ -237,15 +242,26 @@ onMounted(load);
             <div class="min-w-0">
               <h2 class="break-words text-lg font-semibold">{{ selectedSource.title || "未命名来源" }}</h2>
               <p class="mt-1 break-all text-xs text-slate-400">Source {{ selectedSource.source_id }} · peer {{ selectedSource.peer_id }} · {{ selectedSource.username ? "@" + selectedSource.username : "无公开用户名" }} · {{ selectedSource.router_mode }}</p>
-              <p class="mt-1 text-[11px] text-amber-300">Active 仅管理员可对唯一白名单来源启用。结果先进入人工审核，不自动上架；可立即切回 Legacy。</p>
+              <p class="mt-1 text-[11px] text-amber-300">Active 命中、身份冲突和 OCR 辅助候选均进入人工审核；不会自动上架。切回 Legacy 会记录管理员与时间。</p>
+              <p class="mt-1 text-[11px]" :class="selectedSource.guard_healthy ? 'text-emerald-300' : 'text-rose-300'">
+                Active Guard：{{ selectedSource.guard_healthy ? "在线" : "未在线" }}
+                <span v-if="selectedSource.guard?.heartbeat_at">· 心跳 {{ new Date(selectedSource.guard.heartbeat_at).toLocaleString() }}</span>
+                <span v-if="selectedSource.guard?.last_rollback_reason">· 最近自动回退 {{ selectedSource.guard.last_rollback_reason }}</span>
+              </p>
               <p v-if="selectedSource.last_mode_event" class="mt-1 text-[11px] text-slate-500">最近模式：{{ selectedSource.last_mode_event.previous_mode }} → {{ selectedSource.last_mode_event.new_mode }} · 管理员 #{{ selectedSource.last_mode_event.actor_user_id }} · {{ new Date(selectedSource.last_mode_event.changed_at).toLocaleString() }}</p>
             </div>
             <div class="flex flex-wrap gap-2">
               <button v-if="selectedSource.router_mode === 'legacy'" :disabled="busy" class="rounded-lg bg-violet-700 px-3 py-2 text-sm text-white disabled:opacity-50" @click="setMode('shadow')">此来源启用 Shadow</button>
               <button v-else :disabled="busy" class="rounded-lg bg-slate-700 px-3 py-2 text-sm text-white disabled:opacity-50" @click="setMode('legacy')">切回 Legacy</button>
-              <button v-if="selectedSource.router_mode === 'legacy' && activeModeAvailable && activeSourceIds.includes(selectedSource.source_id)" :disabled="busy" class="rounded-lg bg-amber-700 px-3 py-2 text-sm text-white disabled:opacity-50" @click="setMode('active')">此来源启用 Active（审核优先）</button>
-              <button v-else-if="selectedSource.router_mode === 'legacy'" disabled title="需发布配置明确开启 Active、配置唯一来源白名单并关闭急停" class="cursor-not-allowed rounded-lg border border-slate-800 px-3 py-2 text-sm text-slate-600">Active（未获准）</button>
+              <button v-if="selectedSource.router_mode === 'legacy' && activeModeAvailable && activeSourceIds.includes(selectedSource.source_id) && selectedSource.active_compatible && selectedSource.guard_healthy" :disabled="busy" class="rounded-lg bg-amber-700 px-3 py-2 text-sm text-white disabled:opacity-50" @click="setMode('active')">此来源启用 Active（审核优先）</button>
+              <button v-else-if="selectedSource.router_mode === 'legacy'" disabled :title="selectedSource.active_block_reason || (selectedSource.guard_healthy ? '来源未通过 Active 门禁' : '持续守护未在线，拒绝启用 Active')" class="cursor-not-allowed rounded-lg border border-slate-800 px-3 py-2 text-sm text-slate-600">Active（{{ selectedSource.active_block_reason || (selectedSource.guard_healthy ? "未获准" : "Guard 未在线") }}）</button>
             </div>
+          </div>
+          <div class="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+            <p class="rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-xs text-slate-300">近 30 天消息 {{ selectedSource.metrics?.messages_30d || 0 }} · 已处理 {{ selectedSource.metrics?.processed_30d || 0 }}</p>
+            <p class="rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-xs text-slate-300">Active {{ selectedSource.metrics?.active_hits_30d || 0 }} / {{ selectedSource.metrics?.active_runs_30d || 0 }} 命中（{{ percent(selectedSource.metrics?.active_hits_30d, selectedSource.metrics?.active_runs_30d) }}）· 待审 {{ selectedSource.metrics?.open_active_reviews || 0 }}</p>
+            <p class="rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-xs text-slate-300">Shadow 差异 {{ selectedSource.metrics?.shadow_differences_30d || 0 }} / {{ selectedSource.metrics?.shadow_comparisons_30d || 0 }}</p>
+            <p class="rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-xs text-slate-300">最近规则版本 {{ selectedSource.bindings.map((item) => item.rule_name + " v" + (item.version ?? "?")).join(" · ") || "无绑定" }}</p>
           </div>
           <div class="grid gap-2 md:grid-cols-2">
             <article v-for="binding in bindings" :key="binding.rule_id" class="min-w-0 rounded-lg border border-slate-800 bg-slate-950/70 p-3">

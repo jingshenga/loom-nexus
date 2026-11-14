@@ -124,13 +124,13 @@ function processingLabel(image) {
           </article>
           <article class="rounded-xl bg-slate-950/70 p-3">
             <div class="text-xs text-slate-400">结构字段提取</div>
-            <div class="mt-2 text-lg font-semibold">{{ data.recognition.metrics.field_records }} 条 · {{ percent(data.recognition.metrics.field_rate) }}</div>
-            <div class="text-xs text-slate-500">非空 fields_json / OCR done；不是准确率</div>
+            <div class="mt-2 text-lg font-semibold">{{ data.recognition.metrics.field_records }} 条 · {{ data.recognition.metrics.field_value_count }} 个字段值</div>
+            <div class="text-xs text-slate-500">非空 fields_json / OCR done {{ percent(data.recognition.metrics.field_rate) }}；不是准确率</div>
           </article>
           <article class="rounded-xl bg-slate-950/70 p-3">
             <div class="text-xs text-slate-400">进入 Listing 或审核</div>
-            <div class="mt-2 text-lg font-semibold">{{ data.recognition.metrics.business_involved }} 条</div>
-            <div class="text-xs text-slate-500">Listing {{ data.recognition.metrics.listing_linked }} · 人工分类审核 {{ data.recognition.metrics.review_involved }}</div>
+            <div class="mt-2 text-lg font-semibold">{{ data.recognition.metrics.ocr_adopted }} 条 · {{ percent(data.recognition.metrics.ocr_adoption_rate) }}</div>
+            <div class="text-xs text-slate-500">按 OCR done 记录计算；Listing {{ data.recognition.metrics.listing_linked }} · 人工分类审核 {{ data.recognition.metrics.review_involved }}</div>
           </article>
           <article class="rounded-xl bg-slate-950/70 p-3">
             <div class="text-xs text-slate-400">人工分类纠错</div>
@@ -146,6 +146,11 @@ function processingLabel(image) {
             <div class="text-xs text-slate-400">按来源模式映射的消息量</div>
             <div class="mt-2 text-sm font-semibold">Legacy {{ data.recognition.metrics.legacy_messages }} · Active {{ data.recognition.metrics.active_messages }} · Shadow {{ data.recognition.metrics.shadow_messages }}</div>
             <div class="text-xs text-slate-500">done/dropped：{{ data.recognition.metrics.legacy_processed_messages }} / {{ data.recognition.metrics.active_processed_messages }} / {{ data.recognition.metrics.shadow_processed_messages }}；Active 解析审计 {{ data.recognition.metrics.active_runs }} 次</div>
+          </article>
+          <article class="rounded-xl bg-slate-950/70 p-3">
+            <div class="text-xs text-slate-400">新旧规则差异（Shadow）</div>
+            <div class="mt-2 text-lg font-semibold">{{ data.recognition.metrics.shadow_differences }} / {{ data.recognition.metrics.shadow_comparisons }}</div>
+            <div class="text-xs text-slate-500">近 30 天有差异的对比数 / 总对比数；不是准确率</div>
           </article>
         </div>
 

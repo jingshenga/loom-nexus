@@ -64,6 +64,7 @@ required = {
     ("/api/admin/rules/active-review-queue/{queue_id}/resolve", "POST"),
     ("/api/admin/rules/active-review-queue/{queue_id}/requeue", "POST"),
     ("/api/admin/models", "GET"),
+    ("/api/admin/models/classifier-engine", "PUT"),
     ("/api/admin/models/vision4/upload", "POST"),
     ("/api/admin/models/{version_id}/predict", "POST"),
     ("/api/admin/dashboard", "GET"),
@@ -124,6 +125,8 @@ SELECT object_name FROM (VALUES
  ('table:rule_active_ocr_rechecks', to_regclass('public.rule_active_ocr_rechecks') IS NOT NULL),
  ('table:vision4_model_versions', to_regclass('public.vision4_model_versions') IS NOT NULL),
  ('table:vision4_model_events', to_regclass('public.vision4_model_events') IS NOT NULL),
+ ('table:active_router_guard_state', to_regclass('public.active_router_guard_state') IS NOT NULL),
+ ('table:ocr_classifier_engine_events', to_regclass('public.ocr_classifier_engine_events') IS NOT NULL),
  ('safety:legacy_raw_requeue_trigger_absent', NOT EXISTS (
    SELECT 1 FROM pg_trigger t WHERE t.tgrelid=to_regclass('public.listing_media_ocr')
      AND t.tgname='trg_active_raw_after_ocr' AND NOT t.tgisinternal)),

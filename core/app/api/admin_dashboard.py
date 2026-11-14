@@ -38,6 +38,7 @@ async def _recognition_overview(pool, request: Request, now: datetime) -> dict:
         "(NULLIF(BTRIM(raw_text),'') IS NOT NULL OR NULLIF(BTRIM(normalized_text),'') IS NOT NULL)) AS text_records, "
         "COUNT(*) FILTER (WHERE fields_json IS NOT NULL AND fields_json <> '{}'::jsonb "
         "AND fields_json <> '[]'::jsonb) AS field_records, "
+        "SUM(CASE WHEN jsonb_typeof(fields_json)='object' THEN jsonb_object_length(fields_json) ELSE 0 END) AS field_value_count, "
         "COUNT(*) FILTER (WHERE predicted_model_version IS NOT NULL) AS vision4_calls, "
         "COUNT(*) FILTER (WHERE classifier_version_id=2) AS classifier_v2_calls, "
         "COUNT(*) FILTER (WHERE human_classification IS NOT NULL AND predicted_classification IS NOT NULL) AS labeled_records, "
@@ -59,6 +60,10 @@ async def _recognition_overview(pool, request: Request, now: datetime) -> dict:
         "SELECT COUNT(*) AS runs, COUNT(*) FILTER (WHERE "
         "jsonb_array_length(COALESCE(result_json->'selected_rule_ids','[]'::jsonb)) > 0) AS rule_hits "
         "FROM rule_parse_runs WHERE run_reason='active' AND created_at >= $1", start,
+    )
+    shadow_stats = await pool.fetchrow(
+        "SELECT COUNT(*) AS comparisons,COUNT(*) FILTER (WHERE changed IS TRUE) AS differences "
+        "FROM rule_shadow_comparisons WHERE observed_at >= $1", start,
     )
     # Legacy does not persist a per-message parser run. Attribute ingress by the
     # mode audit effective at Telegram posted_at, and disclose that distinction.
@@ -191,7 +196,11 @@ async def _recognition_overview(pool, request: Request, now: datetime) -> dict:
             "vision4_calls": stats["vision4_calls"], "classifier_v2_calls": stats["classifier_v2_calls"],
             "ocr_text_records": stats["text_records"], "ocr_done": stats["ocr_done"],
             "field_records": stats["field_records"],
+            "field_value_count": stats["field_value_count"] or 0,
             "field_rate": round(stats["field_records"] * 100 / stats["ocr_done"], 1) if stats["ocr_done"] else 0,
+            "ocr_adopted": stats["business_involved"],
+            "ocr_adoption_rate": round(stats["business_involved"] * 100 / stats["ocr_done"], 1)
+            if stats["ocr_done"] else 0,
             "business_involved": stats["business_involved"], "listing_linked": stats["listing_linked"],
             "not_business_involved": stats["ocr_records"] - stats["business_involved"],
             "no_flow_not_required": stats["no_flow_not_required"],
@@ -200,6 +209,8 @@ async def _recognition_overview(pool, request: Request, now: datetime) -> dict:
             "correction_rate": round(stats["corrected_records"] * 100 / stats["labeled_records"], 1)
             if stats["labeled_records"] else 0,
             "active_runs": active_runs["runs"], "active_rule_hits": active_runs["rule_hits"],
+            "shadow_comparisons": shadow_stats["comparisons"],
+            "shadow_differences": shadow_stats["differences"],
             "legacy_messages": mode_counts.get("legacy", {}).get("messages", 0),
             "legacy_processed_messages": mode_counts.get("legacy", {}).get("processed", 0),
             "active_messages": mode_counts.get("active", {}).get("messages", 0),
@@ -212,6 +223,9 @@ async def _recognition_overview(pool, request: Request, now: datetime) -> dict:
             "vision4_calls": "listing_media_ocr.predicted_model_version 非空的持久化分类结果，不等同于模型加载次数",
             "classifier_v2_calls": "classifier_version_id=2 的持久化预测结果",
             "field_rate": "OCR done 记录中 fields_json 非空占比，不代表字段准确率",
+            "ocr_adoption_rate": "OCR done 记录中关联 Listing 或进入图片人工分类审核的比例，不代表字段准确率",
+            "field_value_count": "OCR done 记录 fields_json 对象的键数量总和，不代表字段准确性",
+            "shadow_differences": "近 30 天 Shadow 对比 changed=true 的次数；仅作新旧差异，不代表新流程更准确",
             "correction_rate": "存在人工分类标签的记录中，人工分类与模型预测不同的比例，不是字段纠错率",
             "business_involved": "有直接/消息关联 Listing，或 review_status 为 pending/confirmed/not_card 的去重记录数",
             "mode_messages": "按来源模式审计事件映射到 Telegram posted_at；Legacy 没有逐消息 parser-run 审计，Active 实际执行数另列 rule_parse_runs",

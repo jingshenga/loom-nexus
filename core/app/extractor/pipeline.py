@@ -236,8 +236,36 @@ class Extractor:
             rechecks = await self._pool.fetch(SQL_OCR_RECHECK_CLAIM, batch_size)
             for task in rechecks:
                 await self._process_ocr_recheck(task)
+            await self._rollback_sources_with_stale_guard()
             if not rows and not rechecks:
                 await _sleep(stop, idle_s)
+
+    async def _rollback_sources_with_stale_guard(self):
+        """Revoke Active independently if the supervisor heartbeat disappears."""
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.fetchval("SELECT pg_advisory_xact_lock($1)", 814271002)
+                sources = await conn.fetch(
+                    "SELECT s.id,s.router_mode,g.heartbeat_at,g.health_status "
+                    "FROM ingest_sources s LEFT JOIN active_router_guard_state g ON g.source_id=s.id "
+                    "WHERE s.router_mode='active' AND (g.source_id IS NULL "
+                    "OR g.health_status<>'healthy' OR g.heartbeat_at<NOW()-INTERVAL '90 seconds') "
+                    "FOR UPDATE OF s"
+                )
+                for source in sources:
+                    await conn.execute(
+                        "UPDATE ingest_sources SET router_mode='legacy' WHERE id=$1", source["id"],
+                    )
+                    await conn.execute(
+                        "INSERT INTO rule_router_mode_events(source_id,previous_mode,new_mode,actor_user_id) "
+                        "VALUES($1,$2,'legacy',NULL)", source["id"], source["router_mode"],
+                    )
+                    await conn.execute(
+                        "UPDATE active_router_guard_state SET active_started_at=NULL,"
+                        "active_baseline_json='{}'::jsonb,last_rollback_reason='guard_heartbeat_stale',"
+                        "updated_at=NOW() WHERE source_id=$1", source["id"],
+                    )
+                    logger.error("Active source %s returned to Legacy: supervisor heartbeat stale", source["id"])
 
     async def _process_one(self, row) -> None:
         raw_id = row["raw_id"]
@@ -491,6 +519,18 @@ class Extractor:
             if mode != "active":
                 return None
             settings = get_settings()
+            guard_ok = await self._pool.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM active_router_guard_state "
+                "WHERE source_id=$1 AND health_status='healthy' "
+                "AND active_started_at IS NOT NULL "
+                "AND heartbeat_at >= NOW()-INTERVAL '90 seconds')",
+                row["source_id"],
+            )
+            if not guard_ok:
+                await self._rollback_sources_with_stale_guard()
+                return {"review_reason": "active_guard_unavailable", "result": {
+                    "reason": "active_guard_unavailable", "trace": [], "conflicts": [],
+                }}
             if not active_source_allowed(
                 row["source_id"], enabled=settings.active_router_enabled,
                 allowed_source_ids=settings.active_router_source_ids,
@@ -770,8 +810,16 @@ class Extractor:
             mode = await self._pool.fetchval(
                 "SELECT router_mode FROM ingest_sources WHERE id=$1", task["source_id"],
             )
+            guard_ok = await self._pool.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM active_router_guard_state "
+                "WHERE source_id=$1 AND health_status='healthy' "
+                "AND active_started_at IS NOT NULL "
+                "AND heartbeat_at >= NOW()-INTERVAL '90 seconds')",
+                task["source_id"],
+            )
             settings = get_settings()
             if (mode != "active" or int(row["mode_event_id"]) != int(task["mode_event_id"])
+                    or not guard_ok
                     or not settings.ocr_review_assist_enabled
                     or not active_source_allowed(
                         task["source_id"], enabled=settings.active_router_enabled,

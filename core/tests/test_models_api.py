@@ -96,6 +96,8 @@ class ModelPackageTests(unittest.TestCase):
         self.assertIn("/api/admin/models", paths)
         self.assertIn("/api/admin/models/vision4/upload", paths)
         self.assertIn("/api/admin/models/{version_id}/predict", paths)
+        self.assertIn("/api/admin/models/classifier-engine", paths)
+        self.assertIn("put", paths["/api/admin/models/classifier-engine"])
         # FastAPI stores included routers lazily; inspect the router-level
         # admin dependency instead of relying on eager app.routes expansion.
         self.assertTrue(models.router.dependencies)

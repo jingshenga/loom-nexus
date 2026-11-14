@@ -13,6 +13,7 @@ const selectedFile = ref(null);
 const testFiles = ref([]);
 const testVersionId = ref("");
 const testResults = ref([]);
+const selectedEngine = ref("vision4");
 const readyVersions = computed(() => inventory.value?.vision4?.installed?.filter((x) => x.status === "ready" || x.status === "rollback") || []);
 
 async function load() {
@@ -23,6 +24,7 @@ async function load() {
     ]);
     inventory.value = models;
     classifierVersions.value = versions.items || [];
+    selectedEngine.value = models.primary_classifier?.engine || "vision4";
     if (!testVersionId.value) {
       const active = models.vision4.installed?.find((item) => item.status === "active");
       testVersionId.value = String(active?.id || models.vision4.installed?.[0]?.id || "");
@@ -30,6 +32,20 @@ async function load() {
   } catch (e) { error.value = e.message || "模型状态读取失败"; }
 }
 onMounted(load);
+
+async function saveEngine() {
+  if (busy.value || !selectedEngine.value) return;
+  busy.value = true; error.value = ""; notice.value = "";
+  try {
+    const result = await api("/api/admin/models/classifier-engine", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ engine: selectedEngine.value }),
+    });
+    notice.value = `主分类引擎已从 ${result.previous_engine} 切换为 ${result.engine}，操作已记入审计。`;
+    await load();
+  } catch (e) { error.value = e.message || "主分类引擎切换失败"; }
+  finally { busy.value = false; }
+}
 
 function selectFile(event) { selectedFile.value = event.target.files?.[0] || null; }
 function selectTestFiles(event) { testFiles.value = Array.from(event.target.files || []); testResults.value = []; }
@@ -92,6 +108,17 @@ function pretty(value) { return value ? new Date(value).toLocaleString("zh-CN", 
     <section v-if="inventory" class="grid gap-4 xl:grid-cols-3">
       <article class="min-w-0 rounded-2xl border border-slate-800 bg-slate-900 p-5">
         <div class="flex items-start justify-between gap-3"><div><div class="text-xs font-semibold uppercase tracking-wide text-sky-400">A · Vision4 ONNX</div><h2 class="mt-2 text-lg font-semibold">图片分类推理</h2></div><Cpu class="size-5 text-sky-400" /></div>
+        <div class="mt-4 rounded-xl border border-sky-900/60 bg-slate-950/60 p-3">
+          <label class="text-xs text-slate-400" for="primary-classifier">图片主分类引擎</label>
+          <div class="mt-2 flex flex-wrap gap-2">
+            <select id="primary-classifier" v-model="selectedEngine" class="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm">
+              <option value="vision4">Vision4 ONNX</option>
+              <option value="legacy">站内分类器 #2 / 传统分类回退</option>
+            </select>
+            <button class="rounded-lg bg-sky-700 px-3 py-2 text-sm text-white disabled:opacity-50" :disabled="busy || selectedEngine === inventory.primary_classifier.engine" @click="saveEngine">保存并审计</button>
+          </div>
+          <p class="mt-2 text-xs text-slate-500">当前配置：{{ inventory.primary_classifier.engine }} · 启用后仅影响之后处理的新图片，已保存的 OCR 结果不会重跑。</p>
+        </div>
         <dl class="mt-4 space-y-2 text-sm"><div class="flex justify-between gap-3"><dt class="text-slate-400">当前版本</dt><dd class="break-all text-right">{{ inventory.vision4.version || "未知" }}</dd></div><div class="flex justify-between gap-3"><dt class="text-slate-400">运行状态</dt><dd>{{ inventory.vision4.runtime_status }}<span v-if="inventory.vision4.runtime_error" class="ml-2 break-all text-rose-300">{{ inventory.vision4.runtime_error }}</span></dd></div><div class="flex justify-between gap-3"><dt class="text-slate-400">模式</dt><dd>{{ inventory.vision4.mode }}</dd></div><div class="flex justify-between gap-3"><dt class="text-slate-400">加载耗时</dt><dd>{{ inventory.vision4.load_ms ?? "—" }} ms</dd></div><div class="flex justify-between gap-3"><dt class="text-slate-400">最近启用</dt><dd class="text-right">{{ pretty(inventory.vision4.activated_at) }}</dd></div><div class="flex justify-between gap-3"><dt class="text-slate-400">模型 SHA-256</dt><dd class="max-w-[62%] break-all text-right font-mono text-xs">{{ inventory.vision4.sha256 || "未加载" }}</dd></div></dl>
         <div class="mt-3 break-all text-xs text-slate-500">模型路径：{{ inventory.vision4.model_path }}</div>
         <div class="mt-3 flex flex-wrap gap-1.5"><span v-for="category in inventory.vision4.categories" :key="category.category" class="rounded-full bg-slate-800 px-2 py-1 text-xs">{{ category.category_zh || category.category }}</span></div>
@@ -149,6 +176,10 @@ function pretty(value) { return value ? new Date(value).toLocaleString("zh-CN", 
     <section v-if="inventory?.vision4?.events?.length" class="rounded-2xl border border-slate-800 bg-slate-900 p-5">
       <h2 class="mb-3 font-semibold">模型操作审计</h2>
       <div class="overflow-x-auto"><table class="w-full min-w-[560px] text-left text-sm"><thead class="text-xs text-slate-500"><tr><th class="pb-2">时间</th><th class="pb-2">版本</th><th class="pb-2">操作</th><th class="pb-2">管理员 ID</th></tr></thead><tbody><tr v-for="event in inventory.vision4.events" :key="event.id" class="border-t border-slate-800"><td class="py-2">{{ pretty(event.created_at) }}</td><td class="py-2">{{ event.version_key || "—" }}</td><td class="py-2">{{ event.action }}</td><td class="py-2">{{ event.actor_id }}</td></tr></tbody></table></div>
+    </section>
+    <section v-if="inventory?.primary_classifier?.events?.length" class="rounded-2xl border border-slate-800 bg-slate-900 p-5">
+      <h2 class="mb-3 font-semibold">主分类引擎切换审计</h2>
+      <div class="overflow-x-auto"><table class="w-full min-w-[520px] text-left text-sm"><thead class="text-xs text-slate-500"><tr><th class="pb-2">时间</th><th class="pb-2">旧引擎</th><th class="pb-2">新引擎</th><th class="pb-2">管理员 ID</th></tr></thead><tbody><tr v-for="event in inventory.primary_classifier.events" :key="event.id" class="border-t border-slate-800"><td class="py-2">{{ pretty(event.created_at) }}</td><td class="py-2">{{ event.previous_engine || "—" }}</td><td class="py-2">{{ event.new_engine }}</td><td class="py-2">{{ event.actor_user_id }}</td></tr></tbody></table></div>
     </section>
     <p class="flex items-center gap-2 text-xs text-slate-500"><Check class="size-3 text-emerald-400" />模型仅通过管理员 API 操作；Web Core 不具有 Docker 管理权限，安装成功不会自动切换线上模型。</p>
   </div>

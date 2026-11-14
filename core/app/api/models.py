@@ -11,6 +11,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from pydantic import BaseModel, Literal
 
 from app import db
 from app.api.auth import current_user_id, require_admin
@@ -222,6 +223,13 @@ async def model_inventory(request: Request) -> dict:
         "FROM vision4_model_events e LEFT JOIN vision4_model_versions v ON v.id=e.model_version_id "
         "ORDER BY e.created_at DESC,e.id DESC LIMIT 30"
     )
+    engine_row = await pool.fetchrow(
+        "SELECT value FROM app_settings WHERE key='ocr_classifier_engine'"
+    )
+    engine_events = await pool.fetch(
+        "SELECT e.id,e.previous_engine,e.new_engine,e.actor_user_id,e.created_at "
+        "FROM ocr_classifier_engine_events e ORDER BY e.created_at DESC,e.id DESC LIMIT 20"
+    )
     ocr = await pool.fetchrow(
         "SELECT count(*) FILTER (WHERE status='done') AS done, "
         "count(*) FILTER (WHERE status='failed') AS failed, "
@@ -248,6 +256,12 @@ async def model_inventory(request: Request) -> dict:
             "installed": [dict(row) for row in installed],
             "events": [dict(row) for row in events],
         },
+        "primary_classifier": {
+            "engine": engine_row["value"] if engine_row else (
+                "vision4" if settings.vision4_mode == "active" else "legacy"
+            ),
+            "events": [dict(row) for row in engine_events],
+        },
         "ocr_classifier": {"endpoint": "/admin/ocr-classifier", "api": "/api/admin/ocr-classifier/versions"},
         "rapidocr": {
             "engine_version": ENGINE_VERSION,
@@ -258,6 +272,42 @@ async def model_inventory(request: Request) -> dict:
             "last_processed_at": ocr["last_processed_at"].isoformat() if ocr["last_processed_at"] else None,
         },
     }
+
+
+class ClassifierEngineBody(BaseModel):
+    engine: Literal["vision4", "legacy"]
+
+
+@router.put("/classifier-engine")
+async def set_classifier_engine(
+    body: ClassifierEngineBody, request: Request, authorization: str = Header(default=""),
+) -> dict:
+    pool = _pool()
+    actor_id = current_user_id(authorization)
+    if body.engine == "vision4":
+        processor = getattr(request.app.state, "media_ocr_processor", None)
+        classifier = processor._vision4 if processor else None
+        if not classifier or classifier._session is None or classifier._load_error:
+            raise HTTPException(status_code=409, detail="Vision4 当前未成功加载，不能设为主分类引擎")
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.fetchval("SELECT pg_advisory_xact_lock($1)", 814271003)
+            previous = await conn.fetchval(
+                "SELECT value FROM app_settings WHERE key='ocr_classifier_engine' FOR UPDATE"
+            )
+            if previous is None:
+                previous = "vision4" if get_settings().vision4_mode == "active" else "legacy"
+            if previous != body.engine:
+                await conn.execute(
+                    "INSERT INTO app_settings(key,value,updated_at) VALUES('ocr_classifier_engine',$1,NOW()) "
+                    "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=NOW()",
+                    body.engine,
+                )
+                await conn.execute(
+                    "INSERT INTO ocr_classifier_engine_events(previous_engine,new_engine,actor_user_id) "
+                    "VALUES($1,$2,$3)", previous, body.engine, actor_id,
+                )
+    return {"previous_engine": previous, "engine": body.engine, "actor_user_id": actor_id}
 
 
 @router.post("/vision4/upload", status_code=201)
