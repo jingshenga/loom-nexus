@@ -39,9 +39,11 @@ SQL_REGISTER = sqlres.load("register_account.sql")
 SQL_VERIFIED_BOT = sqlres.load("verified_bot_for_session.sql")
 SQL_SET_CHANNEL = sqlres.load("session_set_channel.sql")
 SQL_LIMIT_SET = sqlres.load("gateway_limit_set.sql")
+SQL_FLOOD_WAIT_SET = sqlres.load("account_flood_wait_set.sql")
 
 SIM_ACCOUNTS = ((6660001, "sim-alpha"), (6660002, "sim-beta"))
 POLL_S = float(os.getenv("NEXUS_BRIDGE_SEND_INTERVAL", "2"))
+ACCOUNT_REFRESH_S = 60
 
 BOT_RE = re.compile(r"(?:@|t\.me/)([A-Za-z0-9_]{4,32}bot)\b", re.IGNORECASE)
 
@@ -108,7 +110,7 @@ async def _sim_account_ids(pool: asyncpg.Pool) -> list:
 
 
 async def _real_account_ids(pool: asyncpg.Pool) -> list:
-    rows = await pool.fetch(sqlres.load("active_accounts.sql"))
+    rows = await pool.fetch(sqlres.load("active_sender_accounts.sql"))
     return [r["id"] for r in rows]
 
 
@@ -232,7 +234,14 @@ async def _send_real(pool, account_id, job) -> None:
         if error_kind in ("flood", "timeout"):
             # today this account messages strangers through bots only
             await pool.fetch(SQL_LIMIT_SET, account_id, "bot_first")
-        if not use_bot and error_kind in ("blocked", "privacy", "flood", "gone", "timeout"):
+        is_flood_wait = type(exc).__name__ == "FloodWaitError"
+        if is_flood_wait:
+            await pool.fetch(
+                SQL_FLOOD_WAIT_SET, account_id,
+                max(1, int(getattr(exc, "seconds", 1))),
+            )
+        if (not use_bot and not is_flood_wait
+                and error_kind in ("blocked", "privacy", "flood", "gone", "timeout")):
             bot = await _resolve_bot(pool, job["session_id"])
             if bot:
                 try:
@@ -266,23 +275,28 @@ async def _send_real(pool, account_id, job) -> None:
 async def run_sender(pool: asyncpg.Pool, stop: asyncio.Event) -> None:
     sim = os.getenv("NEXUS_BRIDGE_SIM", "0") == "1"
     send = _send_sim if sim else _send_real
-    try:
-        account_ids = (
-            await _sim_account_ids(pool) if sim else await _real_account_ids(pool)
-        )
-    except Exception as exc:
-        logger.error("sender cannot resolve accounts: %s", exc)
-        await stop.wait()
-        return
-    if not account_ids and not sim:
-        logger.info("sender idle (no active gateway accounts yet)")
-    logger.info(
-        "sender loop started (mode=%s accounts=%d)",
-        "sim" if sim else "real", len(account_ids),
-    )
+    account_ids = []
+    refresh_at = 0.0
+    loop = asyncio.get_running_loop()
+    logger.info("sender loop started (mode=%s)", "sim" if sim else "real")
     while not stop.is_set():
         try:
-            for account_id in account_ids:
+            now = loop.time()
+            if now >= refresh_at:
+                try:
+                    refreshed = (
+                        await _sim_account_ids(pool)
+                        if sim else await _real_account_ids(pool)
+                    )
+                    if refreshed != account_ids:
+                        account_ids = refreshed
+                        logger.info("sender active accounts refreshed (%d)", len(account_ids))
+                except Exception:
+                    logger.exception(
+                        "sender account refresh failed; retaining last safe account set"
+                    )
+                refresh_at = loop.time() + ACCOUNT_REFRESH_S
+            for account_id in tuple(account_ids):
                 jobs = await pool.fetch(SQL_CLAIM, account_id)
                 for job in jobs:
                     logger.info(
@@ -301,7 +315,7 @@ async def run_sender(pool: asyncpg.Pool, stop: asyncio.Event) -> None:
                                           "sender crashed on this job", None)
                         except Exception:
                             logger.exception("finish after crash failed too")
-            await _sleep(stop, POLL_S)
+            await _sleep(stop, min(POLL_S, max(0.1, refresh_at - loop.time())))
             # clients are owned by the shared hub; nothing to tear down here
         except Exception:
             logger.exception("sender loop cycle failed; continuing")

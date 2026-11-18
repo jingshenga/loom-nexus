@@ -50,6 +50,18 @@ def _is_user(entity) -> bool:
     return type(entity).__name__ == "User"
 
 
+def _username_matches(entity, username: str) -> bool:
+    wanted = (username or "").strip().lstrip("@").lower()
+    if not wanted:
+        return False
+    names = {getattr(entity, "username", None)}
+    names.update(
+        getattr(item, "username", None)
+        for item in (getattr(entity, "usernames", None) or [])
+    )
+    return wanted in {name.lower() for name in names if isinstance(name, str)}
+
+
 async def _fresh_statuses(client, entities: list) -> dict:
     """One users.getUsers round-trip per chunk for up-to-date statuses
     (session-cached entities would otherwise replay stale status)."""
@@ -69,8 +81,8 @@ async def _fresh_statuses(client, entities: list) -> dict:
             logger.warning("batched status fetch failed: %s", exc)
             continue
         for user in users:
-            if user is not None:
-                statuses[user.id] = user.status
+            if user is not None and _is_user(user):
+                statuses[user.id] = getattr(user, "status", None)
     return statuses
 
 
@@ -111,24 +123,46 @@ async def run_presence(pool: asyncpg.Pool, stop: asyncio.Event) -> None:
                         entity = await client.get_entity(
                             known_peer if known_peer else username,
                         )
+                        if not _is_user(entity):
+                            logger.info(
+                                "presence ignored non-user entity (%s)",
+                                type(entity).__name__,
+                            )
+                            continue
+                        entity_id = getattr(entity, "id", None)
+                        if not isinstance(entity_id, int) or entity_id <= 0:
+                            logger.info("presence ignored User without a valid id")
+                            continue
+                        if known_peer is None and _username_matches(entity, username):
+                            await pool.fetch(SQL_BIND, username, entity_id)
+                        elif known_peer is not None and known_peer != entity_id:
+                            logger.warning(
+                                "presence kept stored peer id after a mismatched resolution"
+                            )
+                            continue
+                        resolved.append((username, entity))
                     except Exception as exc:
                         logger.info(
-                            "presence resolve failed for @%s: %s",
-                            username, str(exc)[:80],
+                            "presence contact resolution failed (%s)",
+                            type(exc).__name__,
                         )
-                        continue
-                    if known_peer != entity.id:
-                        # first resolution (or changed id): cache it
-                        await pool.fetch(SQL_BIND, username, entity.id)
-                    resolved.append((username, entity))
                 statuses = await _fresh_statuses(
                     client, [e for _u, e in resolved],
                 )
                 tiers = {}
                 for username, entity in resolved:
-                    tier = _tier(statuses.get(entity.id, entity.status))
-                    tiers[tier] = tiers.get(tier, 0) + 1
-                    await pool.fetch(SQL_UPSERT, entity.id, username, tier)
+                    try:
+                        entity_id = entity.id
+                        tier = _tier(statuses.get(
+                            entity_id, getattr(entity, "status", None),
+                        ))
+                        await pool.fetch(SQL_UPSERT, entity_id, username, tier)
+                        tiers[tier] = tiers.get(tier, 0) + 1
+                    except Exception as exc:
+                        logger.warning(
+                            "presence contact update failed (%s)",
+                            type(exc).__name__,
+                        )
                 logger.info(
                     "presence checked %d contact(s): %s",
                     len(resolved),
