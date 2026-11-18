@@ -17,11 +17,19 @@ trap 'rm -rf "$STAGE"' EXIT
 
 git -C "$ROOT" archive --format=tar "$COMMIT" \
   scripts/nexus-release-entrypoint.sh \
+  scripts/build-nexus-bridge-overlay.sh \
   scripts/nexus_active_guard.py \
   scripts/test_nexus_active_guard.py \
   scripts/check_admin_feature_manifest.py \
   scripts/admin-feature-manifest.json \
   scripts/migrations \
+  scripts/test_nexus_collection_plan.sql \
+  scripts/test_nexus_checkin_stage.sql \
+  scripts/test_nexus_bot_precheck.sql \
+  scripts/test_nexus_collection_ocr_postgres.py \
+  bridge/Dockerfile.release-overlay \
+  bridge/runner \
+  bridge/tests \
   core/app \
   core/tests \
   core/frontend \
@@ -38,7 +46,7 @@ Nexus V3 one-shot NAS release package
 
 Prerequisite: the NAS project must be /volume3/docker/nexus, the running
 Core must be healthy and all sources must be Legacy when the release starts.
-The build uses the live Core Image ID observed immediately before building.
+The build uses the live Core and Bridge Image IDs observed before building.
 Docker Compose and PostgreSQL 16 client tools must be available.
 
 After extracting this package on the NAS, run this single command from its
@@ -49,20 +57,18 @@ root directory:
 The entrypoint verifies all package files before starting the release gate.
 The release script will not restart or extend an Active Guard; it stops while
 any source is Active. It snapshots Compose,
-the current Core image, database, and key queue/listing state, then applies
-only the listed idempotent migrations and updates Core from the canonical
-core/app and core/frontend sources. It does not rebuild
-Bridge or PostgreSQL, change Vision4 weights, enable Active, or modify
-production rules and Listings. Failures after Core replacement restore the
-previous Compose and Core image. Database DDL is intentionally retained on
-rollback because it is forward-compatible.
+the current Core and Bridge images, database, and key queue/listing state.
+It applies the listed additive migrations and deploys the canonical Core,
+Bridge and Guard sources in one release. PostgreSQL, Vision4 weights, and
+source rules are preserved. Failures restore the previous Compose, Core,
+Bridge and Guard; forward-compatible database DDL is retained.
 
 Keep this package and the printed backup directory until browser and API
-acceptance is complete. Active and OCR assist remain disabled by default.
+acceptance is complete. Source modes and runtime settings are preserved.
 EOF
 (
   cd "$STAGE"
-  find . -type f ! -name SHA256SUMS.source ! -name .nexus-release-commit -print0 \
+  find . -type f ! -name SHA256SUMS.source -print0 \
     | LC_ALL=C sort -z \
     | xargs -0 sha256sum > SHA256SUMS.source
 )
