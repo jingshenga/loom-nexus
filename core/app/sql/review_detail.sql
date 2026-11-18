@@ -7,7 +7,7 @@ SELECT l.id, l.nickname, l.district, l.price_amount, l.price_currency,
                               WHEN ir.rule_type = 'profile_collection' THEN 'TG号采集 V2'
                               WHEN l.duty_collection_job_id IS NOT NULL
                               THEN 'Telegram 个人资料/关联频道' END) AS source_title,
-       rm.posted_at AS raw_posted_at
+       rm.posted_at AS raw_posted_at, l.source_msg_id, l.profile_collection_job_id
 FROM listings l
 LEFT JOIN raw_messages rm ON rm.id = l.source_msg_id
 LEFT JOIN ingest_sources s ON s.id = rm.source_id

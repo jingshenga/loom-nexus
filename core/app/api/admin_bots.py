@@ -21,7 +21,7 @@ class BotDecision(BaseModel):
 
 @router.get("")
 async def list_bot_results(
-    status: str = Query(default="all"), limit: int = 100, offset: int = 0,
+    status: str = Query(default="all"), limit: int = 100, offset: int = 0, job_id: int | None = None,
 ) -> dict:
     if status not in {"all", "unverified", "verified", "unrelated", "unavailable", "no_bot", "needs_review"}:
         raise HTTPException(status_code=400, detail="invalid status")
@@ -42,10 +42,10 @@ async def list_bot_results(
         "OR ($1='needs_review' AND b.verification_status='unverified' AND j.status='needs_review') "
         "OR ($1='unverified' AND b.verification_status='unverified' "
         "AND (b.bot_url<>'' OR j.status='needs_review')) "
-        "OR ($1<>'unverified' AND b.verification_status=$1)) "
+        "OR ($1<>'unverified' AND b.verification_status=$1)) AND ($4::bigint IS NULL OR b.job_id=$4) "
         "ORDER BY CASE WHEN b.verification_status='unverified' AND (j.status='needs_review' OR NULLIF(b.bot_url,'') IS NOT NULL) THEN 0 ELSE 1 END, "
         "b.collected_at DESC,b.job_id DESC LIMIT $2 OFFSET $3",
-        status, max(1, min(limit, 200)), max(0, offset),
+        status, max(1, min(limit, 200)), max(0, offset), job_id,
     )
     items = []
     for row in rows:

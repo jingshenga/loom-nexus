@@ -1,10 +1,13 @@
 <script setup>
 import { computed, onMounted, ref } from "vue";
+import { useRoute } from "vue-router";
 import { Check, CircleOff, RefreshCw, ShieldAlert } from "lucide-vue-next";
 import AdminTabs from "../components/AdminTabs.vue";
 import { api, mediaUrl } from "../api/client";
 
 const items = ref([]);
+const route = useRoute();
+const initialItem = ref(/^\d+$/.test(String(route.query.item || "")) ? Number(route.query.item) : null);
 const selected = ref(null);
 const confirmedFieldsJson = ref("");
 const status = ref("open");
@@ -48,7 +51,11 @@ async function load() {
     const result = await api(`/api/admin/rules/active-review-queue?${query}`);
     items.value = result.items || [];
     counts.value = result.counts || { review: 0, unmatched: 0 };
-    if (selected.value && items.value.some(item => item.id === selected.value.id))
+    if (initialItem.value) {
+      const id = initialItem.value;
+      initialItem.value = null;
+      await openItem(id);
+    } else if (selected.value && items.value.some(item => item.id === selected.value.id))
       await openItem(selected.value.id);
     else if (items.value.length) await openItem(items.value[0].id);
     else selected.value = null;

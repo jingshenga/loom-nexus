@@ -43,7 +43,13 @@ const sortBy = ref("original");
 const sortThen = ref("none");
 const sortOrder = ref("newest");
 const recollectStatus = ref("");
-const activeWorkbench = ref("review");
+const activeWorkbench = ref("attention");
+const attention = ref({ groups: [], total_groups: 0 });
+const attentionSearch = ref("");
+const attentionSourceId = ref("");
+const attentionOffset = ref(0);
+const attentionBusy = ref(false);
+const comparisonFields = { nickname: "昵称", district: "区域", price_amount: "价格", price_currency: "币种", contact_username: "TG 账号" };
 const dutyRecovery = ref([]);
 const selectedRecovery = ref(null);
 const recoveryModalOpen = ref(false);
@@ -141,6 +147,7 @@ function uncertainMediaPaths() {
 }
 
 async function loadQueue(resetPage = false) {
+  if (activeWorkbench.value === "attention") return loadAttention(resetPage);
   if (resetPage) pageOffset.value = 0;
   const bucket = activeWorkbench.value === "checkin" ? "checkin_supplement"
     : activeWorkbench.value === "tgprofile" ? "tg_profile_v2" : "";
@@ -187,6 +194,37 @@ async function loadQueue(resetPage = false) {
   }
 }
 
+async function loadAttention(reset = false) {
+  if (reset) attentionOffset.value = 0;
+  attentionBusy.value = true;
+  try {
+    const query = new URLSearchParams({ limit: "20", offset: String(attentionOffset.value), search: attentionSearch.value });
+    if (attentionSourceId.value) query.set("source_id", attentionSourceId.value);
+    attention.value = await api(`/api/admin/review/attention?${query}`);
+  } catch (e) {
+    notify(e.message || "待判断记录加载失败");
+  } finally {
+    attentionBusy.value = false;
+  }
+}
+
+async function openAttentionCard(item) {
+  activeWorkbench.value = "review";
+  statusTab.value = item.status;
+  await loadQueue(true);
+  await select(item);
+}
+
+async function dismissCheckinAttention(item) {
+  if (!window.confirm(`将签到任务 #${item.id} 标为无需处理？`)) return;
+  try {
+    await api(`/api/admin/review/attention/checkin/${item.id}/dismiss`, { method: "POST" });
+    await loadAttention();
+  } catch (e) {
+    notify(e.message || "签到任务处理失败");
+  }
+}
+
 async function loadReviewSources() {
   const data = await api("/api/admin/review/sources");
   sourceOptions.value = data.items;
@@ -230,6 +268,7 @@ function changePage(delta) {
 function setWorkbench(value) {
   activeWorkbench.value = value;
   pageOffset.value = 0;
+  if (value === "attention") loadAttention(true);
   if (value === "duplicates") loadDuplicatePairs();
   if (["review", "checkin", "tgprofile"].includes(value)) loadQueue();
   if (value === "duty") loadDutyRecovery();
@@ -603,7 +642,7 @@ async function decide(action, target) {
 }
 
 function onKey(e) {
-  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") decide("publish");
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter" && current.value?.status === "pending") decide("publish");
 }
 
 const filteredDuplicatePairs = computed(() => duplicatePairs.value
@@ -639,6 +678,7 @@ onMounted(async () => {
   timer = setInterval(() => {
     if (document.visibilityState !== "visible") return;
     if (activeWorkbench.value === "duty") loadDutyRecovery();
+    else if (activeWorkbench.value === "attention") loadAttention();
     else if (activeWorkbench.value === "duplicates") loadDuplicatePairs();
     else if (["review", "checkin", "tgprofile"].includes(activeWorkbench.value)) loadQueue();
   }, 60000);
@@ -664,6 +704,7 @@ onUnmounted(() => {
 function onReviewVisibilityChange() {
   if (document.visibilityState !== "visible") return;
   if (["review", "checkin", "tgprofile"].includes(activeWorkbench.value)) loadQueue();
+  else if (activeWorkbench.value === "attention") loadAttention();
   else if (activeWorkbench.value === "duty") loadDutyRecovery();
   else if (activeWorkbench.value === "duplicates") loadDuplicatePairs();
 }
@@ -676,7 +717,8 @@ function onReviewVisibilityChange() {
       {{ flash }}
     </div>
 
-    <div class="flex gap-2">
+    <div class="flex flex-wrap gap-2">
+      <button @click="setWorkbench('attention')" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'attention' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">需要我判断</button>
       <button @click="setWorkbench('review')" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'review' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">审核队列</button>
       <RouterLink to="/admin/history" class="rounded-lg bg-slate-800 px-3 py-1.5 text-sm text-slate-300 hover:bg-slate-700">历史资料库</RouterLink>
       <button @click="activeWorkbench = 'duplicates'; loadDuplicatePairs()" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'duplicates' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">疑似重复</button>
@@ -685,7 +727,7 @@ function onReviewVisibilityChange() {
       <button @click="setWorkbench('duty')" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'duty' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">旧签到恢复（{{ dutyRecovery.length }}）</button>
     </div>
 
-    <div v-if="activeWorkbench !== 'review'" class="flex flex-wrap items-center gap-2 rounded-lg border border-slate-800 bg-slate-900/60 p-2">
+    <div v-if="!['review', 'attention'].includes(activeWorkbench)" class="flex flex-wrap items-center gap-2 rounded-lg border border-slate-800 bg-slate-900/60 p-2">
       <input v-model="nicknameFilter" placeholder="按昵称筛选" class="min-w-28 rounded-lg border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm" />
       <select v-model="sourceFilter" class="min-w-36 rounded-lg border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm">
         <option value="">全部采集群组</option>
@@ -701,7 +743,46 @@ function onReviewVisibilityChange() {
       <button @click="clearQueueFilters" class="rounded-lg px-2 py-1.5 text-xs text-slate-500">清除</button>
     </div>
 
-    <section v-if="activeWorkbench === 'duty'" class="space-y-4">
+    <section v-if="activeWorkbench === 'attention'" class="space-y-3">
+      <form class="grid gap-2 sm:grid-cols-3" @submit.prevent="loadAttention(true)">
+        <input v-model="attentionSearch" aria-label="搜索候选" maxlength="120" placeholder="昵称、TG 账号或来源" class="min-w-0 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm" />
+        <select v-model="attentionSourceId" aria-label="来源筛选" class="min-w-0 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm">
+          <option value="">全部来源</option>
+          <option v-for="source in sourceOptions" :key="source.id" :value="source.id">{{ source.title }}</option>
+        </select>
+        <button :disabled="attentionBusy" class="justify-self-start rounded-lg border border-slate-700 px-3 py-2 text-sm disabled:opacity-50">查找待处理组</button>
+      </form>
+      <p class="text-xs text-slate-400">{{ attention.total_groups }} 组。相同账号的候选集中显示，身份关联需人工确认。</p>
+      <details v-for="group in attention.groups" :key="group.subject" class="min-w-0 rounded-lg border border-slate-800 bg-slate-900/60 p-3">
+        <summary class="cursor-pointer break-words text-sm text-slate-200">
+          {{ group.items[0]?.label || group.items[0]?.contact_username || '待核对资料' }}
+          <span class="ml-1 text-xs text-slate-400">{{ group.items.length }} 条记录<span v-if="group.published_matches"> · {{ group.published_matches }} 张同账号已发布卡</span></span>
+        </summary>
+        <ul class="mt-3 space-y-2">
+          <li v-for="item in group.items" :key="item.kind + ':' + item.id" class="flex flex-wrap items-center gap-2 rounded-lg bg-slate-950/70 p-2 text-xs text-slate-300">
+            <span>{{ ({ listing: '卡片', rule: '规则待审', bot: 'Bot 核对', checkin: '签到异常' })[item.kind] }} #{{ item.id }}</span>
+            <span class="break-words text-slate-400">{{ item.source || '来源未标记' }}</span>
+            <button v-if="item.kind === 'listing'" @click="openAttentionCard(item)" class="rounded border border-slate-700 px-2 py-1 text-sky-200">{{ item.status === 'duplicate_pending' ? '查看疑似重复' : '审核卡片' }}</button>
+            <RouterLink v-else-if="item.kind === 'rule'" :to="{ path: '/admin/rule-review', query: { item: item.id } }" class="rounded border border-slate-700 px-2 py-1 text-sky-200">打开规则证据</RouterLink>
+            <RouterLink v-else-if="item.kind === 'bot'" :to="{ path: '/admin/bots', query: { item: item.id } }" class="rounded border border-slate-700 px-2 py-1 text-sky-200">核对 Bot</RouterLink>
+            <template v-else>
+              <span class="break-words text-amber-200">{{ ({ identity_conflict: '身份冲突', source_unverified: '来源无法验证',
+                  original_text_differs: '原帖正文有差异', original_revision_changed: '原帖修订已变化',
+                  closed_identity_reference: '只有已关闭的历史卡片' })[item.status] || '采集证据需核对' }}</span>
+              <button @click="dismissCheckinAttention(item)" class="rounded border border-slate-700 px-2 py-1">标记无需处理</button>
+            </template>
+          </li>
+        </ul>
+      </details>
+      <p v-if="!attentionBusy && !attention.groups.length" class="rounded-lg border border-slate-800 p-5 text-center text-sm text-slate-400">当前没有匹配的待处理组</p>
+      <div class="flex flex-wrap gap-2">
+        <button v-if="attentionOffset" @click="attentionOffset -= 20; loadAttention()" class="rounded border border-slate-700 px-3 py-1 text-xs">上一页</button>
+        <button v-if="attentionOffset + 20 < attention.total_groups" @click="attentionOffset += 20; loadAttention()" class="rounded border border-slate-700 px-3 py-1 text-xs">下一页</button>
+        <RouterLink to="/admin/lifecycle" class="rounded border border-slate-700 px-3 py-1 text-xs text-slate-300">状态变更审核</RouterLink>
+      </div>
+    </section>
+
+    <section v-else-if="activeWorkbench === 'duty'" class="space-y-4">
       <div class="grid grid-cols-3 gap-3 sm:grid-cols-4 lg:grid-cols-6 2xl:grid-cols-8">
         <button v-for="item in filteredDutyRecovery" :key="item.id" @click="selectRecovery(item)" class="min-w-0 overflow-hidden rounded-lg border border-slate-800 bg-slate-900 text-left hover:border-slate-600">
           <div class="relative flex aspect-[3/4] items-center justify-center bg-slate-950 text-3xl font-semibold text-slate-700">
@@ -789,6 +870,7 @@ function onReviewVisibilityChange() {
       <select v-model="statusTab" @change="selectedIds = []; loadQueue(true)"
         class="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm">
         <option value="pending">待审核</option>
+        <option value="duplicate_pending">疑似重复</option>
         <option value="published">已发布</option>
         <option value="rejected">已驳回</option>
         <option value="archived">已下架</option>
@@ -904,6 +986,27 @@ function onReviewVisibilityChange() {
         <div class="flex flex-wrap gap-2 text-xs text-slate-400"><span class="rounded bg-slate-900 px-2 py-1">媒体 {{ current.media?.length || 0 }} 个 · 有效媒体 {{ current.effective_media_count || 0 }} 个</span><RouterLink v-if="uncertainMediaPaths().length" :to="{ path: '/admin/ocr', query: { listing_id: current.id, media_path: uncertainMediaPaths(), status: 'all' } }" class="rounded bg-amber-950/60 px-2 py-1 text-amber-200 hover:bg-amber-900">含 AI 未确认媒体 · 点击直接核对 →</RouterLink></div>
         <AdminMediaGrid v-model:media="form.media" editable @order-change="mediaManualOrder = true" />
         <details class="rounded-lg border border-slate-800 bg-slate-950/60 p-3"><summary class="cursor-pointer text-sm text-slate-300">查看原始消息</summary><p class="mt-3 whitespace-pre-wrap text-sm leading-relaxed text-slate-400">{{ current.source_text || "（无正文）" }}</p></details>
+        <details v-if="current.ocr?.length" class="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+          <summary class="cursor-pointer text-sm text-slate-300">OCR 证据 · {{ current.ocr.length }} 张图</summary>
+          <div v-for="ocr in current.ocr" :key="ocr.id" class="mt-3 space-y-1 rounded bg-slate-900 p-2 text-xs">
+            <p class="text-slate-300">{{ ocr.classification || '未分类' }} · {{ ocr.engine_version || '版本未记录' }}</p>
+            <p v-for="(value, key) in ocr.fields_json" :key="key" class="break-words text-sky-200">{{ key }}：{{ value }}</p>
+            <p class="max-h-36 overflow-auto whitespace-pre-wrap break-words text-slate-400">{{ ocr.text || '无 OCR 正文' }}</p>
+            <RouterLink :to="{ path: '/admin/ocr', query: { media_path: ocr.media_path, status: 'all' } }" class="inline-flex text-sky-200 underline">查看图片和识别证据</RouterLink>
+          </div>
+        </details>
+        <details v-if="current.reference_cards?.length || current.bot_evidence?.length" class="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+          <summary class="cursor-pointer text-sm text-slate-300">已有卡片差异与 Bot 证据</summary>
+          <div v-for="reference in current.reference_cards" :key="reference.id" class="mt-3 text-xs text-slate-300">
+            <p>参考卡 #{{ reference.id }}<span v-if="reference.peer_conflict" class="ml-1 text-rose-300">Telegram 身份 ID 冲突</span></p>
+            <p v-for="change in reference.differences" :key="change.field" class="mt-1 break-words">{{ comparisonFields[change.field] || change.field }} · {{ change.current ?? '空' }} → {{ change.proposed ?? '空' }}</p>
+            <p v-if="!reference.differences.length" class="text-slate-500">关键字段一致</p>
+          </div>
+          <p v-for="bot in current.bot_evidence" :key="bot.job_id" class="mt-2 break-all text-xs text-slate-300">
+            Bot · {{ bot.bot_url || '无可用链接' }} · {{ bot.verification_status === 'verified' ? '已核验' : '待核验或未采用' }}
+            <RouterLink :to="{ path: '/admin/bots', query: { item: bot.job_id } }" class="ml-1 text-sky-200 underline">查看证据</RouterLink>
+          </p>
+        </details>
         <details class="rounded-lg border border-slate-800 bg-slate-950/60 p-3"><summary class="cursor-pointer text-sm text-slate-300">修订卡片字段</summary>
           <div class="mt-3 flex flex-wrap gap-1.5"><span v-for="(ev, field) in current.evidence" :key="field" class="rounded px-2 py-0.5 text-xs" :class="ev.src === 'ocr' ? 'bg-amber-600/20 text-amber-300' : 'bg-slate-800 text-slate-400'">{{ field }} · {{ ev.src }}</span></div>
           <div class="mt-3 grid gap-2 text-sm sm:grid-cols-2"><label>昵称<input v-model="form.nickname" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" /></label><label>城区<input v-model="form.district" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" /></label><label>价格<input v-model.number="form.price_amount" type="number" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" /></label><label>币种<input v-model="form.price_currency" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" /></label><label class="sm:col-span-2">TG号（填用户名，不含 @）<input v-model="form.contact_username" placeholder="例如 baitao431" spellcheck="false" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" /></label><label class="sm:col-span-2">Bot 用户名<span class="mt-1 flex rounded-lg border border-slate-700 bg-slate-950"><span class="flex items-center border-r border-slate-700 px-3 text-slate-500">https://t.me/</span><input v-model="listingBotUsername" placeholder="例如 xxxxxxbot" spellcheck="false" class="min-w-0 flex-1 bg-transparent px-3 py-2 outline-none" /></span></label><label class="sm:col-span-2">描述<textarea v-model="form.description" rows="4" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" /></label></div>

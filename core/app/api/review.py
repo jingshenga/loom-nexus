@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from app import db, sqlres
 from app.config import get_settings
 from app.api.auth import current_user_id, require_admin
+from app.extractor.ocr_fields import equivalent_field
 
 router = APIRouter(
     prefix="/api/admin/review", tags=["admin-review"],
@@ -41,6 +42,7 @@ SQL_DUTY_SCAN_ENQUEUE = sqlres.load("duty_recovery_scan_enqueue.sql")
 SQL_HISTORY_SOURCES = sqlres.load("history_library_sources.sql")
 SQL_HISTORY_MESSAGES = sqlres.load("history_library_messages.sql")
 SQL_HISTORY_TOTAL = sqlres.load("history_library_total.sql")
+SQL_ATTENTION_GROUPS = sqlres.load("review_attention_groups.sql")
 
 
 def _decode(value, fallback):
@@ -162,6 +164,35 @@ async def review_detail(listing_id: int) -> dict:
     row = await pool.fetchrow(SQL_REVIEW_DETAIL, listing_id)
     if row is None:
         raise HTTPException(status_code=404, detail="review card not found")
+    ocr = await pool.fetch(
+        "SELECT id,media_path,classification,review_status,status,confidence,engine_version,fields_json, "
+        "LEFT(raw_text,6000) AS text FROM listing_media_ocr "
+        "WHERE listing_id=$1 OR raw_id=$2 OR profile_result_id IN "
+        "(SELECT id FROM profile_collection_results WHERE job_id=$3) "
+        "ORDER BY media_path,id LIMIT 40", listing_id, row["source_msg_id"], row["profile_collection_job_id"],
+    )
+    references = await pool.fetch(
+        "SELECT id,nickname,district,price_amount,price_currency,contact_username,contact_peer_id FROM listings "
+        "WHERE id<>$1 AND status='published' AND (($2::bigint>0 AND contact_peer_id=$2) "
+        "OR (NULLIF($3::text,'') IS NOT NULL AND lower(contact_username)=lower($3))) "
+        "ORDER BY published_at DESC NULLS LAST,id DESC LIMIT 3", listing_id, row["contact_peer_id"], row["contact_username"],
+    )
+    reference_cards = []
+    for reference in references:
+        differences = []
+        for field in ("nickname", "district", "price_amount", "price_currency", "contact_username"):
+            key = "username" if field == "contact_username" else field
+            if row[field] != reference[field] and not equivalent_field(key, row[field], reference[field]):
+                differences.append({"field": field, "current": reference[field], "proposed": row[field]})
+        reference_cards.append({"id": reference["id"], "differences": differences,
+                                "peer_conflict": bool(row["contact_peer_id"] and reference["contact_peer_id"]
+                                                      and row["contact_peer_id"] != reference["contact_peer_id"])})
+    bots = await pool.fetch(
+        "SELECT job_id,bot_url,verification_status,discovery_json->>'outcome' AS outcome "
+        "FROM bot_collection_results WHERE lower(contact_username)=lower($1) "
+        "ORDER BY (verification_status='verified') DESC,collected_at DESC,job_id DESC LIMIT 5",
+        row["contact_username"],
+    )
     return {
         "id": row["id"], "nickname": row["nickname"], "district": row["district"],
         "price_amount": float(row["price_amount"]) if row["price_amount"] is not None else None,
@@ -176,7 +207,44 @@ async def review_detail(listing_id: int) -> dict:
         "created_at": row["created_at"].isoformat(), "source_text": row["raw_text"],
         "source_title": row["source_title"],
         "source_posted_at": row["raw_posted_at"].isoformat() if row["raw_posted_at"] else None,
+        "ocr": [{**dict(item), "fields_json": _decode(item["fields_json"], {})} for item in ocr],
+        "reference_cards": reference_cards,
+        "bot_evidence": [dict(item) for item in bots],
     }
+
+
+@router.get("/attention")
+async def attention_groups(
+    source_id: int | None = None, search: str = "", limit: int = 40, offset: int = 0,
+) -> dict:
+    from app.api.rules import SQL_ACTIVE_REVIEW_CLASSIFIED_CTE
+
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    rows = await pool.fetch(SQL_ACTIVE_REVIEW_CLASSIFIED_CTE + SQL_ATTENTION_GROUPS,
+                            source_id, search.strip()[:120] or None, max(1,min(100,limit)), max(0,offset))
+    return {"total_groups": rows[0]["total_groups"] if rows else 0,
+            "groups": [{"subject": row["subject"], "items": _decode(row["items"], []),
+                        "published_matches": row["published_matches"]} for row in rows]}
+
+
+@router.post("/attention/checkin/{job_id}/dismiss")
+async def dismiss_checkin_attention(job_id: int, authorization: str = Header(default="")) -> dict:
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    actor = current_user_id(authorization)
+    dismissed = await pool.fetchval(
+        "UPDATE profile_collection_jobs j SET status='skipped',stage='checked',updated_at=NOW(),"
+        "collection_plan_json=collection_plan_json || jsonb_build_object('review',jsonb_build_object("
+        "'action','dismiss','actor_user_id',$2::bigint,'at',NOW())) "
+        "FROM ingest_rules rule WHERE j.id=$1 AND j.rule_id=rule.id AND rule.rule_type='checkin_reverse' "
+        "AND j.status='needs_review' RETURNING j.id", job_id, actor,
+    )
+    if dismissed is None:
+        raise HTTPException(status_code=409, detail="这条签到任务已处理或不可操作")
+    return {"id": dismissed, "status": "skipped"}
 
 
 @router.get("/duplicates")

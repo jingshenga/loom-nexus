@@ -1,9 +1,12 @@
 <script setup>
 import { onMounted, ref } from "vue";
+import { useRoute } from "vue-router";
 import { api } from "../api/client";
 import { Bot, Check, CircleHelp, RotateCw, XCircle } from "lucide-vue-next";
 
 const items = ref([]);
+const route = useRoute();
+const focusJob = ref(/^\d+$/.test(String(route.query.item || "")) ? String(route.query.item) : "");
 const status = ref("unverified");
 const busy = ref(false);
 const reason = ref("");
@@ -18,7 +21,9 @@ const outcomes = {
 async function load() {
   busy.value = true;
   try {
-    items.value = (await api(`/api/admin/bots?status=${status.value}&limit=100`)).items;
+    const query = new URLSearchParams({ status: focusJob.value ? "all" : status.value, limit: "100" });
+    if (focusJob.value) query.set("job_id", focusJob.value);
+    items.value = (await api(`/api/admin/bots?${query}`)).items;
   } catch (error) {
     flash.value = error.message || "加载失败";
   } finally {
@@ -51,11 +56,12 @@ onMounted(load);
       <button @click="load" class="flex items-center gap-2 rounded-lg border border-slate-700 px-3 py-2 text-sm"><RotateCw class="size-4" />刷新</button>
     </header>
     <div class="flex flex-wrap items-center gap-2">
-      <select v-model="status" @change="load" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm">
+      <select v-model="status" @change="focusJob = ''; load()" class="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm">
         <option value="unverified">待核候选</option><option value="verified">已确认</option>
         <option value="needs_review">查询异常或多候选</option>
         <option value="unrelated">无关 Bot</option><option value="unavailable">不可访问</option><option value="no_bot">未发现 Bot</option><option value="all">全部</option>
       </select>
+      <button v-if="focusJob" @click="focusJob = ''; load()" class="rounded border border-slate-700 px-3 py-2 text-xs">返回 Bot 列表</button>
       <input v-model="reason" maxlength="500" class="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm" placeholder="审核原因（可选）" />
       <span class="text-xs text-slate-500">{{ items.length }} 条</span>
     </div>
