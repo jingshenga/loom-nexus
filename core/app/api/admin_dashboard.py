@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from app import db
+from app import db, sqlres
 from app.api.auth import require_admin
 from app.api.review import SQL_DUPLICATE_CANDIDATES
 from app.config import get_settings
@@ -16,6 +16,7 @@ router = APIRouter(
 )
 _DUPLICATE_CTE = SQL_DUPLICATE_CANDIDATES.rsplit("SELECT * FROM candidates", 1)[0]
 SQL_DUPLICATE_COUNT = _DUPLICATE_CTE + "SELECT count(*) FROM candidates WHERE group_pair_rank=1"
+SQL_COLLECTION_FLOW = sqlres.load("dashboard_collection_flow.sql")
 
 
 def _decode_json(value, fallback):
@@ -96,56 +97,71 @@ async def _recognition_overview(pool, request: Request, now: datetime) -> dict:
         "SELECT id,status FROM ocr_classifier_versions WHERE status='active' ORDER BY id DESC LIMIT 1"
     )
     source2 = await pool.fetchrow(
-        "SELECT s.is_active,s.router_mode,g.active_started_at,g.heartbeat_at,g.health_status,"
+        "WITH active_interval AS ("
+        " SELECT COALESCE(s.is_active,FALSE) AS is_active,COALESCE(s.router_mode,'legacy') AS router_mode,"
+        " g.heartbeat_at,g.health_status,g.last_error,g.last_rollback_reason,g.last_metrics_json,"
+        " CASE WHEN s.router_mode='active' THEN COALESCE(g.active_started_at,started.changed_at)"
+        " ELSE started.changed_at END AS active_started_at,"
+        " CASE WHEN s.router_mode<>'active' THEN stopped.changed_at END AS active_ended_at"
+        " FROM (SELECT 2 AS id) expected LEFT JOIN ingest_sources s ON s.id=expected.id"
+        " LEFT JOIN active_router_guard_state g ON g.source_id=s.id"
+        " LEFT JOIN LATERAL (SELECT id,changed_at FROM rule_router_mode_events WHERE source_id=s.id AND new_mode='active'"
+        " ORDER BY changed_at DESC,id DESC LIMIT 1) started ON TRUE"
+        " LEFT JOIN LATERAL (SELECT changed_at FROM rule_router_mode_events WHERE source_id=s.id AND new_mode<>'active'"
+        " AND (changed_at,id)>(started.changed_at,started.id) ORDER BY changed_at,id LIMIT 1) stopped ON TRUE"
+        "), windowed AS (SELECT *,CASE WHEN active_started_at IS NOT NULL"
+        " AND (router_mode='active' OR active_ended_at IS NOT NULL)"
+        " THEN tstzrange(active_started_at,active_ended_at,'[)') END AS active_window FROM active_interval)"
+        " SELECT g.is_active,g.router_mode,g.active_started_at,g.active_ended_at,g.heartbeat_at,g.health_status,"
         "g.last_error,g.last_rollback_reason,g.last_metrics_json,"
         "(SELECT max(r.posted_at) FROM raw_messages r WHERE r.source_id=2) AS latest_message_posted_at,"
         "(SELECT max(rv.observed_at) FROM raw_messages r JOIN raw_message_revisions rv ON rv.raw_id=r.id "
         " WHERE r.source_id=2) AS latest_revision_observed_at,"
         "(SELECT count(*) FROM raw_messages r JOIN raw_message_revisions rv ON rv.raw_id=r.id "
-        " WHERE r.source_id=2 AND rv.observed_at>=g.active_started_at) AS new_revisions,"
+        " WHERE r.source_id=2 AND g.active_window @> rv.observed_at) AS new_revisions,"
         "(SELECT count(DISTINCT r.id) FROM raw_messages r JOIN raw_message_revisions rv ON rv.raw_id=r.id "
-        " WHERE r.source_id=2 AND rv.observed_at>=g.active_started_at) AS new_raws,"
+        " WHERE r.source_id=2 AND g.active_window @> rv.observed_at) AS new_raws,"
         "(SELECT count(DISTINCT r.id) FROM raw_messages r JOIN raw_message_revisions rv ON rv.raw_id=r.id "
-        " WHERE r.source_id=2 AND rv.observed_at>=g.active_started_at "
+        " WHERE r.source_id=2 AND g.active_window @> rv.observed_at "
         " AND r.extract_state IN ('done','dropped')) AS processed_raws,"
         "(SELECT count(*) FROM rule_parse_runs p JOIN raw_message_revisions rv ON rv.id=p.raw_revision_id "
         " JOIN raw_messages r ON r.id=rv.raw_id WHERE r.source_id=2 AND p.run_reason='active' "
-        " AND p.created_at>=g.active_started_at) AS active_runs,"
+        " AND g.active_window @> p.created_at) AS active_runs,"
         "(SELECT count(*) FROM rule_parse_runs p JOIN raw_message_revisions rv ON rv.id=p.raw_revision_id "
         " JOIN raw_messages r ON r.id=rv.raw_id WHERE r.source_id=2 AND p.run_reason='active' "
-        " AND p.created_at>=g.active_started_at AND "
+        " AND g.active_window @> p.created_at AND "
         " jsonb_array_length(COALESCE(p.result_json->'selected_rule_ids','[]'::jsonb))>0) AS rule_hits,"
         "(SELECT count(*) FROM listing_media_ocr o JOIN raw_messages r ON r.id=o.raw_id "
-        " WHERE r.source_id=2 AND o.created_at>=g.active_started_at) AS ocr_records,"
+        " WHERE r.source_id=2 AND g.active_window @> o.created_at) AS ocr_records,"
         "(SELECT count(*) FROM listing_media_ocr o JOIN raw_messages r ON r.id=o.raw_id "
-        " WHERE r.source_id=2 AND o.created_at>=g.active_started_at AND o.fields_json IS NOT NULL "
+        " WHERE r.source_id=2 AND g.active_window @> o.created_at AND o.fields_json IS NOT NULL "
         " AND o.fields_json<>'{}'::jsonb AND o.fields_json<>'[]'::jsonb) AS ocr_field_records,"
         "(SELECT COALESCE(sum((SELECT count(*) FROM jsonb_object_keys(o.fields_json))),0) "
         " FROM listing_media_ocr o "
-        " JOIN raw_messages r ON r.id=o.raw_id WHERE r.source_id=2 AND o.created_at>=g.active_started_at "
+        " JOIN raw_messages r ON r.id=o.raw_id WHERE r.source_id=2 AND g.active_window @> o.created_at "
         " AND jsonb_typeof(o.fields_json)='object') AS ocr_field_values,"
         "(SELECT count(*) FROM rule_active_review_queue q WHERE q.source_id=2 "
-        " AND q.created_at>=g.active_started_at) AS review_candidates,"
+        " AND g.active_window @> q.created_at) AS review_candidates,"
         "(SELECT count(*) FROM rule_active_review_queue q WHERE q.source_id=2 "
-        " AND q.created_at>=g.active_started_at AND "
+        " AND g.active_window @> q.created_at AND "
         " jsonb_array_length(COALESCE(q.candidate_json->'ocr_assist','[]'::jsonb))>0) AS ocr_assisted_candidates,"
         "(SELECT count(*) FROM rule_active_review_queue q CROSS JOIN LATERAL "
         " jsonb_each(COALESCE(q.candidate_json->'evidence','{}'::jsonb)) field "
-        " WHERE q.source_id=2 AND q.created_at>=g.active_started_at AND field.value->>'src'='ocr') "
+        " WHERE q.source_id=2 AND g.active_window @> q.created_at AND field.value->>'src'='ocr') "
         " AS ocr_adopted_field_values,"
         "(SELECT count(*) FROM rule_active_review_queue q CROSS JOIN LATERAL "
         " jsonb_array_elements(COALESCE(q.candidate_json->'ocr_assist','[]'::jsonb)) assist "
         " CROSS JOIN LATERAL jsonb_object_keys(COALESCE(assist.value->'fields','{}'::jsonb)) field "
-        " WHERE q.source_id=2 AND q.created_at>=g.active_started_at) AS ocr_evidence_field_values,"
+        " WHERE q.source_id=2 AND g.active_window @> q.created_at) AS ocr_evidence_field_values,"
         "(SELECT count(*) FROM rule_active_review_queue q WHERE q.source_id=2 "
-        " AND q.created_at>=g.active_started_at AND "
+        " AND g.active_window @> q.created_at AND "
         " jsonb_array_length(COALESCE(q.diagnostics_json->'conflict_kinds','[]'::jsonb))>0) AS conflicted_candidates,"
         "(SELECT count(*) FROM rule_active_review_queue q WHERE q.source_id=2 "
-        " AND q.created_at>=g.active_started_at AND q.status='open') AS new_open_reviews,"
+        " AND g.active_window @> q.created_at AND q.status='open') AS new_open_reviews,"
         "(SELECT count(*) FROM rule_active_review_queue q WHERE q.source_id=2 AND q.status='open') AS open_reviews,"
         "(SELECT count(*) FROM rule_active_ocr_rechecks x WHERE x.source_id=2 "
-        " AND x.created_at>=g.active_started_at) AS ocr_rechecks "
-        "FROM ingest_sources s LEFT JOIN active_router_guard_state g ON g.source_id=s.id WHERE s.id=2"
+        " AND g.active_window @> x.created_at) AS ocr_rechecks "
+        "FROM windowed g"
     )
     guard_heartbeat = source2["heartbeat_at"]
     guard_healthy = bool(
@@ -155,7 +171,8 @@ async def _recognition_overview(pool, request: Request, now: datetime) -> dict:
     if not source2["active_started_at"]:
         source2_diagnosis = "没有找到本次 Active 启用时间，无法计算本次处理量。"
     elif not source2["is_active"] or source2["router_mode"] != "active":
-        source2_diagnosis = "来源 2 当前未处于 Active；以下处理量仍按最近一次启用时间统计。"
+        source2_diagnosis = ("来源 2 当前未处于 Active。本处显示上次 Active 起止区间。"
+                             if source2["active_ended_at"] else "来源 2 当前未处于 Active，历史结束时间未记录。")
     elif not guard_healthy:
         source2_diagnosis = "来源 2 当前为 Active，但 Guard 心跳异常或过期；请先检查守护状态。"
     elif source2["new_revisions"] == 0:
@@ -265,6 +282,7 @@ async def _recognition_overview(pool, request: Request, now: datetime) -> dict:
         "source2_activity": {
             "source_id": 2, "is_active": source2["is_active"], "router_mode": source2["router_mode"],
             "active_started_at": source2["active_started_at"].isoformat() if source2["active_started_at"] else None,
+            "active_ended_at": source2["active_ended_at"].isoformat() if source2["active_ended_at"] else None,
             "guard_health_status": source2["health_status"], "guard_healthy": guard_healthy,
             "guard_heartbeat_at": guard_heartbeat.isoformat() if guard_heartbeat else None,
             "guard_last_error": source2["last_error"],
@@ -385,8 +403,10 @@ async def dashboard(request: Request) -> dict:
         "SELECT COALESCE(bool_or(router_mode='active'),FALSE) FROM ingest_sources"
     )
     recognition = await _recognition_overview(pool, request, now)
+    collection = await pool.fetch(SQL_COLLECTION_FLOW, now - timedelta(days=7))
     return {
         "as_of": now.isoformat(),
+        "collection": {"window_days": 7, "sources": [dict(row) for row in collection]},
         "metrics": {
             "raw_today": rows["raw_today"],
             "active_runs_today": rows["active_runs_today"],
@@ -418,7 +438,7 @@ async def dashboard(request: Request) -> dict:
         ],
         "recognition": recognition,
         "actions": [
-            {"to": "/admin/review", "label": "打开 Listing 审核", "alert": rows["pending_listings"] > 0},
+            {"to": "/admin/review", "label": "打开需要我判断", "alert": rows["pending_listings"] > 0},
             {"to": "/admin/rule-review", "label": "处理规则待审", "alert": rows["open_rule_reviews"] > 0},
             {"to": "/admin/lifecycle", "label": "处理 Lifecycle", "alert": rows["open_lifecycle_reviews"] > 0},
             {"to": "/admin/ocr", "label": "核对 OCR 记录", "alert": False},

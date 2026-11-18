@@ -96,12 +96,37 @@ function processingLabel(image) {
         </article>
       </section>
 
+      <section class="space-y-3 rounded-2xl border border-slate-800 bg-slate-900 p-4 sm:p-5">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <h2 class="font-semibold">近 {{ data.collection.window_days }} 天采集流转</h2>
+          <RouterLink to="/admin/review" class="text-sm text-sky-200 underline">处理待判断资料</RouterLink>
+        </div>
+        <div class="grid gap-3 md:grid-cols-2">
+          <article v-for="source in data.collection.sources" :key="source.source_id" class="min-w-0 rounded-xl bg-slate-950/70 p-3">
+            <div class="flex flex-wrap items-center gap-2"><h3 class="break-words text-sm font-medium">{{ source.title || `来源 ${source.source_id}` }}</h3><span class="text-xs text-slate-400">{{ source.router_mode }}</span></div>
+            <dl class="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-3">
+              <div>原帖 <dd class="font-medium text-slate-200">{{ source.originals }}</dd></div>
+              <div>已处理 <dd class="font-medium text-slate-200">{{ source.processed }}</dd></div>
+              <div>已有资料复用 <dd class="font-medium text-slate-200">{{ source.reused }}</dd></div>
+              <div>补缺计划 <dd class="font-medium text-slate-200">{{ source.supplements }}</dd></div>
+              <div>更新对比 <dd class="font-medium text-slate-200">{{ source.updates }}</dd></div>
+              <div>新建补采候选 <dd class="font-medium text-slate-200">{{ source.new_candidates }}</dd></div>
+              <div>补采需人工判断 <dd class="font-medium text-slate-200">{{ source.needs_review }}</dd></div>
+              <div>无可用资料 / 失败 <dd class="font-medium text-slate-200">{{ source.not_found }} / {{ source.failed }}</dd></div>
+              <div>已发布卡片 <dd class="font-medium text-slate-200">{{ source.published }}</dd></div>
+            </dl>
+            <p class="mt-2 text-xs text-slate-400">已记录 {{ source.assessed }} 次查库决策。计划和执行结果分别计数。</p>
+          </article>
+        </div>
+        <p class="text-xs text-slate-400">原帖按首次入库计数。补采列按有新版查库记录的任务统计。</p>
+      </section>
+
       <section v-if="data.recognition.source2_activity" class="space-y-4 rounded-2xl border border-amber-900/60 bg-slate-900 p-5">
         <div class="flex flex-wrap items-start justify-between gap-3">
           <div>
             <p class="text-xs font-semibold uppercase tracking-[.16em] text-amber-300">SOURCE 2 · ACTIVE LIFETIME</p>
-            <h2 class="mt-1 text-lg font-semibold">来源 2 自本次启用以来</h2>
-            <p class="mt-1 text-xs text-slate-500">起点 {{ timeText(data.recognition.source2_activity.active_started_at) }} · 按新 raw revision、Active 解析审计、OCR 与审核队列分别统计。</p>
+            <h2 class="mt-1 text-lg font-semibold">来源 2 Active 运行区间</h2>
+            <p class="mt-1 text-xs text-slate-500">{{ timeText(data.recognition.source2_activity.active_started_at) }} 至 {{ data.recognition.source2_activity.active_ended_at ? timeText(data.recognition.source2_activity.active_ended_at) : data.recognition.source2_activity.router_mode === 'active' ? '当前' : '结束时间未记录' }}</p>
           </div>
           <span class="rounded-full px-3 py-1.5 text-xs" :class="data.recognition.source2_activity.is_active && data.recognition.source2_activity.router_mode === 'active' && data.recognition.source2_activity.guard_healthy ? 'bg-emerald-500/10 text-emerald-200' : 'bg-amber-500/10 text-amber-200'">
             {{ data.recognition.source2_activity.router_mode }} · Guard {{ data.recognition.source2_activity.guard_healthy ? '心跳正常' : '异常/过期' }}
