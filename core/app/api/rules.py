@@ -16,6 +16,7 @@ from app import db, llm, sqlres
 from app.api.auth import current_user_id, require_admin
 from app.config import get_settings
 from app.extractor import ast_rules
+from app.extractor.ocr_fields import equivalent_field
 from app.extractor.rule_config import PARSER_BY_TYPE, validate_rule_config, validate_match_mode
 from app.extractor.rule_router import business_candidate_key, config_hash, shadow_compare
 from app.extractor.rule_router import active_source_allowed
@@ -819,6 +820,46 @@ async def set_source_router_mode(source_id: int, body: RouterModeBody,
                     )
     return {"source_id": source_id, "previous_mode": previous,
             "mode": body.mode, "actor_user_id": actor_id}
+
+
+class CollectionPreviewBody(BaseModel):
+    source_id: int = Field(gt=0)
+    username: str = Field(min_length=4, max_length=33)
+    message_id: int | None = Field(default=None, gt=0)
+
+
+@router.post("/collection-preview")
+async def collection_preview(body: CollectionPreviewBody) -> dict:
+    username = body.username.strip().lstrip("@").lower()
+    if not re.fullmatch(r"[a-z][a-z0-9_]{3,31}", username):
+        raise HTTPException(status_code=422, detail="请输入有效的 Telegram 用户名")
+    pool = _pool()
+    value = await pool.fetchval("SELECT nexus_collection_plan($1,$2,NULL,$3)",
+                               body.source_id, body.message_id, username)
+    plan = _decode_jsonb(value, {})
+    original = plan.pop("local_post", {})
+    existing = plan.pop("listing_fields", {})
+    changes = []
+    version = None
+    if original and plan.get("decision") in {"supplement", "update"}:
+        rule = await pool.fetchrow(
+            "SELECT b.rule_version_id,COALESCE(v.config_json,r.config_json) AS config "
+            "FROM source_rule_bindings b JOIN ingest_rules r ON r.id=b.rule_id "
+            "LEFT JOIN rule_instance_versions v ON v.id=b.rule_version_id "
+            "WHERE b.source_id=$1 AND r.rule_type='listing' AND r.is_active "
+            "ORDER BY b.priority DESC,r.id LIMIT 1", body.source_id,
+        )
+        if rule:
+            version = rule["rule_version_id"]
+            fields, _ = ast_rules.extract_fields(_decode_jsonb(rule["config"], {}), original.get("raw_text", ""))
+            for field in ("nickname", "district", "price_amount", "price_currency", "contact_username"):
+                parsed_key = "username" if field == "contact_username" else field
+                before, after = existing.get(field), fields.get(parsed_key)
+                if after not in (None, "") and not equivalent_field(parsed_key, before, after):
+                    changes.append({"field": field, "current": before, "proposed": after})
+    return {**plan, "original": {key: original[key] for key in ("id", "platform_msg_id", "revision_id")
+                                  if key in original},
+            "rule_version_id": version, "field_differences": changes}
 
 
 @router.post("/router-dryrun")

@@ -18,6 +18,20 @@ const search = ref("");
 const versions = ref([]);
 const samples = ref([]);
 const dryRun = ref(null);
+const collectionUsername = ref("");
+const collectionMessageId = ref("");
+const collectionPlan = ref(null);
+const collectionDecisions = {
+  reuse: "复用现有卡片", supplement: "补齐缺项", update: "比较更新", review: "需要人工判断", end: "结束",
+};
+const collectionReasons = {
+  complete_published: "已有完整的已发布卡片", existing_review: "该资料已有审核记录",
+  missing_required_fields: "已有卡片仍缺必填资料", local_post_available: "库内已有原帖，可先使用本地资料",
+  no_existing_card: "库内暂未找到可采用的卡片", different_original: "原帖不同，需要对比",
+  newer_local_revision: "库内有较新的原帖修订", identity_conflict: "身份线索冲突",
+  source_unverified: "来源身份无法确认", username_unverified: "TG 用户名无法确认",
+  closed_original: "原帖已关闭", closed_identity_reference: "只有已关闭的旧资料", card_unavailable: "卡片暂不可用",
+};
 const loading = ref(false);
 const busy = ref(false);
 const error = ref("");
@@ -97,6 +111,7 @@ async function changeSource(source) {
   selectedRuleId.value = String(source.bindings[0]?.rule_id || "");
   selectedRawId.value = "";
   dryRun.value = null;
+  collectionPlan.value = null;
   await Promise.all([loadVersions(), loadSamples()]);
 }
 
@@ -130,6 +145,24 @@ async function runDryRun() {
     });
   } catch (e) {
     error.value = e.message || "Dry-run 失败";
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function previewCollection() {
+  if (!selectedSource.value || !collectionUsername.value.trim()) return;
+  collectionPlan.value = null;
+  busy.value = true;
+  error.value = "";
+  try {
+    collectionPlan.value = await api("/api/admin/rules/collection-preview", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source_id: selectedSource.value.source_id, username: collectionUsername.value.trim(),
+        message_id: collectionMessageId.value ? Number(collectionMessageId.value) : null }),
+    });
+  } catch (e) {
+    error.value = e.message || "读取采集预览失败";
   } finally {
     busy.value = false;
   }
@@ -274,6 +307,31 @@ onMounted(load);
           <p v-else class="text-xs text-slate-500">该来源没有已记录 Shadow 比较。</p>
           <div v-if="selectedSource.recent_errors?.length" class="rounded-lg border border-amber-900/60 bg-amber-950/20 p-3 text-xs text-amber-200">近 24 小时错误：
             <span v-for="item in selectedSource.recent_errors" :key="item.error_class + item.last_occurred_at" class="ml-2">{{ item.error_class }} × {{ item.occurrences }}</span>
+          </div>
+        </section>
+
+        <section class="space-y-3 rounded-xl border border-slate-800 bg-slate-900/70 p-4">
+          <h2 class="text-base font-semibold">查库与补采预览</h2>
+          <form class="grid gap-2 sm:grid-cols-2" @submit.prevent="previewCollection">
+            <label class="text-xs text-slate-400">Telegram 用户名
+              <input v-model="collectionUsername" maxlength="33" required class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
+            </label>
+            <label class="text-xs text-slate-400">Telegram 原帖 ID（可选）
+              <input v-model="collectionMessageId" type="number" min="1" step="1" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
+            </label>
+            <button :disabled="busy" class="justify-self-start rounded-lg border border-sky-700 px-3 py-2 text-sm text-sky-200 disabled:opacity-50">预览采集决定</button>
+          </form>
+          <div v-if="collectionPlan" class="space-y-2 break-words rounded-lg bg-slate-950/60 p-3 text-xs">
+            <p class="text-slate-200">{{ collectionDecisions[collectionPlan.decision] }}
+              <span v-if="collectionPlan.listing_id"> · 卡片 #{{ collectionPlan.listing_id }}</span>
+              <span v-if="collectionPlan.original?.id"> · 库内原帖 #{{ collectionPlan.original.id }}</span>
+            </p>
+            <p class="text-slate-400">{{ collectionReasons[collectionPlan.reason] || '需检查采集记录' }}</p>
+            <p v-if="collectionPlan.rule_version_id" class="text-slate-400">对比规则版本 #{{ collectionPlan.rule_version_id }}</p>
+            <p v-if="collectionPlan.missing_fields?.length" class="text-amber-200">缺项 {{ collectionPlan.missing_fields.join('、') }}</p>
+            <ul v-if="collectionPlan.field_differences?.length" class="space-y-1 text-slate-300">
+              <li v-for="change in collectionPlan.field_differences" :key="change.field">{{ change.field }} · {{ change.current ?? '空' }} → {{ change.proposed }}</li>
+            </ul>
           </div>
         </section>
 
