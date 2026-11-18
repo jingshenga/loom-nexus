@@ -554,7 +554,9 @@ async def _collect_checkin_source(pool, client, job, cfg):
             return "skipped", "原资料已关闭，保留历史记录"
         if plan["decision"] == "review":
             return "needs_review", f"采集证据需核对：{plan['reason']}"
-        if original.get("revision_id") and original.get("raw_text"):
+        missing_media = "public_media" in (plan.get("missing_fields") or []) and not original.get("media_json")
+        if (original.get("revision_id") and original.get("raw_text") and not missing_media
+                and plan["reason"] != "reuse_evidence_expired"):
             from types import SimpleNamespace
 
             message = SimpleNamespace(raw_text=original["raw_text"], get_entities_text=lambda: [])

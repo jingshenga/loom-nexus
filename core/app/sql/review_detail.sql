@@ -1,5 +1,5 @@
 SELECT l.id, l.nickname, l.district, l.price_amount, l.price_currency,
-       l.description, l.custom_fields, l.media_json, l.evidence_json,
+       l.description, l.custom_fields, l.media_json, l.evidence_json, l.manual_fields,
        l.confidence, l.status, l.contact_peer_id, l.contact_username,
        l.bot_url, l.created_at, COALESCE(rm.raw_text, l.description) AS raw_text,
        COALESCE(s.title, CASE WHEN ir.rule_type = 'checkin_reverse' THEN '签到来源反查 V2'

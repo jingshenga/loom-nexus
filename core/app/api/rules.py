@@ -826,6 +826,39 @@ class CollectionPreviewBody(BaseModel):
     message_id: int | None = Field(default=None, gt=0)
 
 
+class CollectionReuseBody(BaseModel):
+    enabled: bool
+
+
+@router.get("/collection-reuse-mode")
+async def collection_reuse_mode() -> dict:
+    pool = _pool()
+    enabled = await pool.fetchval("SELECT value='1' FROM app_settings WHERE key='collection_reuse_enabled'")
+    last = await pool.fetchrow(
+        "SELECT enabled,actor_user_id,changed_at FROM collection_reuse_mode_events ORDER BY id DESC LIMIT 1"
+    )
+    return {"enabled": bool(enabled), "last_change": dict(last) if last else None}
+
+
+@router.put("/collection-reuse-mode")
+async def update_collection_reuse_mode(body: CollectionReuseBody, authorization: str = Header(default="")) -> dict:
+    actor = current_user_id(authorization)
+    async with _pool().acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("INSERT INTO app_settings(key,value) VALUES('collection_reuse_enabled','0') ON CONFLICT DO NOTHING")
+            previous = await conn.fetchval(
+                "SELECT value='1' FROM app_settings WHERE key='collection_reuse_enabled' FOR UPDATE"
+            )
+            if previous != body.enabled:
+                await conn.execute("UPDATE app_settings SET value=$1,updated_at=NOW() WHERE key='collection_reuse_enabled'",
+                                   "1" if body.enabled else "0")
+                await conn.execute(
+                    "INSERT INTO collection_reuse_mode_events(previous_enabled,enabled,actor_user_id) VALUES($1,$2,$3)",
+                    previous, body.enabled, actor,
+                )
+    return await collection_reuse_mode()
+
+
 @router.post("/collection-preview")
 async def collection_preview(body: CollectionPreviewBody) -> dict:
     username = body.username.strip().lstrip("@").lower()
@@ -858,6 +891,33 @@ async def collection_preview(body: CollectionPreviewBody) -> dict:
     return {**plan, "original": {key: original[key] for key in ("id", "platform_msg_id", "revision_id")
                                   if key in original},
             "rule_version_id": version, "field_differences": changes}
+
+
+@router.get("/sources/{source_id}/review-feedback")
+async def source_review_feedback(source_id: int) -> dict:
+    rows = await _pool().fetch(
+        "SELECT DISTINCT ON (q.raw_id) q.raw_id,q.candidate_json,q.candidate_rule_ids,e.decision_json "
+        "FROM rule_active_review_events e JOIN rule_active_review_queue q ON q.id=e.queue_id "
+        "WHERE q.source_id=$1 AND e.actor_user_id IS NOT NULL AND e.action='create_pending_listing' "
+        "AND jsonb_typeof(e.decision_json->'confirmed_fields')='object' "
+        "ORDER BY q.raw_id,e.created_at DESC,e.id DESC LIMIT 500", source_id,
+    )
+    corrections = {}
+    no_rule_labels = 0
+    for row in rows:
+        proposed = _decode_jsonb(row["candidate_json"], {}).get("fields") or {}
+        confirmed = _decode_jsonb(row["decision_json"], {}).get("confirmed_fields") or {}
+        if confirmed and not row["candidate_rule_ids"]:
+            no_rule_labels += 1
+        for field in ("username", "nickname", "price_amount", "price_currency", "district"):
+            if field in confirmed and not equivalent_field(field, proposed.get(field), confirmed[field]):
+                corrections[field] = corrections.get(field, 0) + 1
+    suggestions = [{"kind": "field_normalization", "field": field, "confirmed_count": count}
+                   for field, count in sorted(corrections.items()) if count >= 2]
+    if no_rule_labels >= 2:
+        suggestions.append({"kind": "gate_review", "confirmed_count": no_rule_labels})
+    return {"confirmed_samples": len(rows), "corrections": corrections, "suggestions": suggestions,
+            "status": "needs_regression" if suggestions else "insufficient_evidence"}
 
 
 @router.post("/router-dryrun")

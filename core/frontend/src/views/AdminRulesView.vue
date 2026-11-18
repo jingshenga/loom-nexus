@@ -67,7 +67,7 @@ const botSkipReasons = {
   verified_result_available: "复用已核验 Bot", recent_no_bot: "近期已查询，没有 Bot",
 };
 
-const EMPTY_CHECKIN_CONFIG = { collection_mode: "checkin_source_reverse", source_username: "" };
+const EMPTY_CHECKIN_CONFIG = { collection_mode: "checkin_source_reverse", source_username: "", reuse_max_age_days: 0, reuse_required_fields: [] };
 const checkinForm = ref({ ...EMPTY_CHECKIN_CONFIG });
 
 const EMPTY_CONFIG = {
@@ -806,6 +806,13 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
             <input v-model="checkinForm.source_username" placeholder="例如 nbtgzb 或 NBXMWBGJ"
               class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
           </label>
+          <label class="block text-xs text-slate-400">资料复用有效天数（0 表示不限）
+            <input v-model.number="checkinForm.reuse_max_age_days" type="number" min="0" max="3650" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
+          </label>
+          <div class="flex flex-wrap gap-3 text-xs text-slate-300">
+            <label><input v-model="checkinForm.reuse_required_fields" type="checkbox" value="district" /> 复用前需要区域</label>
+            <label><input v-model="checkinForm.reuse_required_fields" type="checkbox" value="verified_bot" /> 复用前需要已核验 Bot</label>
+          </div>
         </template>
       </section>
 

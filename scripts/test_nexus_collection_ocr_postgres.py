@@ -5,7 +5,7 @@ import os
 
 import asyncpg
 
-from app.extractor.media_ocr import MediaOcrProcessor
+from app.extractor.media_ocr import MediaOcrProcessor, SQL_MEDIA_FLAGS
 
 
 async def main():
@@ -59,6 +59,16 @@ async def main():
         await processor._sync_profile_listing(result)
         after = await conn.fetchrow("SELECT status,description,nickname FROM listings WHERE id=$1", listing)
         assert tuple(after.values()) == ("published", "fixture text", "fixture manual name"), dict(after)
+
+        media = '[{"kind":"photo","path":"one.jpg","visibility":"public"}]'
+        raw = await conn.fetchval(
+            "INSERT INTO raw_messages(source_id,platform_msg_id,media_json) VALUES($1,991,$2::jsonb) RETURNING id",
+            source, media,
+        )
+        await conn.execute("UPDATE listings SET source_msg_id=$1,media_json=$2::jsonb WHERE id=$3", raw, media, listing)
+        assert await conn.fetchval(SQL_MEDIA_FLAGS, raw, "one.jpg", "admin", "done", "info_card")
+        assert await conn.fetchval("SELECT media_json->0->>'visibility' FROM listings WHERE id=$1", listing) == "public"
+        assert await conn.fetchval("SELECT media_json->0->>'visibility' FROM raw_messages WHERE id=$1", raw) == "admin"
         print("Collection OCR sync keeps guarded candidates in review and protects published cards")
     finally:
         await tx.rollback()

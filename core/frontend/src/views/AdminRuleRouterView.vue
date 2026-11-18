@@ -21,6 +21,8 @@ const dryRun = ref(null);
 const collectionUsername = ref("");
 const collectionMessageId = ref("");
 const collectionPlan = ref(null);
+const collectionReuse = ref(null);
+const reviewFeedback = ref(null);
 const collectionDecisions = {
   reuse: "复用现有卡片", supplement: "补齐缺项", update: "比较更新", review: "需要人工判断", end: "结束",
 };
@@ -31,6 +33,7 @@ const collectionReasons = {
   newer_local_revision: "库内有较新的原帖修订", identity_conflict: "身份线索冲突",
   source_unverified: "来源身份无法确认", username_unverified: "TG 用户名无法确认",
   closed_original: "原帖已关闭", closed_identity_reference: "只有已关闭的旧资料", card_unavailable: "卡片暂不可用",
+  reuse_evidence_expired: "现有证据已超过复用有效期",
 };
 const loading = ref(false);
 const busy = ref(false);
@@ -85,16 +88,18 @@ async function load() {
   loading.value = true;
   error.value = "";
   try {
-    const [routerData, templateData, diagnosticsData] = await Promise.all([
+    const [routerData, templateData, diagnosticsData, collectionData] = await Promise.all([
       api("/api/admin/rules/router-management"),
       api("/api/admin/rules/templates"),
       api("/api/admin/rules/shadow-diagnostics"),
+      api("/api/admin/rules/collection-reuse-mode"),
     ]);
     sources.value = routerData.items || [];
     activeModeAvailable.value = Boolean(routerData.active_mode_available);
     activeSourceIds.value = routerData.active_source_ids || [];
     templates.value = templateData.items || [];
     diagnostics.value = diagnosticsData;
+    collectionReuse.value = collectionData;
     if (!sources.value.some((item) => String(item.source_id) === String(selectedSourceId.value))) {
       selectedSourceId.value = String(sources.value[0]?.source_id || "");
     }
@@ -112,6 +117,7 @@ async function changeSource(source) {
   selectedRawId.value = "";
   dryRun.value = null;
   collectionPlan.value = null;
+  reviewFeedback.value = null;
   await Promise.all([loadVersions(), loadSamples()]);
 }
 
@@ -165,6 +171,30 @@ async function previewCollection() {
     error.value = e.message || "读取采集预览失败";
   } finally {
     busy.value = false;
+  }
+}
+
+async function toggleCollectionReuse() {
+  const enabled = !collectionReuse.value?.enabled;
+  if (!window.confirm(enabled ? "启用签到查库优先？新的补采候选进入人工审核。" : "关闭签到查库优先并恢复原有方式？")) return;
+  busy.value = true;
+  try {
+    collectionReuse.value = await api("/api/admin/rules/collection-reuse-mode", {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled }),
+    });
+  } catch (e) {
+    error.value = e.message || "更新采集方式失败";
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function loadReviewFeedback() {
+  if (!selectedSource.value) return;
+  try {
+    reviewFeedback.value = await api(`/api/admin/rules/sources/${selectedSource.value.source_id}/review-feedback`);
+  } catch (e) {
+    error.value = e.message || "审核反馈读取失败";
   }
 }
 
@@ -312,6 +342,11 @@ onMounted(load);
 
         <section class="space-y-3 rounded-xl border border-slate-800 bg-slate-900/70 p-4">
           <h2 class="text-base font-semibold">查库与补采预览</h2>
+          <div v-if="collectionReuse" class="flex flex-wrap items-center gap-2 text-xs text-slate-300">
+            <span>签到查库优先 · {{ collectionReuse.enabled ? '已启用' : '已关闭' }}</span>
+            <button @click="toggleCollectionReuse" :disabled="busy" class="rounded border border-slate-700 px-2 py-1">{{ collectionReuse.enabled ? '关闭并回退' : '启用' }}</button>
+            <span v-if="collectionReuse.last_change" class="text-slate-500">最近操作 {{ new Date(collectionReuse.last_change.changed_at).toLocaleString() }}</span>
+          </div>
           <form class="grid gap-2 sm:grid-cols-2" @submit.prevent="previewCollection">
             <label class="text-xs text-slate-400">Telegram 用户名
               <input v-model="collectionUsername" maxlength="33" required class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
@@ -331,6 +366,16 @@ onMounted(load);
             <p v-if="collectionPlan.missing_fields?.length" class="text-amber-200">缺项 {{ collectionPlan.missing_fields.join('、') }}</p>
             <ul v-if="collectionPlan.field_differences?.length" class="space-y-1 text-slate-300">
               <li v-for="change in collectionPlan.field_differences" :key="change.field">{{ change.field }} · {{ change.current ?? '空' }} → {{ change.proposed }}</li>
+            </ul>
+          </div>
+          <button @click="loadReviewFeedback" class="rounded-lg border border-slate-700 px-3 py-2 text-sm">查看人工审核反馈</button>
+          <div v-if="reviewFeedback" class="space-y-2 break-words rounded-lg bg-slate-950/60 p-3 text-xs text-slate-300">
+            <p>有 {{ reviewFeedback.confirmed_samples }} 条已记录人工确认字段的原帖。</p>
+            <p v-if="reviewFeedback.status === 'insufficient_evidence'">证据不足，暂无安全建议。</p>
+            <ul v-else class="space-y-1">
+              <li v-for="item in reviewFeedback.suggestions" :key="item.kind + (item.field || '')">
+                {{ item.kind === 'gate_review' ? '检查 Gate 漏识别' : `检查字段提取或标准化（${item.field}）` }} · {{ item.confirmed_count }} 条人工记录 · 待正反样本回归
+              </li>
             </ul>
           </div>
         </section>

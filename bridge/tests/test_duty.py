@@ -112,7 +112,8 @@ class DutyProcessTests(unittest.IsolatedAsyncioTestCase):
         local_post = {"platform_msg_id": 19, "revision_id": 23, "raw_text": "TG: @fixture_user"}
         pool = SimpleNamespace(
             fetch=AsyncMock(side_effect=[
-                [{"plan": {"decision": "supplement", "source_peer_id": -1002, "local_post": local_post}}],
+                [{"plan": {"decision": "supplement", "reason": "local_post_available", "source_peer_id": -1002,
+                           "local_post": local_post}}],
                 [{"result": {"status": "fetched", "reason": "candidate_created"}}],
             ]),
             execute=AsyncMock(),

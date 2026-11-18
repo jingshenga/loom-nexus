@@ -79,6 +79,10 @@ CANDIDATE_ID="$(docker image inspect --format '{{.Id}}' "$CANDIDATE_IMAGE" 2>/de
 bash "$REPO_DIR/scripts/build-nexus-bridge-overlay.sh" "$CURRENT_BRIDGE_REF" "$CURRENT_BRIDGE_ID" "$BRIDGE_CANDIDATE" "$COMMIT" \
     || die "Bridge candidate build or regression failed"
 BRIDGE_CANDIDATE_ID="$(docker image inspect --format '{{.Id}}' "$BRIDGE_CANDIDATE")"
+DB_IMAGE_ID="$(docker inspect --format '{{.Image}}' nexus-db)"
+[[ "$(docker inspect --format '{{.State.Health.Status}}' nexus-db)" == healthy ]] || die "current PostgreSQL is not healthy"
+bash "$REPO_DIR/scripts/check-nexus-collection-postgres.sh" "$CANDIDATE_IMAGE" "$CURRENT_ID" "$DB_IMAGE_ID" \
+    || die "isolated PostgreSQL collection gate failed"
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 BACKUP_DIR="$PROJECT_DIR/release-backups/nexus-v3-unified-$STAMP"
@@ -136,9 +140,10 @@ apply_migration 2026-11-12-active-ocr-review-assist.sql
 apply_migration 2026-11-12-active-ocr-recheck-isolation.sql
 apply_migration 2026-11-12-vision4-model-registry.sql
 apply_migration 2026-11-14-active-router-supervisor-engine-audit.sql
-apply_migration 2026-11-18-collection-reuse-plan.sql
 apply_migration 2026-11-18-collection-reuse-job-audit.sql
+apply_migration 2026-11-18-collection-reuse-plan.sql
 apply_migration 2026-11-18-collection-reuse-stage.sql
+apply_migration 2026-11-18-collection-ocr-safe-flags.sql
 apply_migration 2026-11-18-bot-collection-precheck.sql
 
 GUARD_SOURCE="$REPO_DIR/scripts/nexus_active_guard.py"
@@ -150,7 +155,8 @@ docker run --rm --network none --entrypoint python \
     "$CANDIDATE_IMAGE" -m unittest discover -s /release-tests -p 'test_nexus_active_guard.py' \
     || die "Active supervisor JSONB/fail-closed regression failed"
 [[ "$(docker inspect --format '{{.Image}}' nexus-core)" == "$CURRENT_ID" \
-   && "$(docker inspect --format '{{.Image}}' nexus-bridge)" == "$CURRENT_BRIDGE_ID" ]] \
+   && "$(docker inspect --format '{{.Image}}' nexus-bridge)" == "$CURRENT_BRIDGE_ID" \
+   && "$(docker inspect --format '{{.Image}}' nexus-db)" == "$DB_IMAGE_ID" ]] \
     || die "production baseline changed during candidate build"
 ROLLBACK_REQUIRED=1
 install -m 0644 "$GUARD_SOURCE" "$PROJECT_DIR/scripts/nexus_active_guard.py" \

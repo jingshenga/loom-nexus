@@ -18,6 +18,7 @@ trap 'rm -rf "$STAGE"' EXIT
 git -C "$ROOT" archive --format=tar "$COMMIT" \
   scripts/nexus-release-entrypoint.sh \
   scripts/build-nexus-bridge-overlay.sh \
+  scripts/check-nexus-collection-postgres.sh \
   scripts/nexus_active_guard.py \
   scripts/test_nexus_active_guard.py \
   scripts/check_admin_feature_manifest.py \
@@ -34,6 +35,7 @@ git -C "$ROOT" archive --format=tar "$COMMIT" \
   core/tests \
   core/frontend \
   release/nexus-v3-20261110/BC/core/Dockerfile \
+  release/nexus-v3-20261110/BC/core/tests/e2e_active_pipeline_postgres.py \
   release/nexus-v3-20261110/BC/scripts/build-core-release.sh \
   release/nexus-v3-20261110/BC/scripts/deploy-core-release.sh \
   release/nexus-v3-20261110/BC/scripts/release-core-unified.sh \

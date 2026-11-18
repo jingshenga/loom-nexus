@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from app import db, sqlres
 from app.config import get_settings
 from app.api.auth import current_user_id, require_admin
-from app.extractor.ocr_fields import equivalent_field
+from app.extractor.ocr_fields import equivalent_field, structured_ocr_candidate
 
 router = APIRouter(
     prefix="/api/admin/review", tags=["admin-review"],
@@ -67,6 +67,46 @@ def _publishable_media_count(media: list) -> int:
         and item.get("ocr_classification") not in {"info_card", "uncertain"}
         and item.get("ocr_review_status", "not_required") != "pending"
     )
+
+
+def _review_ocr_fields(card, images):
+    fields = {}
+    conflicts = []
+    manual = _decode(card["manual_fields"], {})
+    for image in images:
+        category = image["human_classification"] or image["classification"]
+        if image["status"] != "done" or category != "info_card" or image["review_status"] == "not_card":
+            continue
+        confidence = float(image["confidence"] or 0)
+        parsed = structured_ocr_candidate(
+            _decode(image["fields_json"], {}), _decode(image["evidence_json"], {}),
+            ocr_id=image["id"], engine_version=image["engine_version"], confidence=confidence,
+            text_identity=card["contact_username"] or "",
+        )
+        conflicts.extend(parsed["conflicts"])
+        for key in ("nickname", "district", "price_amount", "price_currency"):
+            if key not in parsed["fields"]:
+                continue
+            value = parsed["fields"][key]
+            options = fields.setdefault(key, [])
+            evidence = {"value": value, "ocr_id": image["id"], "engine_version": image["engine_version"],
+                        "evidence": parsed["evidence"].get(key), "confirmed": image["review_status"] == "confirmed",
+                        "confidence": confidence}
+            match = next((i for i, option in enumerate(options) if equivalent_field(key, value, option["value"])), None)
+            if match is None:
+                options.append(evidence)
+            elif (evidence["confirmed"], confidence) > (options[match]["confirmed"], options[match]["confidence"]):
+                options[match] = evidence
+    suggestions = []
+    for field, options in sorted(fields.items()):
+        current = card[field]
+        if len(options) > 1 or (current not in (None, "") and not equivalent_field(field, current, options[0]["value"])):
+            conflicts.append({"kind": "field", "field": field, "current": current, "options": options})
+        elif current in (None, "") and field not in manual and (options[0]["confirmed"] or options[0]["confidence"] >= 0.85):
+            suggestions.append({"field": field, **options[0]})
+    if any(item.get("kind") == "telegram_identity" for item in conflicts):
+        suggestions = []
+    return {"suggestions": suggestions, "conflicts": conflicts}
 
 
 def _save_uploaded_photo(image_data: str, image_mime: str) -> dict:
@@ -165,7 +205,7 @@ async def review_detail(listing_id: int) -> dict:
     if row is None:
         raise HTTPException(status_code=404, detail="review card not found")
     ocr = await pool.fetch(
-        "SELECT id,media_path,classification,review_status,status,confidence,engine_version,fields_json, "
+        "SELECT id,media_path,classification,human_classification,review_status,status,confidence,engine_version,fields_json,evidence_json, "
         "LEFT(raw_text,6000) AS text FROM listing_media_ocr "
         "WHERE listing_id=$1 OR raw_id=$2 OR profile_result_id IN "
         "(SELECT id FROM profile_collection_results WHERE job_id=$3) "
@@ -208,6 +248,7 @@ async def review_detail(listing_id: int) -> dict:
         "source_title": row["source_title"],
         "source_posted_at": row["raw_posted_at"].isoformat() if row["raw_posted_at"] else None,
         "ocr": [{**dict(item), "fields_json": _decode(item["fields_json"], {})} for item in ocr],
+        "ocr_field_review": _review_ocr_fields(row, ocr),
         "reference_cards": reference_cards,
         "bot_evidence": [dict(item) for item in bots],
     }

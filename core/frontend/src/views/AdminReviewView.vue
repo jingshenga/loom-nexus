@@ -140,6 +140,13 @@ async function select(item) {
   };
 }
 
+function fillOcrSuggestions() {
+  for (const item of current.value?.ocr_field_review?.suggestions || []) {
+    if (form.value[item.field] == null || form.value[item.field] === "") form.value[item.field] = item.value;
+  }
+  notify("已将建议填入表单，可核对后保存");
+}
+
 function uncertainMediaPaths() {
   return (current.value?.media || [])
     .filter((item) => item.ocr_classification === "uncertain" && item.path)
@@ -995,6 +1002,19 @@ function onReviewVisibilityChange() {
             <RouterLink :to="{ path: '/admin/ocr', query: { media_path: ocr.media_path, status: 'all' } }" class="inline-flex text-sky-200 underline">查看图片和识别证据</RouterLink>
           </div>
         </details>
+        <section v-if="current.ocr_field_review?.suggestions?.length || current.ocr_field_review?.conflicts?.length" class="space-y-2 rounded-lg border border-amber-900/60 bg-amber-950/20 p-3 text-xs">
+          <p class="font-medium text-amber-100">OCR 字段建议与冲突</p>
+          <p v-for="item in current.ocr_field_review.suggestions" :key="item.field" class="break-words text-slate-300">
+            {{ comparisonFields[item.field] || item.field }} · {{ item.value }} · OCR #{{ item.ocr_id }}
+          </p>
+          <p v-for="(item, index) in current.ocr_field_review.conflicts" :key="index" class="break-words text-amber-200">
+            {{ comparisonFields[item.field] || (item.kind === 'telegram_identity' ? 'TG 身份' : item.field || 'OCR 字段') }}冲突
+            <span v-if="item.current != null"> · 当前 {{ item.current }}</span>
+            <span v-if="item.options?.length"> · OCR {{ item.options.map(option => option.value).join('、') }}</span>
+            <span v-else-if="item.values?.length"> · {{ item.values.join('、') }}</span>
+          </p>
+          <button v-if="current.ocr_field_review.suggestions.length" @click="fillOcrSuggestions" class="rounded border border-sky-700 px-2 py-1 text-sky-200">将建议填入空白字段</button>
+        </section>
         <details v-if="current.reference_cards?.length || current.bot_evidence?.length" class="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
           <summary class="cursor-pointer text-sm text-slate-300">已有卡片差异与 Bot 证据</summary>
           <div v-for="reference in current.reference_cards" :key="reference.id" class="mt-3 text-xs text-slate-300">

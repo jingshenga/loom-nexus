@@ -15,13 +15,15 @@ DECLARE
     original_ref JSONB;
     plan JSONB;
     outcome JSONB;
+    reuse_enabled BOOLEAN;
 BEGIN
+    SELECT value='1' INTO reuse_enabled FROM app_settings WHERE key='collection_reuse_enabled' FOR SHARE;
     SELECT j.* INTO job FROM profile_collection_jobs j
     JOIN ingest_rules rule ON rule.id=j.rule_id AND rule.rule_type='checkin_reverse' AND rule.is_active
     JOIN ingest_sources s ON s.id=j.source_id AND s.peer_id=p_source_peer_id AND s.is_active
     WHERE j.id=p_job_id FOR UPDATE OF j;
     IF NOT FOUND OR p_message_id IS NULL OR p_message_id <= 0
-       OR NOT EXISTS (SELECT 1 FROM app_settings WHERE key='collection_reuse_enabled' AND value='1')
+       OR NOT COALESCE(reuse_enabled,FALSE)
        OR (job.rule_version_id IS NOT NULL AND NOT EXISTS (
                 SELECT 1 FROM source_rule_bindings b WHERE b.source_id=job.source_id
                 AND b.rule_id=job.rule_id AND b.rule_version_id=job.rule_version_id)) THEN
@@ -37,6 +39,13 @@ BEGIN
     WHERE source_id=job.source_id AND platform_msg_id=p_message_id FOR UPDATE;
     IF NOT FOUND THEN
         RETURN jsonb_build_object('status','needs_review','reason','local_original_missing');
+    END IF;
+    -- A live read can supply missing original media without touching the
+    -- extraction state or replacing an existing revision's attachments.
+    IF p_expected_revision_id IS NULL AND original.raw_text IS NOT DISTINCT FROM p_description
+        AND original.extract_state NOT IN ('new','processing')
+        AND COALESCE(original.media_json,'[]')='[]'::jsonb AND COALESCE(p_media,'[]')<>'[]'::jsonb THEN
+        UPDATE raw_messages SET media_json=p_media WHERE id=original.id RETURNING * INTO original;
     END IF;
     SELECT rr.* INTO revision FROM raw_message_revisions rr WHERE rr.raw_id=original.id ORDER BY rr.revision DESC LIMIT 1;
     original_ref := jsonb_strip_nulls(jsonb_build_object('id',original.id,'platform_msg_id',p_message_id,
@@ -56,7 +65,14 @@ BEGIN
         outcome := jsonb_build_object('status','needs_review','reason','original_text_differs');
     ELSIF existing_listing IS NOT NULL OR plan->>'decision' IN ('reuse','end') THEN
         outcome := jsonb_build_object('status','skipped','reason','existing_original',
-                                      'listing_id',COALESCE(existing_listing,(plan->>'listing_id')::bigint));
+                                      'listing_id',COALESCE(existing_listing,(plan->>'listing_id')::bigint),
+                                      'live_checked',p_expected_revision_id IS NULL);
+        IF existing_listing IS NOT NULL AND p_expected_revision_id IS NULL THEN
+            UPDATE listings SET media_json=original.media_json,updated_at=NOW()
+            WHERE id=existing_listing AND status IN ('pending','duplicate_pending')
+              AND NOT (manual_fields ? 'media') AND COALESCE(media_json,'[]')='[]'::jsonb
+              AND COALESCE(original.media_json,'[]')<>'[]'::jsonb;
+        END IF;
     ELSIF active_review IS NOT NULL THEN
         outcome := jsonb_build_object('status','skipped','reason','existing_rule_review','rule_review_id',active_review);
     ELSIF original.extract_state IN ('new','processing') THEN

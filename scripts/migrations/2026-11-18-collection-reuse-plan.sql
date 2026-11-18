@@ -10,9 +10,17 @@ CREATE OR REPLACE FUNCTION nexus_collection_plan(
 LANGUAGE sql STABLE AS $fn$
     WITH input AS (
         SELECT s.peer_id AS source_peer_id,
-               lower(ltrim(btrim(COALESCE(p_username, '')), '@')) AS username
+               lower(ltrim(btrim(COALESCE(p_username, '')), '@')) AS username,
+               COALESCE(reuse.config,'{}') AS reuse_config
         FROM (SELECT 1) request
         LEFT JOIN ingest_sources s ON s.id = p_source_id
+        LEFT JOIN LATERAL (
+            SELECT COALESCE(v.config_json,r.config_json) AS config
+            FROM source_rule_bindings b JOIN ingest_rules r ON r.id=b.rule_id
+            LEFT JOIN rule_instance_versions v ON v.id=b.rule_version_id
+            WHERE b.source_id=s.id AND r.rule_type='checkin_reverse' AND r.is_active
+            ORDER BY b.priority DESC,r.id LIMIT 1
+        ) reuse ON TRUE
     ), candidates AS (
         SELECT l.*, r.source_id AS raw_source_id, j.source_id AS job_source_id,
                COALESCE((r.source_id = p_source_id AND r.platform_msg_id = p_message_id)
@@ -78,10 +86,20 @@ LANGUAGE sql STABLE AS $fn$
                ], NULL) || ARRAY(SELECT d.field_key::text FROM listing_field_definitions d
                                  WHERE d.is_active AND d.required_for_publish
                                    AND NULLIF(btrim(c.custom_fields->>d.field_key),'') IS NULL
-                                 ORDER BY d.field_key) AS missing_fields,
+                                 ORDER BY d.field_key) || required.missing AS missing_fields,
                listing_meets_publish_requirements(c.nickname,c.price_amount,c.description,
-                   c.contact_username,c.bot_url,c.media_json,c.custom_fields) AS complete
-        FROM selected c
+                   c.contact_username,c.bot_url,c.media_json,c.custom_fields)
+                   AND cardinality(required.missing)=0 AS complete
+        FROM selected c CROSS JOIN input i
+        CROSS JOIN LATERAL (
+            SELECT array_remove(ARRAY[
+                CASE WHEN (i.reuse_config->'reuse_required_fields') ? 'district'
+                  AND NULLIF(btrim(c.district),'') IS NULL THEN 'district' END,
+                CASE WHEN (i.reuse_config->'reuse_required_fields') ? 'verified_bot'
+                  AND NOT EXISTS (SELECT 1 FROM bot_collection_results b WHERE lower(b.contact_username)=i.username
+                                  AND b.verification_status='verified' AND b.bot_url<>'') THEN 'verified_bot' END
+            ],NULL) AS missing
+        ) required
     ), outcome AS (
         SELECT CASE
           WHEN i.source_peer_id IS NULL OR (p_source_peer_id IS NOT NULL AND p_source_peer_id <> i.source_peer_id)
@@ -95,6 +113,13 @@ LANGUAGE sql STABLE AS $fn$
           WHEN p_message_id IS NOT NULL AND NOT c.exact_message THEN 'different_original'
           WHEN r.observed_at > c.updated_at THEN 'newer_local_revision'
           WHEN NOT q.complete THEN 'missing_required_fields'
+          WHEN COALESCE((i.reuse_config->>'reuse_max_age_days')::int,0)>0
+            AND GREATEST(COALESCE(r.posted_at,c.created_at), (SELECT max(j.updated_at)
+                FROM profile_collection_jobs j WHERE j.source_id=p_source_id
+                  AND j.collection_plan_json#>>'{result,listing_id}'=c.id::text
+                  AND j.collection_plan_json#>>'{result,live_checked}'='true'))
+                < NOW()-make_interval(days=>(i.reuse_config->>'reuse_max_age_days')::int)
+            THEN 'reuse_evidence_expired'
           WHEN c.status IN ('pending','duplicate_pending') THEN 'existing_review'
           WHEN c.status = 'published' THEN 'complete_published'
           ELSE 'card_unavailable'

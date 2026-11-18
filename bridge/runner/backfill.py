@@ -11,6 +11,8 @@ import asyncio
 import json
 import logging
 import os
+from collections import Counter
+from pathlib import Path
 
 import asyncpg
 
@@ -25,10 +27,33 @@ SQL_SESSION_OF = sqlres.load("session_file_of.sql")
 SQL_SET_MEDIA = sqlres.load("set_media.sql")
 SQL_RESET_PRICE = sqlres.load("reset_missing_price.sql")
 SQL_RAW_IDS = sqlres.load("raw_ids_for_source.sql")
+SQL_EXISTING_ORIGINAL = sqlres.load("collection_existing_original.sql")
 
 POLL_S = float(os.getenv("NEXUS_BRIDGE_BACKFILL_INTERVAL", "3"))
 MEDIA_DIR = os.getenv("NEXUS_MEDIA_DIR", "/app/data/media")
 MAX_MEDIA_BYTES = int(os.getenv("NEXUS_BRIDGE_MEDIA_MAX_MB", "50")) * 1024 * 1024
+
+
+async def can_reuse_original(pool, source_id, anchor, parts):
+    row = await pool.fetchrow(SQL_EXISTING_ORIGINAL, source_id, anchor.id, getattr(anchor, "grouped_id", None))
+    if row is None or (row["raw_text"] or "").strip() != (anchor.raw_text or "").strip():
+        return False
+    media = row["media_json"] or []
+    if isinstance(media, str):
+        media = json.loads(media)
+    expected = Counter()
+    for part in parts:
+        if getattr(part, "photo", None):
+            expected["photo"] += 1
+        elif getattr(part, "video", None) or getattr(part, "video_note", None):
+            expected["video"] += 1
+    captured = Counter()
+    root = Path(MEDIA_DIR).resolve()
+    for item in media:
+        path = (root / (item.get("path") or "")).resolve()
+        if path.is_relative_to(root) and path.is_file():
+            captured[item.get("kind")] += 1
+    return captured == expected
 
 
 async def save_media(
@@ -106,7 +131,7 @@ def order_media(media: list) -> list:
     )
 
 
-async def _fetch_history(client, peer_id: int, limit: int, source_id: int):
+async def _fetch_history(client, peer_id: int, limit: int, source_id: int, pool=None):
     """[(msg_id, sender, grouped, text, date, media_json)] oldest first.
     Album parts sharing a grouped_id are MERGED into one row anchored
     on the caption-bearing part, carrying all photos + videos."""
@@ -118,6 +143,9 @@ async def _fetch_history(client, peer_id: int, limit: int, source_id: int):
         msg = messages[i]
         gid = getattr(msg, "grouped_id", None)
         if not gid:
+            if pool is not None and await can_reuse_original(pool, source_id, msg, [msg]):
+                i += 1
+                continue
             media = await save_media(msg, source_id)
             text = (msg.raw_text or "").strip()
             if text or media:
@@ -129,6 +157,8 @@ async def _fetch_history(client, peer_id: int, limit: int, source_id: int):
             group.append(messages[i])
             i += 1
         anchor = next((m for m in group if (m.raw_text or "").strip()), group[0])
+        if pool is not None and await can_reuse_original(pool, source_id, anchor, group):
+            continue
         media = []
         for part in group:
             media.extend(await save_media(part, source_id))
@@ -141,7 +171,7 @@ async def _fetch_history(client, peer_id: int, limit: int, source_id: int):
 
 
 async def _backfill_history(pool, job, client) -> int:
-    history = await _fetch_history(client, job["peer_id"], job["msg_limit"], job["source_id"])
+    history = await _fetch_history(client, job["peer_id"], job["msg_limit"], job["source_id"], pool)
     inserted = 0
     for msg_id, sender, grouped, text, date, media in history:
         rows = await pool.fetch(

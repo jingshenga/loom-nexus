@@ -18,12 +18,14 @@ import os
 import time
 
 from runner import accounts, duty, hub, source_routing, sqlres
-from runner.backfill import save_media
+from runner.backfill import can_reuse_original, save_media
 from runner.listener import LINK_PATTERN, expand_embedded_links, order_media
 
 logger = logging.getLogger("nexus-bridge.protocol")
 
 SESSION_DIR = os.getenv("NEXUS_BRIDGE_SESSION_DIR", "/app/data/sessions")
+SQL_ADVANCE_SOURCE = sqlres.load("advance_source.sql")
+SQL_RECORD_ORIGINAL_EDIT = sqlres.load("collection_record_original_edit.sql")
 
 RECONCILE_S = 60.0
 
@@ -42,11 +44,14 @@ def _make_link_fetcher(client):
     return fetch_target
 
 
-def _make_handler(pipeline, source_id, client):
+def _make_handler(pipeline, source_id, client, pool=None):
     async def handler(event):
         msg = event.message
-        media = await save_media(msg, source_id)
         text = msg.raw_text or ""
+        if pool is not None and not LINK_PATTERN.search(text) and await can_reuse_original(pool, source_id, msg, [msg]):
+            await pool.fetch(SQL_ADVANCE_SOURCE, source_id, msg.id)
+            return
+        media = await save_media(msg, source_id)
         if LINK_PATTERN.search(text):
             text, fetched = await expand_embedded_links(text, _make_link_fetcher(client))
             logger.info("type-B message %s merged %d link target(s)", msg.id, fetched)
@@ -62,7 +67,7 @@ def _make_handler(pipeline, source_id, client):
     return handler
 
 
-def _make_album_handler(pipeline, source_id, client):
+def _make_album_handler(pipeline, source_id, client, pool=None):
     async def handler(event):
         messages = sorted(event.messages, key=lambda msg: msg.id)
         if not messages:
@@ -71,11 +76,14 @@ def _make_album_handler(pipeline, source_id, client):
             (msg for msg in messages if (msg.raw_text or "").strip()),
             messages[0],
         )
+        text = caption.raw_text or ""
+        if pool is not None and not LINK_PATTERN.search(text) and await can_reuse_original(pool, source_id, caption, messages):
+            await pool.fetch(SQL_ADVANCE_SOURCE, source_id, caption.id)
+            return
         parts = await asyncio.gather(
             *(save_media(msg, source_id) for msg in messages)
         )
         media = order_media([entry for part in parts for entry in part])
-        text = caption.raw_text or ""
         if LINK_PATTERN.search(text):
             text, fetched = await expand_embedded_links(text, _make_link_fetcher(client))
             logger.info("type-B album %s merged %d link target(s)", event.grouped_id, fetched)
@@ -88,6 +96,15 @@ def _make_album_handler(pipeline, source_id, client):
             media=media,
             posted_at=caption.date,
         )
+    return handler
+
+
+def _make_original_edit_handler(pool, source_id):
+    async def handler(event):
+        message = event.message
+        # The stored anchor is the only part whose caption belongs to this raw.
+        # Updating text captures a revision without requeueing extraction.
+        await pool.execute(SQL_RECORD_ORIGINAL_EDIT, source_id, message.id, message.raw_text or "")
     return handler
 
 
@@ -269,14 +286,17 @@ async def run_protocol_intake(pipeline, pool, stop) -> None:
                     chats=meta["peer_id"],
                     func=lambda event: event.message.grouped_id is None,
                 )
-                standalone_handler = _make_handler(pipeline, meta["source_id"], client)
+                standalone_handler = _make_handler(pipeline, meta["source_id"], client, pool)
                 client.add_event_handler(standalone_handler, standalone_event)
                 album_event = events.Album(chats=meta["peer_id"])
-                album_handler = _make_album_handler(pipeline, meta["source_id"], client)
+                album_handler = _make_album_handler(pipeline, meta["source_id"], client, pool)
                 client.add_event_handler(album_handler, album_event)
+                edit_event = events.MessageEdited(chats=meta["peer_id"])
+                edit_handler = _make_original_edit_handler(pool, meta["source_id"])
+                client.add_event_handler(edit_handler, edit_event)
                 handlers[key] = (
                     client,
-                    [(standalone_handler, standalone_event), (album_handler, album_event)],
+                    [(standalone_handler, standalone_event), (album_handler, album_event), (edit_handler, edit_event)],
                 )
                 logger.info(
                     "listening: %s (peer=%s account=%s)",

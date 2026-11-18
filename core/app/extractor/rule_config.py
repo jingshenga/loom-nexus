@@ -174,6 +174,12 @@ def validate_rule_config(rule_type: str, config: dict, *, strict: bool = True) -
             errors.append("source_username must be a public Telegram username")
         if strict and config.get("collection_mode", "checkin_source_reverse") != "checkin_source_reverse":
             errors.append("unsupported checkin_reverse collection_mode")
+        age = config.get("reuse_max_age_days", 0)
+        if type(age) is not int or not 0 <= age <= 3650:
+            errors.append("复用资料有效期必须是 0 至 3650 天的整数")
+        fields = config.get("reuse_required_fields", [])
+        if not isinstance(fields, list) or any(field not in ("district", "verified_bot") for field in fields):
+            errors.append("额外复用必填项可选区域或已核验 Bot")
     elif rule_type == "bot_collection":
         if strict and set(config) - {"parser_key", "precheck_enabled", "allow_pending_cards",
                                      "reuse_verified_days", "reuse_no_bot_days"}:

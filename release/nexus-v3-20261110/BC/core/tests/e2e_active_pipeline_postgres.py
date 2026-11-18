@@ -25,9 +25,13 @@ RULE_BASE = {
 
 async def main():
     settings = get_settings()
+    assert settings.db_host == "127.0.0.1" and settings.db_name == "nexus_collection", "isolated database required"
     assert settings.active_router_enabled and not settings.active_router_kill_switch
     assert SOURCE_ID in {int(x.strip()) for x in settings.active_router_source_ids.split(",") if x.strip()}
     pool = await asyncpg.create_pool(**settings.db_kwargs(), min_size=1, max_size=5)
+    if await pool.fetchval("SELECT EXISTS(SELECT 1 FROM ingest_sources WHERE id=$1)", SOURCE_ID):
+        await pool.close()
+        raise RuntimeError("isolated fixture source ID is already in use")
     suffix = uuid.uuid4().hex[:10]
     peer_id = -int(uuid.uuid4().int % 8_000_000_000) - 1
     raw_ids, listing_ids, rule_ids = [], [], []
@@ -75,9 +79,12 @@ async def main():
     try:
         await pool.execute(
             "INSERT INTO ingest_sources(id,peer_id,title,username,router_mode) "
-            "VALUES($1,$2,$3,$4,'active') ON CONFLICT(id) DO UPDATE SET "
-            "peer_id=EXCLUDED.peer_id,title=EXCLUDED.title,username=EXCLUDED.username,router_mode='active'",
+            "VALUES($1,$2,$3,$4,'active')",
             SOURCE_ID, peer_id, f"isolated Active release {suffix}", f"activee2e{suffix}",
+        )
+        await pool.execute(
+            "INSERT INTO active_router_guard_state(source_id,heartbeat_at,health_status,active_started_at) "
+            "VALUES($1,NOW(),'healthy',NOW())", SOURCE_ID,
         )
 
         await add_rule("normal", {

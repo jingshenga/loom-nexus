@@ -5,6 +5,7 @@ DO $test$
 DECLARE
     source_id BIGINT;
     other_source_id BIGINT;
+    reuse_rule_id BIGINT;
     raw_id BIGINT;
     card_id BIGINT;
     plan JSONB;
@@ -27,6 +28,18 @@ BEGIN
     IF plan->>'reason' <> 'complete_published' OR plan->>'listing_id' IS DISTINCT FROM card_id::text THEN
         RAISE EXCEPTION 'Expected direct reuse of a complete published card: %', plan;
     END IF;
+    INSERT INTO ingest_rules(rule_name,rule_type,config_json) VALUES('fixture reuse requirements','checkin_reverse',
+         '{"reuse_required_fields":["district"],"reuse_max_age_days":7}') RETURNING id INTO reuse_rule_id;
+    INSERT INTO source_rule_bindings(source_id,rule_id) VALUES(source_id,reuse_rule_id);
+    plan := nexus_collection_plan(source_id,501,-10012340001,'fixture_contact');
+    IF plan->>'reason' <> 'missing_required_fields' OR NOT (plan->'missing_fields' ? 'district') THEN
+        RAISE EXCEPTION 'Source reuse policy must request the missing district: %',plan;
+    END IF;
+    UPDATE listings SET district='fixture district',created_at=NOW()-INTERVAL '100 days' WHERE id=card_id;
+    IF nexus_collection_plan(source_id,501,-10012340001,'fixture_contact')->>'reason' <> 'reuse_evidence_expired' THEN
+        RAISE EXCEPTION 'Expired original evidence should be refreshed';
+    END IF;
+    DELETE FROM source_rule_bindings b WHERE b.rule_id=reuse_rule_id;
     IF nexus_collection_plan(source_id,501,-10012340002,'fixture_contact')->>'reason' <> 'source_unverified' THEN
         RAISE EXCEPTION 'Wrong source peer should be blocked';
     END IF;

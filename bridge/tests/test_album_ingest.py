@@ -1,8 +1,10 @@
 import sys
+import tempfile
 import types
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 
 try:
@@ -13,6 +15,7 @@ except ModuleNotFoundError:
     sys.modules["asyncpg"] = asyncpg_stub
 
 from runner.backfill import order_media as backfill_order_media
+from runner.backfill import can_reuse_original
 from runner.listener import order_media as listener_order_media
 from runner.protocol import _make_album_handler
 
@@ -28,6 +31,19 @@ class AlbumMessage:
 
 
 class AlbumIngestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reuse_requires_complete_existing_files_and_same_text(self):
+        anchor = AlbumMessage(5256, "photo", "fixture caption")
+        anchor.photo = object()
+        pool = types.SimpleNamespace(fetchrow=AsyncMock(return_value={
+            "raw_text": "fixture caption", "media_json": [{"kind": "photo", "path": "fixture.jpg"}],
+        }))
+        with tempfile.TemporaryDirectory() as temp, patch("runner.backfill.MEDIA_DIR", temp):
+            self.assertFalse(await can_reuse_original(pool, 2, anchor, [anchor]))
+            Path(temp, "fixture.jpg").touch()
+            self.assertTrue(await can_reuse_original(pool, 2, anchor, [anchor]))
+            anchor.raw_text = "fixture revised caption"
+            self.assertFalse(await can_reuse_original(pool, 2, anchor, [anchor]))
+
     async def test_album_is_downloaded_as_one_event_and_keeps_all_media(self):
         messages = [
             AlbumMessage(5256, "video", "昵称：舒舒"),
