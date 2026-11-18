@@ -19,6 +19,7 @@ SOURCE_PEER_ID = -1003083173117
 SERVICE_ACTOR_ID = int(os.environ.get("NEXUS_ACTIVE_GUARD_ACTOR_ID", "4"))
 CORE_URL = os.environ.get("NEXUS_ACTIVE_GUARD_CORE_URL", "http://nexus-core:8000").rstrip("/")
 POLL_SECONDS = 15
+ROUTER_MODE_LOCK = 814271002
 MAX_ACTIVE_ERRORS_15M = 3
 MAX_PENDING_REVIEW = 100
 MAX_PENDING_AGE_SECONDS = 1800
@@ -94,27 +95,20 @@ async def write_heartbeat(conn, healthy, metrics=None, error=None):
 
 
 async def rollback_to_legacy(conn, reason):
-    async with conn.transaction():
-        rows = await conn.fetch(
-            "SELECT id,router_mode FROM ingest_sources WHERE router_mode<>'legacy' FOR UPDATE",
-        )
-        if not any(int(row["id"]) == SOURCE_ID for row in rows):
-            exists = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM ingest_sources WHERE id=$1)", SOURCE_ID)
-            if not exists:
-                raise RuntimeError("approved Active source is missing")
-        for row in rows:
-            source_id = int(row["id"])
-            previous = row["router_mode"]
-            await conn.execute("UPDATE ingest_sources SET router_mode='legacy' WHERE id=$1", source_id)
-            await conn.execute(
-                "INSERT INTO rule_router_mode_events(source_id,previous_mode,new_mode,actor_user_id) "
-                "VALUES($1,$2,'legacy',$3)", source_id, previous, SERVICE_ACTOR_ID,
-            )
-            log.error("automatic Legacy rollback source=%s reason=%s", source_id, reason)
+    rows = await conn.fetch(
+        "UPDATE ingest_sources SET router_mode='legacy' WHERE router_mode='active' RETURNING id",
+    )
+    for row in rows:
+        source_id = int(row["id"])
         await conn.execute(
-            "UPDATE active_router_guard_state SET active_started_at=NULL,active_baseline_json='{}'::jsonb,"
-            "last_rollback_reason=$2,updated_at=NOW() WHERE source_id=$1", SOURCE_ID, reason,
+            "INSERT INTO rule_router_mode_events(source_id,previous_mode,new_mode,actor_user_id) "
+            "VALUES($1,'active','legacy',$2)", source_id, SERVICE_ACTOR_ID,
         )
+        log.error("automatic Legacy rollback source=%s reason=%s", source_id, reason)
+    await conn.execute(
+        "UPDATE active_router_guard_state SET active_started_at=NULL,active_baseline_json='{}'::jsonb,"
+        "last_rollback_reason=$2,updated_at=NOW() WHERE source_id=$1", SOURCE_ID, reason,
+    )
 
 
 def anomaly_reason(metrics, state):
@@ -129,7 +123,7 @@ def anomaly_reason(metrics, state):
     modes = {int(item["id"]): item["mode"] for item in (metrics.get("modes") or [])}
     if set(modes) != {1, 2, 5, 6}:
         return "source_set_changed"
-    if any(mode != "legacy" for source_id, mode in modes.items() if source_id != SOURCE_ID):
+    if any(mode not in {"legacy", "shadow"} for source_id, mode in modes.items() if source_id != SOURCE_ID):
         return "unexpected_active_source"
     baseline = _json_object(state["active_baseline_json"])
     if not baseline:
@@ -166,22 +160,26 @@ async def check_once():
             health_ok = core_health()
         except Exception as exc:
             await write_heartbeat(conn, False, error=type(exc).__name__)
-        metrics = json.loads(await conn.fetchval(METRICS_SQL))
-        row = await conn.fetchrow(
-            "SELECT active_started_at,active_baseline_json FROM active_router_guard_state WHERE source_id=$1",
-            SOURCE_ID,
-        )
-        modes = {int(item["id"]): item["mode"] for item in (metrics.get("modes") or [])}
-        if modes.get(SOURCE_ID) == "active":
-            if not health_ok:
-                await rollback_to_legacy(conn, "core_health_check_failed")
-            elif row is None or row["active_started_at"] is None:
-                await rollback_to_legacy(conn, "active_mode_has_no_guard_lease")
-            else:
-                reason = anomaly_reason(metrics, row)
-                if reason:
-                    await rollback_to_legacy(conn, reason)
-        await write_heartbeat(conn, health_ok, metrics, None if health_ok else "core_health_check_failed")
+        async with conn.transaction():
+            await conn.fetchval("SELECT pg_advisory_xact_lock($1)", ROUTER_MODE_LOCK)
+            metrics = json.loads(await conn.fetchval(METRICS_SQL))
+            row = await conn.fetchrow(
+                "SELECT active_started_at,active_baseline_json FROM active_router_guard_state WHERE source_id=$1",
+                SOURCE_ID,
+            )
+            modes = {int(item["id"]): item["mode"] for item in (metrics.get("modes") or [])}
+            if any(mode == "active" for source_id, mode in modes.items() if source_id != SOURCE_ID):
+                await rollback_to_legacy(conn, "unexpected_active_source")
+            elif modes.get(SOURCE_ID) == "active":
+                if not health_ok:
+                    await rollback_to_legacy(conn, "core_health_check_failed")
+                elif row is None or row["active_started_at"] is None:
+                    await rollback_to_legacy(conn, "active_mode_has_no_guard_lease")
+                else:
+                    reason = anomaly_reason(metrics, row)
+                    if reason:
+                        await rollback_to_legacy(conn, reason)
+            await write_heartbeat(conn, health_ok, metrics, None if health_ok else "core_health_check_failed")
         if not health_ok:
             log.error("Core health check failed; source Active state has been revoked")
     finally:

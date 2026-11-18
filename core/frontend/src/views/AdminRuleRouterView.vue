@@ -141,9 +141,9 @@ async function setMode(mode) {
   const modeName = mode === "shadow" ? "Shadow" : mode === "active" ? "Active" : "Legacy";
   const prompt = "确定只对来源「" + source.title + "」(ID " + source.source_id + ") 切换为 " + modeName + "？\n\n"
     + (mode === "active"
-      ? "Active 首轮为审核优先：新结果进入审核，不自动上架；身份不清、冲突或异常均进入待审，Lifecycle 仍由人工审核。"
+      ? "当前仅来源 2 可启用 Active，持续守护需在线。其他来源可使用 Legacy 或仅记录诊断的 Shadow。新结果进入人工审核，Lifecycle 仍由人工审核。"
       : mode === "shadow"
-      ? "Shadow 只记录预测，Legacy 继续处理实际数据；启用前需已部署相应数据库结构。"
+      ? "Shadow 只记录诊断，实际数据继续由 Legacy 处理。它可以与另一来源的 Active 同时运行。"
       : "后续消息会回到 Legacy 路径。")
     + "\n操作会记录管理员身份和变更时间。";
   if (!window.confirm(prompt)) return;

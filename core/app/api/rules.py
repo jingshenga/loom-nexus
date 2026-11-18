@@ -758,8 +758,8 @@ async def set_source_router_mode(source_id: int, body: RouterModeBody,
         raise HTTPException(status_code=409, detail="Active 未获准：需开启全局开关、关闭急停并仅白名单此来源")
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await conn.fetchval("SELECT pg_advisory_xact_lock($1)", 814271002)
             if body.mode == "active":
-                await conn.fetchval("SELECT pg_advisory_xact_lock($1)", 814271002)
                 supported_rules = await conn.fetch(
                     "SELECT DISTINCT r.rule_type FROM source_rule_bindings b "
                     "JOIN ingest_rules r ON r.id=b.rule_id WHERE b.source_id=$1 AND r.is_active",
