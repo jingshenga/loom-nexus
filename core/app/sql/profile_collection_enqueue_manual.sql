@@ -10,13 +10,16 @@ WITH candidate AS (
     ORDER BY COALESCE(a.duty_profile_lookup_after, '-infinity'::timestamptz),
              b.priority DESC, s.id
     LIMIT 1
+), precheck AS MATERIALIZED (
+    SELECT candidate.*, nexus_bot_collection_precheck(rule_id, source_id, $2::text) AS skip_reason
+    FROM candidate
 ), inserted AS (
     INSERT INTO profile_collection_jobs (
         rule_id, duty_date, source_id, account_id, contact_username, target_peer_id
     )
     SELECT rule_id, (NOW() AT TIME ZONE 'Asia/Shanghai')::date,
            source_id, account_id, $2::text, NULL
-    FROM candidate
+    FROM precheck WHERE skip_reason IS NULL
     ON CONFLICT (rule_id, duty_date, lower(contact_username))
         WHERE target_msg_id IS NULL DO UPDATE SET
         status = CASE
@@ -31,4 +34,5 @@ WITH candidate AS (
         updated_at = NOW()
     RETURNING id, status
 )
-SELECT id AS job_id, status FROM inserted;
+SELECT id AS job_id, status, NULL::text AS skip_reason FROM inserted
+UNION ALL SELECT NULL::bigint, 'skipped', skip_reason FROM precheck WHERE skip_reason IS NOT NULL;

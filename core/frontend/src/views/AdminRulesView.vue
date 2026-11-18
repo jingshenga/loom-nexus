@@ -24,6 +24,7 @@ const dialogs = ref([]);
 const dutyDialogKey = ref("");
 const dutyForm = ref({});
 const profileForm = ref({});
+const botForm = ref({});
 const profileResults = ref([]);
 const profileSummary = ref(null);
 const historyScan = ref(null);
@@ -59,6 +60,11 @@ const EMPTY_PROFILE_CONFIG = {
   skip_video_when_photo_found: true,
   exclude_avatar: true,
   pinned_followup_messages: 5,
+};
+const EMPTY_BOT_CONFIG = { precheck_enabled: false, allow_pending_cards: false, reuse_verified_days: 30, reuse_no_bot_days: 7 };
+const botSkipReasons = {
+  no_valid_contact: "没有有效 TG 联系方式", contact_conflict: "TG 身份有冲突", no_eligible_card: "没有符合条件的卡片",
+  verified_result_available: "复用已核验 Bot", recent_no_bot: "近期已查询，没有 Bot",
 };
 
 const EMPTY_CHECKIN_CONFIG = { collection_mode: "checkin_source_reverse", source_username: "" };
@@ -123,6 +129,7 @@ function select(rule) {
   dryrun.value = null;
   dutyForm.value = { ...EMPTY_DUTY_CONFIG, ...(rule.config || {}) };
   profileForm.value = { ...EMPTY_PROFILE_CONFIG, ...(rule.config || {}) };
+  botForm.value = { ...EMPTY_BOT_CONFIG, ...(rule.config || {}) };
   checkinForm.value = { ...EMPTY_CHECKIN_CONFIG, ...(rule.config || {}) };
   // default the sample drawer to the first group this rule is bound to
   const first = (rule.bindings || [])[0];
@@ -182,7 +189,22 @@ async function enqueueProfileUsername() {
   });
   profileUsernames.value = "";
   await loadProfileResults();
-  notify(`已提交 ${data.queued} 个 TG 号，${data.skipped} 个未入队`);
+  const reasons = [...new Set((data.skip_reasons || []).map(item => botSkipReasons[item.reason] || item.reason))];
+  notify(`已提交 ${data.queued} 个 TG 号，${data.skipped} 个未入队${reasons.length ? ' · ' + reasons.join('、') : ''}`);
+}
+
+async function previewBot() {
+  const username = profileUsernames.value.trim().split(/[\n\r,，;；\s]+/)[0];
+  if (!username || !profileSourceId.value) return notify("请输入 TG 号并选择采集账号来源");
+  try {
+    const result = await api(`/api/admin/rules/${current.value.id}/bot-collection/preview`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source_id: profileSourceId.value, username }),
+    });
+    notify(result.eligible ? "按已启用规则，此 TG 号可进入 Bot 查询" : botSkipReasons[result.reason]);
+  } catch (e) {
+    notify(e.message || "Bot 预览失败");
+  }
 }
 
 async function requeueIneffectiveProfiles() {
@@ -197,11 +219,13 @@ async function requeueIneffectiveProfiles() {
 function newRule() {
   current.value = { rule_name: "", rule_type: activeTab.value, is_active: true };
   const config = activeTab.value === "on_duty" ? EMPTY_DUTY_CONFIG
-    : ["profile_collection", "bot_collection"].includes(activeTab.value) ? EMPTY_PROFILE_CONFIG
+    : activeTab.value === "bot_collection" ? EMPTY_BOT_CONFIG
+      : activeTab.value === "profile_collection" ? EMPTY_PROFILE_CONFIG
       : activeTab.value === "checkin_reverse" ? EMPTY_CHECKIN_CONFIG : EMPTY_CONFIG;
   configText.value = JSON.stringify(config, null, 2);
   dutyForm.value = { ...EMPTY_DUTY_CONFIG };
   profileForm.value = { ...EMPTY_PROFILE_CONFIG };
+  botForm.value = { ...EMPTY_BOT_CONFIG, precheck_enabled: true };
   checkinForm.value = { ...EMPTY_CHECKIN_CONFIG };
   profileResults.value = [];
   profileSummary.value = null;
@@ -231,7 +255,8 @@ function switchTab(tab) {
 async function save() {
   let config;
   if (activeTab.value === "on_duty") config = { ...dutyForm.value };
-  else if (["profile_collection", "bot_collection"].includes(activeTab.value)) config = { ...profileForm.value };
+  else if (activeTab.value === "profile_collection") config = { ...profileForm.value };
+  else if (activeTab.value === "bot_collection") config = { ...botForm.value };
   else if (activeTab.value === "checkin_reverse") config = { ...checkinForm.value };
   else {
     try {
@@ -719,9 +744,19 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
           TG号采集V2 独立运行。输入一个或多个 TG 号提交后，按个人简介和关联公开频道采集；结果进入专属审核页，不覆盖已有卡片。
         </div>
         <div v-else class="rounded-xl border border-violet-800/50 bg-violet-950/20 p-4 text-xs leading-relaxed text-slate-300">
-          只读取 TG 个人名片中的 Bot 联系地址并回填相同 TG 号的卡片；不扫描关联频道。提交支持单个或多个 TG 号，任务遵守账号冷却。
+          读取 TG 个人名片中的 Bot 候选，确认归属后供卡片使用。规则按来源生效，任务遵守账号冷却。
         </div>
-        <div class="grid gap-3 rounded-xl border border-slate-800 bg-slate-900/50 p-4 sm:grid-cols-2">
+        <div v-if="activeTab === 'bot_collection'" class="grid gap-3 rounded-xl border border-slate-800 bg-slate-900/50 p-4 sm:grid-cols-2">
+          <label class="flex items-center gap-2 text-xs text-slate-300 sm:col-span-2"><input v-model="botForm.precheck_enabled" type="checkbox" />采集前核对卡片、TG 联系方式和已有结果</label>
+          <label class="flex items-center gap-2 text-xs text-slate-300 sm:col-span-2"><input v-model="botForm.allow_pending_cards" type="checkbox" />允许字段完整的待审卡片发起 Bot 查询</label>
+          <label class="text-xs text-slate-400">已核验结果复用天数
+            <input v-model.number="botForm.reuse_verified_days" type="number" min="0" max="365" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
+          </label>
+          <label class="text-xs text-slate-400">未发现 Bot 的结果复用天数
+            <input v-model.number="botForm.reuse_no_bot_days" type="number" min="0" max="365" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
+          </label>
+        </div>
+        <div v-else class="grid gap-3 rounded-xl border border-slate-800 bg-slate-900/50 p-4 sm:grid-cols-2">
           <label class="text-xs text-slate-400">先检查最近消息数
             <input v-model.number="profileForm.recent_window" type="number" min="1" max="10"
               class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm" />
@@ -903,6 +938,7 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
             class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs"></textarea>
           <div class="flex flex-wrap gap-2">
             <button @click="enqueueProfileUsername" class="rounded-lg bg-sky-600 px-3 py-2 text-xs font-medium hover:bg-sky-500">提交采集</button>
+            <button v-if="activeTab === 'bot_collection'" @click="previewBot" class="rounded-lg border border-sky-700 px-3 py-2 text-xs text-sky-200">预览首个 TG 号</button>
             <button v-if="activeTab === 'profile_collection'" @click="requeueIneffectiveProfiles" class="rounded-lg border border-amber-700/60 px-3 py-2 text-xs text-amber-300 hover:bg-amber-900/30">重采无有效资料</button>
           </div>
         </div>

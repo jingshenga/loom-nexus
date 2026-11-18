@@ -174,8 +174,16 @@ def validate_rule_config(rule_type: str, config: dict, *, strict: bool = True) -
             errors.append("source_username must be a public Telegram username")
         if strict and config.get("collection_mode", "checkin_source_reverse") != "checkin_source_reverse":
             errors.append("unsupported checkin_reverse collection_mode")
-    elif rule_type == "bot_collection" and strict and set(config) - {"parser_key"}:
-        errors.append("bot_collection does not accept configurable scripts or payloads")
+    elif rule_type == "bot_collection":
+        if strict and set(config) - {"parser_key", "precheck_enabled", "allow_pending_cards",
+                                     "reuse_verified_days", "reuse_no_bot_days"}:
+            errors.append("Bot 规则只接受前置条件与结果复用设置")
+        for key in ("precheck_enabled", "allow_pending_cards"):
+            if key in config and not isinstance(config[key], bool):
+                errors.append(f"Bot 配置 {key} 必须是布尔值")
+        for key in ("reuse_verified_days", "reuse_no_bot_days"):
+            if key in config and (type(config[key]) is not int or not 0 <= config[key] <= 365):
+                errors.append(f"Bot 配置 {key} 必须是 0 至 365 的整数")
     return errors
 
 

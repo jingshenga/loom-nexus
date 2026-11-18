@@ -248,8 +248,6 @@ async def list_rules() -> dict:
 @router.put("")
 async def upsert_rule(body: RuleBody, authorization: str = Header(default="")) -> dict:
     pool = _pool()
-    if body.rule_type == "bot_collection":
-        body.config = {}
     parser_key = body.parser_key or body.config.get("parser_key") or PARSER_BY_TYPE[body.rule_type]
     body.config["parser_key"] = parser_key
     if body.rule_type == "profile_collection":
@@ -1242,13 +1240,34 @@ async def enqueue_profile_collection(rule_id: int, body: ProfileCollectionEnqueu
     if len(usernames) > 100:
         raise HTTPException(status_code=422, detail="单次最多提交 100 个 TG 号")
     jobs = []
+    skipped = []
     for username in usernames:
         rows = await _pool().fetch(SQL_PROFILE_COLLECTION_ENQUEUE, rule_id, username, body.source_id)
-        if rows:
+        if rows and rows[0]["skip_reason"]:
+            skipped.append({"username": username, "reason": rows[0]["skip_reason"]})
+        elif rows:
             jobs.append({"job_id": rows[0]["job_id"], "username": username, "status": rows[0]["status"]})
-    if not jobs:
+    if not jobs and not skipped:
         raise HTTPException(status_code=409, detail="该规则没有已启用并绑定的采集来源/账号")
-    return {"jobs": jobs, "queued": len(jobs), "skipped": len(usernames) - len(jobs)}
+    return {"jobs": jobs, "queued": len(jobs), "skipped": len(usernames) - len(jobs), "skip_reasons": skipped}
+
+
+@router.post("/{rule_id}/bot-collection/preview")
+async def preview_bot_collection(rule_id: int, body: CollectionPreviewBody) -> dict:
+    pool = _pool()
+    eligible_binding = await pool.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM source_rule_bindings b JOIN ingest_rules r ON r.id=b.rule_id "
+        "JOIN ingest_sources s ON s.id=b.source_id JOIN bridge_accounts a ON a.id=s.assigned_account_id "
+        "WHERE b.rule_id=$1 AND b.source_id=$2 AND r.rule_type='bot_collection' "
+        "AND r.is_active AND s.is_active AND a.status='active')", rule_id, body.source_id,
+    )
+    if not eligible_binding:
+        raise HTTPException(status_code=409, detail="该 Bot 规则没有已启用的来源和采集账号")
+    username = body.username.strip().lstrip("@").lower()
+    if not re.fullmatch(r"[a-z][a-z0-9_]{3,31}", username):
+        raise HTTPException(status_code=422, detail="请输入有效的 Telegram 用户名")
+    reason = await pool.fetchval("SELECT nexus_bot_collection_precheck($1,$2,$3)", rule_id, body.source_id, username)
+    return {"eligible": reason is None, "reason": reason}
 
 
 @router.post("/{rule_id}/profile-collection/requeue-ineffective")

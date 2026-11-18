@@ -39,6 +39,8 @@ SQL_PROFILE_LISTING = sqlres.load("profile_collection_listing.sql")
 SQL_CHECKIN_PLAN = sqlres.load("checkin_collection_plan.sql")
 SQL_CHECKIN_PLAN_RECORD = sqlres.load("checkin_collection_plan_record.sql")
 SQL_CHECKIN_STAGE = sqlres.load("checkin_stage_original.sql")
+SQL_BOT_PRECHECK = sqlres.load("bot_collection_precheck.sql")
+SQL_BOT_DISCOVERY = sqlres.load("bot_collection_discovery.sql")
 SQL_CHECKIN_INDEX_USERNAME = sqlres.load("checkin_index_by_username.sql")
 SQL_CHECKIN_INDEX_NICKNAME = sqlres.load("checkin_index_by_nickname.sql")
 
@@ -296,8 +298,6 @@ async def _profile_channel(pool, client, job, full, user, about, saved_channel_u
                 pass
 
     links = _profile_links(about or "")
-    lookup_failures = 0
-    resolved_non_bots = 0
     for name, msg_id in links[:8]:
         link = f"https://t.me/{name}" + (f"/{msg_id}" if msg_id else "")
         try:
@@ -305,27 +305,17 @@ async def _profile_channel(pool, client, job, full, user, about, saved_channel_u
         except Exception as exc:
             if _is_flood_wait(exc):
                 raise
-            lookup_failures += 1
             continue
         if getattr(entity, "bot", False):
             bot_url = bot_url or _entity_url(entity, link)
         elif channel is None and isinstance(entity, (Channel, Chat)):
             channel = entity
             channel_url = _entity_url(entity, link)
-        else:
-            resolved_non_bots += 1
         if bot_url and channel:
             break
 
     if getattr(user, "bot", False):
         bot_url = bot_url or f"https://t.me/{user.username}"
-    if job.get("rule_type") == "bot_collection":
-        logger.info(
-            "bot profile lookup (job=%s candidates=%s lookup_failures=%s "
-            "resolved_non_bots=%s found=%s)",
-            job["job_id"], min(len(links), 8), lookup_failures,
-            resolved_non_bots, bool(bot_url),
-        )
     return channel, channel_url, bot_url, personal_id, full_user
 
 
@@ -647,6 +637,40 @@ async def _collect_checkin_source(pool, client, job, cfg):
     return "fetched", None
 
 
+async def _inspect_profile_bots(pool, client, job, user, about):
+    links = _profile_links(about)
+    candidates = set()
+    lookup_failures = 0
+    for name, _message_id in links[:8]:
+        try:
+            entity = await _rate_limited_entity(pool, client, job["account_id"], name)
+        except Exception as exc:
+            if _is_flood_wait(exc):
+                raise
+            lookup_failures += 1
+            continue
+        if getattr(entity, "bot", False):
+            candidates.add(_entity_url(entity, f"https://t.me/{name}"))
+    if getattr(user, "bot", False):
+        outcome, status = "contact_is_bot", "needs_review"
+    elif len(candidates) > 1:
+        outcome, status = "multiple_bots", "needs_review"
+    elif lookup_failures or len(links) > 8:
+        outcome, status = "lookup_incomplete", "needs_review"
+    elif candidates:
+        outcome, status = "ownership_unverified", "fetched"
+    else:
+        outcome, status = "no_bot", "not_found"
+    urls = sorted(candidates)
+    await pool.execute(
+        SQL_BOT_DISCOVERY, job["job_id"], job["contact_username"],
+        f"https://t.me/{user.username or job['contact_username']}",
+        urls[0] if len(urls) == 1 else "",
+        json.dumps({"outcome": outcome, "candidate_urls": urls, "lookup_failures": lookup_failures}),
+    )
+    return status, None if status == "fetched" else outcome
+
+
 async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
     """Collect a bounded Telegram profile result and stage it for admin review."""
     cfg = job["config_json"]
@@ -655,6 +679,13 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
     cfg = cfg if isinstance(cfg, dict) else {}
     if job["rule_type"] == "checkin_reverse":
         return await _collect_checkin_source(pool, client, job, cfg)
+    if job["rule_type"] == "bot_collection":
+        reason = await pool.fetchval(SQL_BOT_PRECHECK, job["rule_id"], job["source_id"], job["contact_username"])
+        if reason:
+            if reason == "contact_conflict":
+                await pool.execute(SQL_BOT_DISCOVERY, job["job_id"], job["contact_username"], "", "",
+                                   json.dumps({"outcome": "contact_conflict"}))
+            return ("needs_review" if reason == "contact_conflict" else "skipped"), reason
     from telethon.tl.functions.users import GetFullUserRequest
 
     await _profile_progress(pool, job, "resolve_profile", 0, 1, "解析 Telegram 用户名")
@@ -665,25 +696,12 @@ async def _collect_profile_trial(pool, client, job) -> tuple[str, str | None]:
     await _profile_progress(pool, job, "resolve_profile", 1, 1, "已读取个人资料")
     full_user = full.full_user
     about = (getattr(full_user, "about", None) or "").strip()
+    if job["rule_type"] == "bot_collection":
+        return await _inspect_profile_bots(pool, client, job, user, about)
     await _profile_progress(pool, job, "resolve_channel", 0, 1, "解析个人简介中的关联频道")
     channel, channel_url, bot_url, _, full_user = await _profile_channel(
         pool, client, job, full, user, about, "", "",
     )
-    if job["rule_type"] == "bot_collection":
-        profile_url = f"https://t.me/{user.username or job['contact_username']}"
-        await pool.execute(
-            "INSERT INTO bot_collection_results(job_id,contact_username,profile_url,bot_url) "
-            "VALUES($1,$2,$3,$4) ON CONFLICT(job_id) DO UPDATE SET "
-            "contact_username=EXCLUDED.contact_username, profile_url=EXCLUDED.profile_url, "
-            "bot_url=EXCLUDED.bot_url, collected_at=NOW()",
-            job["job_id"], job["contact_username"], profile_url, bot_url or "",
-        )
-        # This collector records a candidate only. A Bot address alone is
-        # not proof that it belongs to the profile owner, and it must never
-        # publish or unpublish a Listing.
-        return ("fetched", None) if bot_url else (
-            "not_found", "Telegram 个人名片中未找到 Bot 地址"
-        )
     await _profile_progress(
         pool, job, "resolve_channel", 1, 1,
         f"关联频道：{channel_url or '未找到，使用个人公开资料'}",
@@ -1012,7 +1030,13 @@ async def run_duty_collection(pool, stop) -> None:
                         await pool.fetch(SQL_PROFILE_DEFER, job["job_id"], wait_s)
                         logger.warning("profile V2 job deferred by FloodWait (job=%s wait=%ss)",
                                        job["job_id"], wait_s)
+                    if job["rule_type"] != "bot_collection" or job["retry_count"] < 2:
                         continue
+                if job["rule_type"] == "bot_collection":
+                    await pool.execute(SQL_BOT_DISCOVERY, job["job_id"], job["contact_username"], "", "",
+                                       json.dumps({"outcome": "lookup_failed", "error_class": type(exc).__name__}))
+                    await pool.fetch(SQL_PROFILE_FINISH, job["job_id"], "needs_review", "lookup_failed")
+                else:
                     await pool.fetch(SQL_PROFILE_FINISH, job["job_id"], "failed", str(exc)[:1000])
                     logger.warning("profile V2 job failed (job=%s): %s", job["job_id"], exc)
         except Exception:

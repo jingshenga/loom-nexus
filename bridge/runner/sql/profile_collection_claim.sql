@@ -46,7 +46,7 @@ SET account_id = p.account_id, status = 'processing', error = NULL,
 FROM picked p
 WHERE j.id = p.id
 RETURNING j.id AS job_id, j.rule_id, j.duty_date, j.source_id, j.account_id,
-          j.contact_username, j.contact_nickname, j.target_peer_id, j.target_msg_id,
+          j.contact_username, j.contact_nickname, j.target_peer_id, j.target_msg_id, j.retry_count,
           ''::text AS channel_url, ''::text AS bot_url,
           (SELECT s.username FROM ingest_sources s WHERE s.id = j.source_id) AS source_username,
           (SELECT a.session_file FROM bridge_accounts a

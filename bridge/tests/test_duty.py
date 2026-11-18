@@ -52,6 +52,23 @@ class LinkedProfileMessage:
 
 
 class DutyProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bot_lookup_records_multiple_candidates_without_selecting_owner(self):
+        from unittest.mock import AsyncMock
+        from runner import duty_collection
+
+        pool = SimpleNamespace(execute=AsyncMock())
+        job = {"job_id": 4, "account_id": 2, "contact_username": "fixture_contact"}
+        user = SimpleNamespace(bot=False, username="fixture_contact")
+        entities = [SimpleNamespace(bot=True, username="fixture_first_bot"),
+                    SimpleNamespace(bot=True, username="fixture_second_bot")]
+        with patch.object(duty_collection, "_rate_limited_entity", AsyncMock(side_effect=entities)):
+            status, reason = await duty_collection._inspect_profile_bots(
+                pool, object(), job, user, "Bot: @fixture_first_bot @fixture_second_bot",
+            )
+        self.assertEqual((status, reason), ("needs_review", "multiple_bots"))
+        self.assertEqual(pool.execute.await_args.args[-2], "")
+        self.assertEqual(len(json.loads(pool.execute.await_args.args[-1])["candidate_urls"]), 2)
+
     async def test_checkin_reuses_complete_card_before_telegram_and_audits_ids(self):
         from unittest.mock import AsyncMock
         from runner import duty_collection

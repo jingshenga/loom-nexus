@@ -752,6 +752,7 @@ async def bot_recollect(body: RecollectBody) -> dict:
     if not ids or len(ids) > 20:
         raise HTTPException(status_code=400, detail="select between 1 and 20 cards")
     jobs = []
+    skipped = []
     async with pool.acquire() as conn:
         async with conn.transaction():
             for listing_id in ids:
@@ -774,6 +775,11 @@ async def bot_recollect(body: RecollectBody) -> dict:
                         status_code=409,
                         detail=f"卡片 #{listing_id} 没有可用 TG 号、Bot 规则或采集账号",
                     )
+                reason = await conn.fetchval("SELECT nexus_bot_collection_precheck($1,$2,$3)",
+                                             target["rule_id"], target["source_id"], target["contact_username"])
+                if reason:
+                    skipped.append({"listing_id": listing_id, "reason": reason})
+                    continue
                 row = await conn.fetchrow(
                     "INSERT INTO profile_collection_jobs "
                     "(rule_id,duty_date,source_id,account_id,contact_username,target_peer_id) "
@@ -787,7 +793,7 @@ async def bot_recollect(body: RecollectBody) -> dict:
                     target["rule_id"], target["source_id"], target["account_id"], target["contact_username"],
                 )
                 jobs.append({"job_id": row["id"], "listing_id": listing_id, "status": row["status"]})
-    return {"jobs": jobs, "queued": len(jobs)}
+    return {"jobs": jobs, "queued": len(jobs), "skipped": len(skipped), "skip_reasons": skipped}
 
 
 @router.get("/recollect/status")
