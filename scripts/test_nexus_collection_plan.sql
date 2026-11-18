@@ -40,6 +40,9 @@ BEGIN
        OR nexus_collection_plan(other_source_id,NULL,NULL,'fixture_contact',12340001)->>'reason' <> 'complete_published' THEN
         RAISE EXCEPTION 'Cross-source identity requires the verified peer';
     END IF;
+    IF nexus_collection_plan(source_id,NULL,NULL,'fixture_contact',12340002)->>'reason' <> 'identity_conflict' THEN
+        RAISE EXCEPTION 'A verified peer conflict must stay in review even without an exact post';
+    END IF;
 
     UPDATE listings SET status='pending', price_amount=NULL WHERE id=card_id;
     plan := nexus_collection_plan(source_id,NULL,NULL,'fixture_contact');

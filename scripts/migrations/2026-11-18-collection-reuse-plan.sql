@@ -32,7 +32,7 @@ LANGUAGE sql STABLE AS $fn$
         SELECT count(DISTINCT contact_peer_id) FILTER (WHERE matches_username AND contact_peer_id > 0) > 1
                OR COALESCE(bool_or(exact_message AND NOT matches_username
                     AND NOT COALESCE(p_verified_peer_id > 0 AND p_verified_peer_id = contact_peer_id, FALSE)), FALSE)
-               OR COALESCE(bool_or(exact_message AND contact_peer_id > 0
+               OR COALESCE(bool_or((exact_message OR matches_username) AND contact_peer_id > 0
                     AND p_verified_peer_id > 0 AND contact_peer_id <> p_verified_peer_id), FALSE) AS conflict
         FROM candidates
     ), selected AS (

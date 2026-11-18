@@ -32,8 +32,9 @@ SQL_PROFILE_LISTING_SYNC = (
     "custom_fields=$6::jsonb,evidence_json=$7::jsonb,"
     "media_json=CASE WHEN manual_fields ? 'media' THEN media_json ELSE $8::jsonb END,"
     "status=$9::varchar(32),published_at=CASE WHEN $9::varchar(32)='published' "
-    "THEN COALESCE(published_at,NOW()) WHEN status='published' THEN NULL ELSE published_at END,"
-    "updated_at=NOW() WHERE id=$1"
+    "THEN COALESCE(published_at,NOW()) ELSE published_at END,"
+    "updated_at=NOW() WHERE id=$1 AND status=$10 AND status IN ('pending','duplicate_pending') "
+    "AND updated_at=$11 AND manual_fields=$12::jsonb"
 )
 
 ENGINE_VERSION = "rapidocr-local-v1"
@@ -637,14 +638,15 @@ class MediaOcrProcessor:
             "SELECT r.description AS source_description,r.evidence_json,r.media_json,"
             "j.source_id,l.id AS listing_id,l.nickname,l.price_amount,l.price_currency,"
             "l.description,l.contact_username,l.bot_url,l.custom_fields,l.manual_fields,"
-            "l.evidence_json AS listing_evidence,l.status "
+            "l.evidence_json AS listing_evidence,l.status,l.updated_at AS listing_updated_at,"
+            "j.collection_plan_json "
             "FROM profile_collection_results r "
             "JOIN profile_collection_jobs j ON j.id=r.job_id "
             "JOIN listings l ON l.profile_collection_job_id=j.id "
             "WHERE r.id=$1",
             profile_result_id,
         )
-        if result is None:
+        if result is None or result["status"] not in {"pending", "duplicate_pending"}:
             return
         ocr_rows = await self._pool.fetch(
             "SELECT status,COALESCE(human_classification,classification) AS classification,"
@@ -699,30 +701,30 @@ class MediaOcrProcessor:
             ocr_text, [row for row in field_definitions if row["extraction_source"] == "ocr"],
         )
         custom_updates = {}
-        if not _decode_json(result["manual_fields"], {}).get("custom_fields"):
+        manual = _decode_json(result["manual_fields"], {})
+        if "custom_fields" not in manual:
             for values in (telegram_custom, ocr_custom):
                 for key, value in values.items():
                     if not str(custom_fields.get(key) or "").strip():
                         custom_fields[key] = value
                         custom_updates[key] = value
 
-        manual = _decode_json(result["manual_fields"], {})
         nickname = result["nickname"]
-        if not manual.get("nickname") and not str(nickname or "").strip():
+        if "nickname" not in manual and not str(nickname or "").strip():
             nickname = text_fields.get("nickname") or image_fields.get("nickname")
         price_amount = result["price_amount"]
-        if not manual.get("price_amount") and price_amount is None:
+        if "price_amount" not in manual and price_amount is None:
             price_amount = text_fields.get("price_amount") or image_fields.get("price_amount")
         price_currency = result["price_currency"] or "CNY"
-        if not manual.get("price_currency"):
+        if "price_currency" not in manual and result["price_amount"] is None:
             price_currency = text_fields.get("price_currency") or image_fields.get("price_currency") or price_currency
-        if manual.get("description"):
+        if "description" in manual:
             description = result["description"] or ""
 
         ocr_filled = bool(
             (not result["nickname"] and image_fields.get("nickname"))
             or (result["price_amount"] is None and image_fields.get("price_amount") is not None)
-            or (not result["description"] and intro_text)
+            or ("description" not in manual and intro_text)
             or any(
                 definition["required_for_publish"]
                 and definition["field_key"] in custom_updates
@@ -735,24 +737,22 @@ class MediaOcrProcessor:
                 "src": "ocr", "fields": image_fields,
                 "custom_fields": {key: value for key, value in ocr_custom.items() if key in custom_updates},
             }
-        ready = await self._pool.fetchval(
-            "SELECT listing_meets_publish_requirements($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb)",
-            nickname or "", price_amount, description, result["contact_username"],
-            result["bot_url"] or "", result["media_json"],
-            json.dumps(custom_fields, ensure_ascii=False),
-        )
-        ready = bool(ready) and not ocr_filled
         next_status = result["status"]
-        if next_status in {"pending", "published"}:
+        if next_status == "pending" and not ocr_filled and not _decode_json(result["collection_plan_json"], {}):
+            ready = await self._pool.fetchval(
+                "SELECT listing_meets_publish_requirements($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb)",
+                nickname or "", price_amount, description, result["contact_username"],
+                result["bot_url"] or "", result["media_json"],
+                json.dumps(custom_fields, ensure_ascii=False),
+            )
             if ready:
                 next_status = "published"
-            elif result["status"] == "published":
-                next_status = "pending"
         await self._pool.execute(
             SQL_PROFILE_LISTING_SYNC,
             result["listing_id"], nickname, price_amount, price_currency, description,
             json.dumps(custom_fields, ensure_ascii=False),
             json.dumps(listing_evidence, ensure_ascii=False), result["media_json"], next_status,
+            result["status"], result["listing_updated_at"], json.dumps(manual, ensure_ascii=False),
         )
 
 
