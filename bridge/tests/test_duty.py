@@ -52,6 +52,42 @@ class LinkedProfileMessage:
 
 
 class DutyProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_checkin_reuses_complete_card_before_telegram_and_audits_ids(self):
+        from unittest.mock import AsyncMock
+        from runner import duty_collection
+
+        pool = SimpleNamespace(
+            fetch=AsyncMock(return_value=[{"plan": json.dumps({
+                "decision": "reuse", "reason": "complete_published", "listing_id": 7,
+                "local_post": {"id": 11, "revision_id": 14, "raw_text": "fixture private text"},
+            })}]),
+            execute=AsyncMock(),
+        )
+        job = {"job_id": 3, "source_id": 2, "target_msg_id": 19, "target_peer_id": -1002,
+               "contact_username": "fixture_user", "account_id": 1}
+        with patch.object(duty_collection, "_rate_limited_entity", AsyncMock()) as telegram:
+            status, _ = await _collect_checkin_source(pool, object(), job, {"source_username": "source"})
+        self.assertEqual(status, "skipped")
+        telegram.assert_not_awaited()
+        audit = json.loads(pool.execute.await_args.args[2])
+        self.assertEqual(audit["original"], {"id": 11, "revision_id": 14})
+        self.assertEqual(audit["listing_id"], 7)
+
+    async def test_checkin_blocks_identity_conflict_before_telegram(self):
+        from unittest.mock import AsyncMock
+        from runner import duty_collection
+
+        pool = SimpleNamespace(
+            fetch=AsyncMock(return_value=[{"plan": {"decision": "review", "reason": "identity_conflict"}}]),
+            execute=AsyncMock(),
+        )
+        job = {"job_id": 3, "source_id": 2, "target_msg_id": None, "target_peer_id": None,
+               "contact_username": "fixture_user", "account_id": 1}
+        with patch.object(duty_collection, "_rate_limited_entity", AsyncMock()) as telegram:
+            status, _ = await _collect_checkin_source(pool, object(), job, {"source_username": "source"})
+        self.assertEqual(status, "needs_review")
+        telegram.assert_not_awaited()
+
     async def test_same_nickname_does_not_skip_exact_checkin_lookup(self):
         from unittest.mock import AsyncMock
         from runner import duty_collection

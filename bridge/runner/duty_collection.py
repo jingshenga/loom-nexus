@@ -36,6 +36,8 @@ SQL_PROFILE_RESULT = sqlres.load("profile_collection_result.sql")
 SQL_PROFILE_OCR_ENQUEUE = sqlres.load("profile_collection_ocr_enqueue.sql")
 SQL_PROFILE_PROGRESS = sqlres.load("profile_collection_progress.sql")
 SQL_PROFILE_LISTING = sqlres.load("profile_collection_listing.sql")
+SQL_CHECKIN_PLAN = sqlres.load("checkin_collection_plan.sql")
+SQL_CHECKIN_PLAN_RECORD = sqlres.load("checkin_collection_plan_record.sql")
 SQL_CHECKIN_INDEX_USERNAME = sqlres.load("checkin_index_by_username.sql")
 SQL_CHECKIN_INDEX_NICKNAME = sqlres.load("checkin_index_by_nickname.sql")
 
@@ -512,7 +514,26 @@ async def _collect_checkin_source(pool, client, job, cfg):
     source_username = str(cfg.get("source_username") or "").strip().lstrip("@")
     if not source_username:
         raise RuntimeError("签到反查规则缺少来源频道用户名")
-    if job["target_msg_id"] is None:
+    rows = await pool.fetch(SQL_CHECKIN_PLAN, job["source_id"], job["target_msg_id"],
+                            job["target_peer_id"], job["contact_username"])
+    plan = rows[0]["plan"] if rows else None
+    if isinstance(plan, str):
+        plan = json.loads(plan)
+    if plan:
+        original = plan.get("local_post") or {}
+        audit = {key: plan[key] for key in (
+            "decision", "reason", "listing_id", "listing_status", "missing_fields", "evidence",
+        ) if key in plan}
+        audit["original"] = {key: original[key] for key in ("id", "platform_msg_id", "revision_id", "content_hash")
+                             if key in original}
+        await pool.execute(SQL_CHECKIN_PLAN_RECORD, job["job_id"], json.dumps(audit, ensure_ascii=False))
+        if plan["decision"] == "reuse":
+            return "skipped", f"复用资料库卡片 #{plan['listing_id']}，保留原审核状态"
+        if plan["decision"] == "end":
+            return "skipped", "原资料已关闭，保留历史记录"
+        if plan["decision"] == "review":
+            return "needs_review", f"采集证据需核对：{plan['reason']}"
+    elif job["target_msg_id"] is None:
         indexed = await pool.fetch(
             SQL_CHECKIN_INDEX_USERNAME, job["source_id"], job["contact_username"],
         )
