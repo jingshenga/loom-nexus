@@ -112,6 +112,7 @@ LANGUAGE sql STABLE AS $fn$
             WHEN o.reason IN ('closed_original','card_unavailable') THEN 'end'
             ELSE 'supplement' END,
         'reason', o.reason,
+        'source_peer_id', i.source_peer_id,
         'listing_id', c.id,
         'listing_status', c.status,
         'listing_fields', jsonb_build_object('nickname', c.nickname, 'district', c.district,

@@ -88,6 +88,26 @@ class DutyProcessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, "needs_review")
         telegram.assert_not_awaited()
 
+    async def test_checkin_passes_local_revision_to_shared_staging_without_telegram(self):
+        from unittest.mock import AsyncMock
+        from runner import duty_collection
+
+        local_post = {"platform_msg_id": 19, "revision_id": 23, "raw_text": "TG: @fixture_user"}
+        pool = SimpleNamespace(
+            fetch=AsyncMock(side_effect=[
+                [{"plan": {"decision": "supplement", "source_peer_id": -1002, "local_post": local_post}}],
+                [{"result": {"status": "fetched", "reason": "candidate_created"}}],
+            ]),
+            execute=AsyncMock(),
+        )
+        job = {"job_id": 3, "source_id": 2, "target_msg_id": 19, "target_peer_id": -1002,
+               "contact_username": "fixture_user", "account_id": 1}
+        with patch.object(duty_collection, "_rate_limited_entity", AsyncMock()) as telegram:
+            self.assertEqual(await _collect_checkin_source(pool, object(), job, {"source_username": "source"}),
+                             ("fetched", None))
+        telegram.assert_not_awaited()
+        self.assertEqual(pool.fetch.await_args.args[-1], 23)
+
     async def test_same_nickname_does_not_skip_exact_checkin_lookup(self):
         from unittest.mock import AsyncMock
         from runner import duty_collection

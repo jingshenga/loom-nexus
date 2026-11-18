@@ -659,7 +659,7 @@ async def resolve_active_review(
         async with conn.transaction():
             row = await conn.fetchrow(
                 "SELECT q.*,r.media_json,r.posted_at FROM rule_active_review_queue q "
-                "JOIN raw_messages r ON r.id=q.raw_id WHERE q.id=$1 FOR UPDATE OF q", queue_id,
+                "JOIN raw_messages r ON r.id=q.raw_id WHERE q.id=$1 FOR UPDATE OF r,q", queue_id,
             )
             if row is None:
                 raise HTTPException(status_code=404, detail="review candidate not found")

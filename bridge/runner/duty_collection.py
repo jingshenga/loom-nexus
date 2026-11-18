@@ -38,6 +38,7 @@ SQL_PROFILE_PROGRESS = sqlres.load("profile_collection_progress.sql")
 SQL_PROFILE_LISTING = sqlres.load("profile_collection_listing.sql")
 SQL_CHECKIN_PLAN = sqlres.load("checkin_collection_plan.sql")
 SQL_CHECKIN_PLAN_RECORD = sqlres.load("checkin_collection_plan_record.sql")
+SQL_CHECKIN_STAGE = sqlres.load("checkin_stage_original.sql")
 SQL_CHECKIN_INDEX_USERNAME = sqlres.load("checkin_index_by_username.sql")
 SQL_CHECKIN_INDEX_NICKNAME = sqlres.load("checkin_index_by_nickname.sql")
 
@@ -510,6 +511,36 @@ async def _persist_profile_result(pool, job, peer_id, profile_url, channel_url,
     await pool.fetch(SQL_PROFILE_LISTING, job["job_id"], bucket)
 
 
+def _checkin_evidence(job, description, channel_name, message_id, posted_at, matched_count):
+    return {
+        "collection_method": "daily_checkin_source_username_search",
+        "review_bucket": "checkin_supplement",
+        "nickname": _explicit_profile_field(description, "老师昵称|昵称|姓名|艺名") or "",
+        "district": _explicit_profile_field(description, "位置|地区|区域|城区") or "",
+        "profile_url": f"https://t.me/{job['contact_username']}",
+        "source_messages": [{
+            "url": f"https://t.me/{channel_name}/{message_id}", "message_id": message_id,
+            "posted_at": posted_at.isoformat() if posted_at is not None else None,
+            "matched_by": "exact_contact_username_in_message",
+        }],
+        "matched_message_count": matched_count,
+        "avatar_used": False,
+    }
+
+
+async def _stage_checkin_original(pool, job, source_peer, post, evidence):
+    rows = await pool.fetch(
+        SQL_CHECKIN_STAGE, job["job_id"], int(post["platform_msg_id"]), source_peer,
+        post.get("sender_peer_id"), post.get("grouped_id"), post.get("posted_at"),
+        post["raw_text"], json.dumps(post.get("media_json") or [], ensure_ascii=False),
+        json.dumps(evidence, ensure_ascii=False), post.get("revision_id"),
+    )
+    result = rows[0]["result"]
+    if isinstance(result, str):
+        result = json.loads(result)
+    return result["status"], None if result["status"] == "fetched" else result["reason"]
+
+
 async def _collect_checkin_source(pool, client, job, cfg):
     source_username = str(cfg.get("source_username") or "").strip().lstrip("@")
     if not source_username:
@@ -533,6 +564,15 @@ async def _collect_checkin_source(pool, client, job, cfg):
             return "skipped", "原资料已关闭，保留历史记录"
         if plan["decision"] == "review":
             return "needs_review", f"采集证据需核对：{plan['reason']}"
+        if original.get("revision_id") and original.get("raw_text"):
+            from types import SimpleNamespace
+
+            message = SimpleNamespace(raw_text=original["raw_text"], get_entities_text=lambda: [])
+            if _matches_username(message, job["contact_username"]) and not _is_obvious_promo(message.raw_text):
+                original["posted_at"] = datetime.fromisoformat(original["posted_at"]) if original.get("posted_at") else None
+                evidence = _checkin_evidence(job, message.raw_text, source_username,
+                                             original["platform_msg_id"], original["posted_at"], 1)
+                return await _stage_checkin_original(pool, job, plan["source_peer_id"], original, evidence)
     elif job["target_msg_id"] is None:
         indexed = await pool.fetch(
             SQL_CHECKIN_INDEX_USERNAME, job["source_id"], job["contact_username"],
@@ -544,6 +584,11 @@ async def _collect_checkin_source(pool, client, job, cfg):
     entity = await _rate_limited_entity(
         pool, client, job["account_id"], source_username,
     )
+    if plan:
+        from telethon import utils
+
+        if int(utils.get_peer_id(entity)) != plan["source_peer_id"]:
+            return "needs_review", "签到来源身份与已绑定频道不一致"
     matches = []
     if job["target_msg_id"] is not None and job["target_peer_id"] is not None:
         from telethon import utils
@@ -588,23 +633,13 @@ async def _collect_checkin_source(pool, client, job, cfg):
     description = (primary.raw_text or "").strip()
     if not description and not media:
         return "not_found", "命中消息没有可用文字或媒体"
-    source_url = f"https://t.me/{channel_name}/{primary.id}"
-    nickname = _explicit_profile_field(description, "老师昵称|昵称|姓名|艺名")
-    district = _explicit_profile_field(description, "位置|地区|区域|城区")
-    evidence = {
-        "collection_method": "daily_checkin_source_username_search",
-        "review_bucket": "checkin_supplement",
-        "nickname": nickname or "",
-        "district": district or "",
-        "profile_url": f"https://t.me/{job['contact_username']}",
-        "source_messages": [{
-            "url": source_url, "message_id": int(primary.id),
-            "posted_at": primary.date.isoformat() if primary.date else None,
-            "matched_by": "exact_contact_username_in_message",
-        }],
-        "matched_message_count": len(matches),
-        "avatar_used": False,
-    }
+    evidence = _checkin_evidence(job, description, channel_name, int(primary.id), primary.date, len(matches))
+    if plan:
+        return await _stage_checkin_original(pool, job, plan["source_peer_id"], {
+            "platform_msg_id": primary.id, "sender_peer_id": primary.sender_id,
+            "grouped_id": primary.grouped_id, "posted_at": primary.date,
+            "raw_text": primary.raw_text or "", "media_json": backfill.order_media(media),
+        }, evidence)
     await _persist_profile_result(
         pool, job, None, evidence["profile_url"], f"https://t.me/{channel_name}",
         "", description, media, evidence, cfg,
