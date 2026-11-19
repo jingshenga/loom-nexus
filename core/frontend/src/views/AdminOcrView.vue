@@ -11,7 +11,7 @@ const listingId = ref(Number(route.query.listing_id) > 0 ? Number(route.query.li
 const mediaPaths = ref((Array.isArray(route.query.media_path) ? route.query.media_path : [route.query.media_path]).filter(Boolean));
 const current = ref(null);
 const modalOpen = ref(false);
-const status = ref(route.query.status === "all" ? "all" : "pending");
+const status = ref(["all", "automatic"].includes(route.query.status) ? route.query.status : "pending");
 const offset = ref(0);
 const total = ref(0);
 const pageSize = 60;
@@ -321,7 +321,7 @@ async function bulkDecision(decision) {
         class_code: bulkClass.value,
         ids: allMatching.value ? [] : selectedIds.value,
         all_matching: allMatching.value,
-        status: status.value,
+        status: status.value === "automatic" ? "all" : status.value,
         exclude_ids: allMatching.value ? excludedIds.value : [],
         category: allMatching.value ? categoryFilter.value || null : null,
         confidence_min: allMatching.value && confidenceRange.value ? Number(confidenceRange.value.split(":")[0]) : null,
@@ -377,6 +377,7 @@ async function reclassifySelected() {
         <option value="failed">识别失败</option>
         <option value="confirmed">已确认</option>
         <option value="not_card">非资料卡</option>
+        <option value="automatic">自动处理</option>
         <option value="all">全部</option>
       </select>
       <select v-model="categoryFilter" @change="changeFilter" class="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm">
@@ -396,7 +397,7 @@ async function reclassifySelected() {
         <component :is="pageFullySelected ? CheckSquare : Square" class="size-3.5" />
         {{ allMatching ? "取消全部选择" : pageFullySelected ? "取消本页选择" : "本页全选" }}
       </button>
-      <button v-if="total" @click="toggleAllMatching" :disabled="busy" class="rounded-lg border border-sky-800 px-2.5 py-1 text-xs text-sky-300 disabled:opacity-40">
+      <button v-if="total && status !== 'automatic'" @click="toggleAllMatching" :disabled="busy" class="rounded-lg border border-sky-800 px-2.5 py-1 text-xs text-sky-300 disabled:opacity-40">
         {{ allMatching ? "取消筛选结果全选" : `全选当前筛选 ${total} 张` }}
       </button>
       <div class="ml-auto flex items-center gap-1">
@@ -419,13 +420,14 @@ async function reclassifySelected() {
           <div class="relative aspect-[3/4] overflow-hidden bg-black">
             <img :src="mediaUrl(item.media_path)" class="h-full w-full object-contain" :alt="item.nickname || 'OCR 图片'" loading="lazy" />
             <span class="absolute right-1 top-1 max-w-[75%] truncate rounded bg-black/75 px-1.5 py-1 text-[10px] font-medium text-white">{{ predictionCategoryName(item) }}</span>
-            <span v-if="confidenceText(item)" class="absolute bottom-1 right-1 rounded bg-emerald-600/90 px-2 py-1 text-xs font-semibold text-white shadow" :title="item.confidence_source === 'model' ? `模型置信度 · V${item.classifier_version_id}` : '旧规则估值，尚未由训练模型校准'">{{ confidenceText(item) }}</span>
+            <span v-if="confidenceText(item)" class="absolute bottom-1 right-1 rounded bg-emerald-600/90 px-2 py-1 text-xs font-semibold text-white shadow" :title="item.predicted_model_version || (item.classifier_version_id ? `模型置信度 · V${item.classifier_version_id}` : '旧规则估值')">{{ confidenceText(item) }}</span>
           </div>
           <div class="space-y-1 p-2">
             <div class="truncate text-xs font-medium text-slate-200">{{ item.nickname || item.source_title || `消息 #${item.raw_id || item.id}` }}</div>
             <div class="flex items-center justify-between gap-1 text-[10px] text-slate-400">
               <span class="truncate">{{ item.human_classification ? `人工：${categoryName(item.human_classification)}` : statusLabel(item) }}</span>
-              <span v-if="item.confidence_source === 'model'" class="shrink-0">V{{ item.classifier_version_id }}</span>
+              <span v-if="item.predicted_model_version" class="shrink-0">Vision4</span>
+              <span v-else-if="item.classifier_version_id" class="shrink-0">V{{ item.classifier_version_id }}</span>
             </div>
             <div class="truncate text-[10px]" :class="item.status === 'failed' ? 'text-rose-300' : item.review_status === 'confirmed' ? 'text-emerald-300' : item.review_status === 'not_card' ? 'text-slate-400' : 'text-amber-300'">
               {{ statusLabel(item) }}<span v-if="item.error"> · {{ item.error }}</span>

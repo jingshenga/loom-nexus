@@ -107,7 +107,7 @@ async def queue(
     listing_id: int | None = None,
     media_path: list[str] = Query(default=[]),
 ) -> dict:
-    if status not in {"all", "pending", "confirmed", "not_card", "failed"}:
+    if status not in {"all", "pending", "confirmed", "not_card", "failed", "automatic"}:
         raise HTTPException(status_code=400, detail="invalid OCR queue status")
     pool = db.get_pool()
     if pool is None:
@@ -160,6 +160,7 @@ async def queue(
         "WHERE CASE WHEN $1='pending' THEN o.review_status='pending' "
         " WHEN $1='confirmed' THEN o.review_status='confirmed' "
         " WHEN $1='not_card' THEN o.review_status='not_card' "
+        " WHEN $1='automatic' THEN auto.id IS NOT NULL AND o.human_classification IS NULL "
         " WHEN $1='failed' THEN o.status='failed' ELSE TRUE END " + filters +
         "ORDER BY CASE WHEN o.status='failed' THEN 0 ELSE 1 END, "
         "CASE WHEN o.review_status='pending' AND COALESCE(o.human_classification,o.classification)='info_card' THEN 0 "
@@ -173,9 +174,11 @@ async def queue(
     )
     total = await pool.fetchval(
         "SELECT count(*) FROM listing_media_ocr o "
+        "LEFT JOIN nexus_auto_ocr_decisions auto ON auto.ocr_id=o.id AND auto.undone_at IS NULL "
         "WHERE CASE WHEN $1='pending' THEN o.review_status='pending' "
         " WHEN $1='confirmed' THEN o.review_status='confirmed' "
         " WHEN $1='not_card' THEN o.review_status='not_card' "
+        " WHEN $1='automatic' THEN auto.id IS NOT NULL AND o.human_classification IS NULL "
         " WHEN $1='failed' THEN o.status='failed' ELSE TRUE END " + count_filters,
         status, category, confidence_min, confidence_max, listing_id, media_path,
     )
@@ -196,6 +199,7 @@ async def queue(
             "confidence": float(confidence) if confidence is not None else None,
             "confidence_source": "model" if row["classifier_version_id"] is not None or row["predicted_model_version"] else "legacy_rule",
             "classifier_version_id": row["classifier_version_id"],
+            "predicted_model_version": row["predicted_model_version"],
             "classifier_signals": _decode(row["classifier_signals_json"], {}),
             "review_status": row["review_status"],
             "auto_reason": row["auto_reason"] if not row["human_classification"] else None,
