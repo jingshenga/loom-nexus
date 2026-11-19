@@ -43,7 +43,7 @@ class BuildAttributesTests(unittest.TestCase):
         self.assertEqual(attributes["profile"], {
             "age": None, "height": None, "weight": None, "bust": None,
         })
-        self.assertEqual(attributes["tariffs"], {"p1": [], "p2": [], "cash_note": [], "raw_fees": []})
+        self.assertEqual(attributes["tariffs"], {"p1": [], "p2": [], "bt": [], "cash_note": [], "raw_fees": []})
         self.assertEqual(attributes["services"], [])
         self.assertEqual(attributes["restrictions"], [])
 
@@ -149,7 +149,8 @@ class TariffFormattingTests(unittest.TestCase):
         attributes = build_attributes({}, {
             "price_text": ["1P6章 40分钟", "包夜 2000", "BT 300"],
         })
-        self.assertEqual(attributes["tariffs"]["raw_fees"], ["包夜 2000", "BT 300"])
+        self.assertEqual(attributes["tariffs"]["raw_fees"], ["包夜 2000 元"])
+        self.assertEqual(attributes["tariffs"]["bt"], ["300 元"])
 
     def test_unparsable_fee_lines_are_dropped_from_p1(self):
         attributes = build_attributes({}, {

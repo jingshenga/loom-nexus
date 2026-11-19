@@ -160,10 +160,11 @@ const profileMetrics = computed(() => {
 // 阶梯资费看板：1P/2P 是轮次（单次/加钟两轮），而非人数
 const tariffGroups = computed(() => {
   const tariffs = item.value?.attributes?.tariffs || {};
-  const quoted = [...(tariffs.p1 || []), ...(tariffs.p2 || [])];
+  const quoted = [...(tariffs.p1 || []), ...(tariffs.p2 || []), ...(tariffs.bt || [])];
   return [
     { label: "1P 价格", lines: tariffs.p1 || [], tone: "text-sky-400" },
     { label: "2P 价格", lines: tariffs.p2 || [], tone: "text-violet-400" },
+    { label: "BT 基础课时", lines: tariffs.bt || [], tone: "text-cyan-400" },
     { label: "现金要求", lines: tariffs.cash_note || [], tone: "text-amber-400" },
     {
       label: "其他资费",

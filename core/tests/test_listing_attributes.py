@@ -48,7 +48,7 @@ class ListingAttributesTests(unittest.TestCase):
         self.assertEqual(item["ocr_evidence"], [])
         legacy = _row_to_item(self.row(custom_fields=None, evidence_json=None), is_admin=False)
         self.assertEqual(legacy["attributes"]["tariffs"],
-                         {"p1": [], "p2": [], "cash_note": [], "raw_fees": []})
+                         {"p1": [], "p2": [], "bt": [], "cash_note": [], "raw_fees": []})
         self.assertEqual(legacy["attributes"]["services"], [])
         self.assertEqual(legacy["attributes"]["restrictions"], [])
 

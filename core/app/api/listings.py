@@ -8,6 +8,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
 from app import db, sqlres
+from app.extractor.ast_rules import additional_fee_labels, restriction_terms
 from app.extractor.ocr_fields import card_weight_kg, format_fee_text
 
 from app.api.auth import bearer_identity, current_user_id, require_user
@@ -129,13 +130,12 @@ def _visible_media(media, is_admin: bool) -> list:
 
 _CARD_SCALAR_KEYS = (
     "age_years", "height_cm", "bust_size",
-    "price_1p", "price_1p_display", "price_2p", "price_2p_display",
+    "price_1p", "price_1p_display", "price_2p", "price_2p_display", "price_bt_display",
 )
 _CARD_LIST_KEYS = (
     "price_1p_text", "price_2p_text", "cash_text", "price_text",
     "service_text", "features_text", "restriction_text", "fixed_intro_terms",
 )
-_RESTRICT_TAG = re.compile(r"禁[\u4e00-\u9fff]{1,6}")
 _SERVICE_LABEL = re.compile(
     r"^(?:服务详情|服务内容|服务项目|服务|课表|项目|套餐|特点|特征|特色)[:：]?\s*"
 )
@@ -216,7 +216,7 @@ def _service_tags(card_fields) -> list:
 def _restriction_tags(card_fields) -> list:
     tags = []
     for line in card_fields.get("restriction_text") or []:
-        found = _RESTRICT_TAG.findall(str(line))
+        found = restriction_terms(str(line))
         if found:
             tags.extend(found)
         elif len(str(line)) <= 12:
@@ -243,19 +243,14 @@ def _quote_list(card_fields, display_key, lines_key, tier) -> list:
     return out
 
 
-def _raw_fees(card_fields) -> list:
-    """price_text lines that are NOT 1P/2P quotes (包夜 / 包时 / BT …)
-    keep their original text; tiered quotes live in p1/p2 instead."""
-    out = []
+def _raw_fees(card_fields, extra_fees) -> list:
+    fees = list(extra_fees) if isinstance(extra_fees, list) else []
     for line in card_fields.get("price_text") or []:
-        if format_fee_text(line):
-            continue
-        text = str(line).strip()
-        if text and text not in out:
-            out.append(text)
-        if len(out) >= 8:
-            break
-    return out
+        if labels := additional_fee_labels(str(line)):
+            fees.extend(labels)
+        elif not format_fee_text(line):
+            fees.append(str(line))
+    return _attr_list(fees, 8)
 
 
 def build_attributes(evidence, card_fields, corrections=None) -> dict:
@@ -275,7 +270,7 @@ def build_attributes(evidence, card_fields, corrections=None) -> dict:
         value = (source or {}).get(key)
         return value.get("value") if isinstance(value, dict) else value
 
-    for tier in ("1p", "2p"):
+    for tier in ("1p", "2p", "bt"):
         key = f"price_{tier}_display"
         if key in corrections:
             card_fields[key] = corrections[key]
@@ -304,6 +299,10 @@ def build_attributes(evidence, card_fields, corrections=None) -> dict:
             return from_card if from_card is not None else from_evidence
         return from_evidence if from_evidence is not None else from_card
 
+    if "restriction_text" not in corrections:
+        found = unwrapped(evidence, "restriction_text")
+        if isinstance(found, list):
+            card_fields["restriction_text"] = found + (card_fields.get("restriction_text") or [])
     return {
         "profile": {
             "age": pick("age_years", _as_int),
@@ -315,8 +314,9 @@ def build_attributes(evidence, card_fields, corrections=None) -> dict:
             # 干净的 "600 元 (40分钟)" 式价格串；1P/2P 是轮次而非人数
             "p1": _quote_list(card_fields, "price_1p_display", "price_1p_text", "1p"),
             "p2": _quote_list(card_fields, "price_2p_display", "price_2p_text", "2p"),
+            "bt": _quote_list(card_fields, "price_bt_display", "price_text", "bt"),
             "cash_note": _attr_list(card_fields.get("cash_text"), 4),
-            "raw_fees": _raw_fees(card_fields),
+            "raw_fees": _raw_fees(card_fields, unwrapped(evidence, "additional_fee_text")),
         },
         "services": _service_tags(card_fields),
         "restrictions": _restriction_tags(card_fields),

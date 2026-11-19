@@ -53,7 +53,7 @@ _PLAIN_AMOUNT = re.compile(
 def format_fee_text(line, tier=None):
     """Return a tier's clean display text, or the first quote if unspecified."""
     quotes = tariff_quotes([line])
-    quote = quotes.get(tier) if tier else (quotes.get("1p") or quotes.get("2p"))
+    quote = quotes.get(tier) if tier else (quotes.get("1p") or quotes.get("2p") or quotes.get("bt"))
     return quote["text"] if quote else None
 
 
@@ -128,7 +128,8 @@ def card_to_listing_fields(card_fields, card_evidence=None, ocr_confidence=None)
     )
     quotes = tariff_quotes(fee_lines)
     _, plain = amounts_from_lines(fee_lines)
-    for key, display_key in (("1p", "price_1p"), ("2p", "price_2p")):
+    for key in ("1p", "2p", "bt"):
+        display_key = f"price_{key}"
         quote = quotes.get(key)
         if quote:
             put(f"{display_key}", quote["amount"], quote["line"], None)
@@ -136,6 +137,7 @@ def card_to_listing_fields(card_fields, card_evidence=None, ocr_confidence=None)
     amount = (
         (quotes.get("1p") or {}).get("amount")
         or (quotes.get("2p") or {}).get("amount")
+        or (quotes.get("bt") or {}).get("amount")
         or plain
     )
     if amount is not None:

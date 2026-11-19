@@ -45,7 +45,7 @@ _PROHIBITION_MARKS = re.compile(r"[🈲🚫⛔]")
 
 # 0.8k / 8千 → 8000-scale rewrites; negative lookaheads keep "8cm",
 # "2P" handles and other letter-suffixed tokens intact.
-_MONEY_K = re.compile(r"(\d+(?:\.\d+)?)\s*(?:[kK千])(?![0-9A-Za-z])")
+_MONEY_K = re.compile(r"(\d+(?:\.\d+)?)\s*([kK千])(?![0-9A-Za-z])")
 _MONEY_W = re.compile(r"(\d+(?:\.\d+)?)\s*(?:[wW万])(?![0-9A-Za-z])")
 # "8c" → 800, but bra sizes ("胸围88C") stay untouched
 _MONEY_C = re.compile(r"(\d+(?:\.\d+)?)\s*[cC](?![0-9A-Za-z])")
@@ -72,14 +72,17 @@ def _rewrite_money_units(text: str) -> str:
     8张, 8米, 6章 or 8c."""
 
     def k_repl(match):
-        return _scaled(match.group(1), 1000)
+        number, unit = match.groups()
+        # Integer shorthand like 11k is quoted in hundreds on these cards.
+        factor = 100 if unit.lower() == "k" and number.isdigit() and 10 <= int(number) <= 99 else 1000
+        return _scaled(number, factor)
 
     def w_repl(match):
         return _scaled(match.group(1), 10000)
 
     def c_repl(match):
         prefix = match.string[max(0, match.start() - 24):match.start()]
-        if _BUST_PREFIX.search(prefix) or match.string[match.end():].lstrip().startswith("罩杯"):
+        if _BUST_PREFIX.search(prefix) or match.string[match.end():].lstrip().startswith(("罩杯", "杯")):
             return match.group(0)
         return _scaled(match.group(1), 100)
 
@@ -117,7 +120,7 @@ def _fold_input(text: str) -> str:
 
 
 _SLANG_UNIT = r"[章张米kKcC千wW万]"
-_COMPACT_MONEY_DURATION = re.compile(rf"(?<=\d)({_SLANG_UNIT})(?=\d{{1,3}}\s*(?:分钟|min\b))", re.I)
+_COMPACT_MONEY_DURATION = re.compile(rf"(?<=\d)({_SLANG_UNIT})(?=\d{{1,3}}\s*(?:分钟|分|min\b))", re.I)
 
 
 def normalize_input(text: str) -> str:
@@ -128,6 +131,7 @@ def normalize_input(text: str) -> str:
 
 # Body fields are shared by text rules and OCR, which keeps the original line as evidence.
 _AGE_LABEL = re.compile(r"(年龄|年纪|出生(?:年份)?)\s*[:=]?\s*(\d{4}|\d{1,2})(?![\d.])\s*([岁年])?(?![岁年\dA-Za-z.])")
+_DIRECT_AGE = re.compile(r"^([0-9]{1,2})\s*岁(?=$|[\s/|,;·-])")
 _AGE_YEAR = r"(?P<year>\d{4}|\d{2})"
 _HEIGHT_TOKEN = r"(?:(?:身高|净高)\s*[:=]?\s*)?1[4-9]\d\s*(?:cm|厘米)?"
 _PROFILE_SEPARATOR = r"(?:\s*[/|,;·-]\s*|\s+)"
@@ -145,9 +149,10 @@ _WEIGHT_LABEL = re.compile(
     re.I,
 )
 _WEIGHT_TOKEN = re.compile(_WEIGHT_VALUE, re.I)
-_CUP = r"(?:\d{2}\s*)?([A-I]\+?)"
+_CUP = r"(?:([A-I]\+?)\s*\d{2}|(?:\d{2}\s*)?([A-I]\+?))"
 _BUST_BEFORE = re.compile(rf"{_BUST_LABEL}\s*[:=]?\s*{_BUST_MODIFIERS}{_CUP}(?![A-Za-z0-9+])", re.I)
-_BUST_AFTER = re.compile(rf"(?<![A-Za-z0-9]){_CUP}\s*罩杯", re.I)
+_BUST_AFTER = re.compile(rf"(?<![A-Za-z0-9]){_CUP}\s*(?:罩杯|杯)", re.I)
+_BUST_STANDALONE = re.compile(r"(?:([A-I])\s*\d{2}|\d{2}\s*([A-I]))", re.I)
 
 
 def _birth_age(year: str) -> int | None:
@@ -176,8 +181,11 @@ def find_age(lines: list[str]) -> tuple[int, int] | None:
             if age is not None and 18 <= age <= 45:
                 return index, age
     for index, line in enumerate(folded_lines):
+        line = line.strip(" []【】()。!、")
+        if (match := _DIRECT_AGE.match(line)) and 18 <= (age := int(match[1])) <= 45:
+            return index, age
         for pattern in _PROFILE_YEAR:
-            match = pattern.match(line.strip(" []【】()。!、"))
+            match = pattern.match(line)
             if match and (age := _birth_age(match["year"])) is not None:
                 return index, age
     # A standalone 05 is a year token. Inside a larger card, a bare
@@ -221,20 +229,21 @@ def find_weight(text: str) -> tuple[str, float, float] | None:
 
 def find_bust(text: str) -> str | None:
     folded = _apply_dynamic_aliases(_fold_input(text))
-    match = _BUST_BEFORE.search(folded) or _BUST_AFTER.search(folded)
-    return match.group(1).upper() if match else None
+    match = _BUST_BEFORE.search(folded) or _BUST_AFTER.search(folded) or _BUST_STANDALONE.fullmatch(folded)
+    return (match[1] or match[2]).upper() if match else None
 
 
 # Parse the amount before slang rewriting so compact money + duration stays split.
 _TARIFF_LABELS = {
-    "1p": r"(?:1\s*(?:p|次(?:价格)?)|一次(?:价格)?|单次(?:价格)?|p)",
-    "2p": r"(?:2\s*(?:p|次(?:价格)?)|两次(?:价格)?|双次(?:价格)?|pp)",
+    "1p": r"(?:一\s*p|1\s*(?:p|次(?:价格)?)|一次(?:价格)?|单次(?:价格)?|p)",
+    "2p": r"(?:二\s*p|2\s*(?:p|次(?:价格)?)|两次(?:价格)?|双次(?:价格)?|pp)",
+    "bt": r"(?:bt|基础课时)",
 }
 _AMOUNT = rf"(?:\d{{1,5}}(?:\.\d+)?\s*{_SLANG_UNIT}|\d{{2,5}}(?:\.\d+)?)"
 _DURATION = re.compile(r"(?<![\d.])(\d{1,3})\s*(?:分钟|分(?!钟)|min)(?![A-Za-z])", re.I)
 _TARIFF_PREFIX = {
     key: re.compile(
-        rf"(?<![0-9A-Za-z]){label}\s*[:=]?\s*[¥￥]?\s*(?P<amount>{_AMOUNT})"
+        rf"(?<![0-9A-Za-z]){label}\s*(?:价格)?\s*[:=]?\s*[¥￥]?\s*(?P<amount>{_AMOUNT})"
         r"(?:\s*(?:元|块)|(?<![\d.])(?=\d{1,3}\s*(?:分钟|分|min))"
         r"|(?![\d.A-Za-z]|\s*(?:分钟|分|min|cm|厘米|kg|公斤|斤|岁|照片|图片|票|券|桌)))",
         re.I,
@@ -247,7 +256,7 @@ _TARIFF_SUFFIX = {
         rf"\s*(?:元|块)?\s*/?\s*{marker}(?![0-9A-Za-z])",
         re.I,
     )
-    for key, marker in {"1p": r"(?:p|次\b)", "2p": r"(?:pp|2\s*p)"}.items()
+    for key, marker in {"1p": r"(?:p|次\b)", "2p": r"(?:pp|2\s*p)", "bt": r"bt"}.items()
 }
 
 
@@ -261,11 +270,16 @@ def tariff_quotes(lines) -> dict:
     quotes = {}
     for line in lines or []:
         folded = re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", _apply_dynamic_terms(_fold_input(str(line))))
-        prefixes = [
+        # Prefer the full label over an overlapping bare P (e.g. 二P).
+        candidates = [
             (hit.start(), tier, hit)
             for tier, pattern in _TARIFF_PREFIX.items()
             for hit in pattern.finditer(folded)
         ]
+        prefixes = []
+        for start, tier, hit in sorted(candidates, key=lambda candidate: (candidate[0], -candidate[2].end())):
+            if not prefixes or start >= prefixes[-1][2].end():
+                prefixes.append((start, tier, hit))
         suffixes = [
             (hit.start(), tier, hit)
             for tier, pattern in _TARIFF_SUFFIX.items()
@@ -285,6 +299,28 @@ def tariff_quotes(lines) -> dict:
                 "text": format_quote(amount, minutes), "line": str(line),
             }
     return quotes
+
+
+_EXTRA_FEE = re.compile(
+    rf"(?P<label>(?:任意)?(?:[一二两三四五六七八九十]+|[1-9]\d?)\s*小时|包时|包夜)"
+    rf"\s*[:=]?\s*[¥￥]?\s*(?P<amount>{_AMOUNT})(?![\d.A-Za-z])",
+    re.I,
+)
+_RESTRICTION = re.compile(
+    r"(?:禁(?!忌)|不(?:做|接(?:受)?|闲聊|催|亲|口嗨))[^\s,，。；;、|/！!？?：:]*"
+)
+
+
+def additional_fee_labels(line: str) -> list[str]:
+    folded = _apply_dynamic_terms(_fold_input(line))
+    return [
+        f'{match["label"]} {format_quote(float(money_normalize(match["amount"])))}'
+        for match in _EXTRA_FEE.finditer(folded)
+    ]
+
+
+def restriction_terms(line: str) -> list[str]:
+    return [term for term in _RESTRICTION.findall(_fold_input(line)) if len(term) > 1]
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +588,12 @@ def extract_fields(rule: dict, text: str, src: str = "regex") -> tuple:
             put("weight_kg", weight[2], line)
         if "bust_size" not in fields and (bust := find_bust(line)):
             put("bust_size", bust, line)
+    for line in lines:
+        for key, values in (("additional_fee_text", additional_fee_labels(line)),
+                            ("restriction_text", restriction_terms(line))):
+            if values:
+                entry = evidence.setdefault(key, {"value": [], "src": src, "line": line})
+                entry["value"].extend(value for value in values if value not in entry["value"])
     for tier, quote in quotes.items():
         put(f"price_{tier}", quote["amount"], quote["line"])
         put(f"price_{tier}_display", quote["text"], quote["line"])
@@ -584,7 +626,7 @@ def extract_fields(rule: dict, text: str, src: str = "regex") -> tuple:
             evidence["price_amount"] = {"value": amount, "src": src}
 
     if "price_amount" not in fields and quotes:
-        quote = quotes.get("1p") or quotes["2p"]
+        quote = quotes.get("1p") or quotes.get("2p") or quotes["bt"]
         put("price_amount", quote["amount"], quote["line"])
 
     currency = _match_currency(cfg.get("currency_map"), text)

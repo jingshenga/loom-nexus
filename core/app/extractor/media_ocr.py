@@ -8,7 +8,7 @@ from pathlib import Path
 from PIL import Image
 
 from app import sqlres
-from app.extractor import ast_rules
+from app.extractor import ast_rules, slang_registry
 from app.extractor.image_classifier import predict
 
 logger = logging.getLogger("nexus-core.media-ocr")
@@ -163,6 +163,8 @@ def extract_card_fields(lines: list) -> tuple[dict, dict]:
         and not ast_rules.find_bust(text_lines[index])
         and not ast_rules.find_age([text_lines[index]])
         and not ast_rules.tariff_quotes([text_lines[index]])
+        and not ast_rules.additional_fee_labels(text_lines[index])
+        and not ast_rules.restriction_terms(text_lines[index])
         and not re.search(r"艺名|昵称|身高|体重|胸围|年龄|年纪|出生|罩杯|服务|特点|特征|特性|价格|课费|水费|现金|携带|禁", text_lines[index])
     ]
     if title_candidates and not any(re.search(r"(?:艺名|昵称)\s*[:：]?", line) for line in text_lines):
@@ -211,7 +213,7 @@ def extract_card_fields(lines: list) -> tuple[dict, dict]:
             services.append(line)
         if re.search(r"特点|特征", line):
             features.append(line)
-        if re.search(r"禁|不接|不做|不接受|无套", line):
+        if ast_rules.restriction_terms(line) or "无套" in line:
             restrictions.append(line)
         for term, pattern in _FIXED_INTRO.items():
             if pattern.search(line):
@@ -223,7 +225,7 @@ def extract_card_fields(lines: list) -> tuple[dict, dict]:
             one_person_fees.append(line)
         if "2p" in quotes:
             two_person_fees.append(line)
-        if quotes or re.search(r"课费|水费|价格|收费|费用|\d+\s*分钟", line):
+        if quotes or ast_rules.additional_fee_labels(line) or re.search(r"课费|水费|价格|收费|费用|\d+\s*分钟", line):
             fees.append(line)
         handles.extend(re.findall(r"@[A-Za-z0-9_]{3,}", line))
         if not any(line in group for group in (locations, services, features, restrictions, fees, cash_lines)):
@@ -339,6 +341,7 @@ class MediaOcrProcessor:
                 return row
 
     async def _process(self, row) -> None:
+        await slang_registry.ensure_fresh(self._pool)
         media_path = (self._media_dir / row["media_path"]).resolve()
         if not media_path.is_relative_to(self._media_dir) or not media_path.is_file():
             await self._finish(row, "failed", "uncertain", "pending", "admin", "", "", {}, {}, 0.0, "image file missing")

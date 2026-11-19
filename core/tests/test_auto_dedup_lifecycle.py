@@ -17,6 +17,7 @@ from app.extractor.media_ocr import MediaOcrProcessor
 ROOT = Path(__file__).resolve().parents[2]
 DSN = os.environ.get("NEXUS_TEST_DATABASE_URL")
 MIGRATION = ROOT / "scripts/migrations/2026-11-19-auto-dedup-lifecycle.sql"
+SLANG_MIGRATION = MIGRATION.with_name("2026-11-19-slang-registry-and-correction-diffs.sql")
 INTAKE = (ROOT / "core/app/sql/upsert_newest.sql").read_text()
 CANDIDATES = (ROOT / "core/app/sql/duplicate_candidates.sql").read_text()
 IDENTITIES = (ROOT / "core/app/sql/duplicate_identity_groups.sql").read_text()
@@ -37,7 +38,7 @@ class AutoDedupLifecycleTests(unittest.IsolatedAsyncioTestCase):
         schema = (ROOT / "scripts/schema.sql").read_text()
         migration = MIGRATION.read_text()
         self.assertTrue(schema.rstrip().endswith(migration.rstrip()))
-        await conn.execute(schema[:schema.rindex(migration)])
+        await conn.execute(schema[:schema.index("-- M19: dynamic slang registry")])
         await conn.execute((MIGRATION.parent / "2026-10-31-ocr-classifier-training.sql").read_text())
         await conn.execute("""
             INSERT INTO ingest_sources(id,peer_id,title) VALUES (81,-81,'来源 A'), (82,-82,'来源 B');
@@ -49,7 +50,9 @@ class AutoDedupLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self.pool.close)
 
     async def migrate(self):
-        await self.conn.execute(MIGRATION.read_text())
+        async with self.conn.transaction():
+            await self.conn.execute(MIGRATION.read_text())
+            await self.conn.execute(SLANG_MIGRATION.read_text())
 
     async def raw(self, raw_id, body, days=0, source=81):
         posted_at = T0 + timedelta(days=days)
@@ -217,6 +220,24 @@ class AutoDedupLifecycleTests(unittest.IsolatedAsyncioTestCase):
                          [(101, "archived"), (102, "pending"), (103, "pending")])
         self.assertEqual(await self.conn.fetchval("SELECT count(*) FROM listing_person_groups"), 1)
         self.assertEqual(await self.conn.fetchval("SELECT count(*) FROM listing_person_group_members"), 2)
+
+    async def test_both_incremental_migrations_preserve_live_registry_and_feedback_on_reentry(self):
+        await self.migrate()
+        await self.raw(101, "initial message")
+        listing = await self.intake(101, "initial message")
+        await self.conn.execute("""
+            INSERT INTO dynamic_slang_terms(category,source_term,factor)
+            VALUES ('money_slang','斗',100)
+        """)
+        count = await self.conn.fetchval(
+            "SELECT correction_diffs_record($1,$2,NULL)", listing["listing_id"],
+            json.dumps([{"field_name": "price_amount", "new_value": "600", "raw_snippet": "6斗"}]),
+        )
+        self.assertEqual(count, 1)
+        await self.migrate()
+        self.assertEqual(await self.conn.fetchval("SELECT factor FROM dynamic_slang_terms WHERE source_term='斗'"), 100)
+        self.assertEqual(await self.conn.fetchval("SELECT count(*) FROM listing_correction_diffs"), 1)
+        self.assertEqual((await self.card(listing["listing_id"]))["status"], "pending")
 
     async def test_bridge_profile_intake_uses_the_same_fingerprint_and_supersede_rules(self):
         await self.migrate()
