@@ -1,7 +1,7 @@
 <script setup>
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { Star, ArrowLeft, MessageCircle, TriangleAlert, ExternalLink, Pencil, Save, X, ChevronUp, ChevronDown, RotateCcw } from "lucide-vue-next";
+import { Star, ArrowLeft, MessageCircle, TriangleAlert, ExternalLink, Pencil, Save, X, ChevronUp, ChevronDown, RotateCcw, Wallet, Sparkles, ScanSearch, Ruler } from "lucide-vue-next";
 import { api, mediaUrl } from "../api/client";
 import { useSession } from "../stores/session";
 import MediaGallery from "../components/MediaGallery.vue";
@@ -137,16 +137,52 @@ onMounted(async () => {
   }
 });
 
-const fieldRowsTop = (it) => [
-  ["昵称", it.nickname],
-  ["城区", it.district],
-  ["价格", it.price_amount != null ? `${it.price_amount} ${it.price_currency}` : null],
-];
-const fieldRowsBottom = (it) => [
-  ["状态", it.online_tier === "online" ? "在线" : it.online_tier === "recent" ? "近期活跃" : "未知"],
-  ["在岗", it.duty_label === "today" ? "今日在岗" : it.duty_label === "yesterday" ? "昨日在岗" : null],
-  ["发布时间", it.published_at ? new Date(it.published_at).toLocaleString("zh-CN") : null],
-];
+const statusText = () =>
+  item.value?.online_tier === "online" ? "在线"
+    : item.value?.online_tier === "recent" ? "近期活跃" : "未知";
+const dutyText = () =>
+  item.value?.duty_label === "today" ? "今日在岗"
+    : item.value?.duty_label === "yesterday" ? "昨日在岗" : null;
+
+// ---- 结构化属性模块（attributes 由后端下发，缺失字段优雅降级） ----
+
+// 身体档案：年龄 / 身高 / 体重 / 胸围，无值的指标直接不渲染
+const profileMetrics = computed(() => {
+  const profile = item.value?.attributes?.profile || {};
+  return [
+    { label: "年龄", value: profile.age != null ? `${profile.age}岁` : null },
+    { label: "身高", value: profile.height != null ? `${profile.height}cm` : null },
+    { label: "体重", value: profile.weight != null ? `${profile.weight}kg` : null },
+    { label: "胸围", value: profile.bust || null },
+  ].filter((metric) => metric.value);
+});
+
+// 阶梯资费看板：1P / 2P / 现金要求 / 其他资费
+const tariffGroups = computed(() => {
+  const tariffs = item.value?.attributes?.tariffs || {};
+  const quoted = [...(tariffs.p1 || []), ...(tariffs.p2 || [])];
+  return [
+    { label: "单人 1P", lines: tariffs.p1 || [], tone: "text-sky-400" },
+    { label: "双人 2P", lines: tariffs.p2 || [], tone: "text-violet-400" },
+    { label: "现金要求", lines: tariffs.cash_note || [], tone: "text-amber-400" },
+    {
+      label: "其他资费",
+      lines: (tariffs.raw_fees || []).filter((line) => !quoted.includes(line)),
+      tone: "text-slate-400",
+    },
+  ].filter((group) => group.lines.length);
+});
+
+const serviceTags = computed(() => item.value?.attributes?.services || []);
+const restrictionTags = computed(() => item.value?.attributes?.restrictions || []);
+
+// 管理员 OCR 溯源抽屉：识别行 + 置信度，仅管理员数据（后端已鉴权）
+const ocrTrace = computed(() => (session.isAdmin ? item.value?.ocr_trace : null) || []);
+const listingEvidence = computed(() => (session.isAdmin ? item.value?.evidence : null) || {});
+const formatConf = (value) =>
+  value == null ? "—" : `${Math.round(Number(value) * 100)}%`;
+const formatTime = (iso) =>
+  iso ? new Date(iso).toLocaleString("zh-CN") : null;
 </script>
 
 <template>
@@ -196,36 +232,130 @@ const fieldRowsBottom = (it) => [
         {{ item.price_amount != null ? item.price_amount : "?" }}
         <span class="text-base text-slate-400">{{ item.price_currency }}</span>
       </p>
-      <table v-if="!editing" class="w-full overflow-hidden rounded-xl border border-slate-800 text-sm">
-        <tbody>
-          <tr v-for="([label, value], i) in fieldRowsTop(item)" :key="label"
-            class="border-b border-slate-800" :class="i % 2 ? 'bg-slate-900/60' : ''">
-            <td class="w-24 px-4 py-2.5 text-slate-500">{{ label }}</td>
-            <td class="px-4 py-2.5">{{ value ?? "—" }}</td>
-          </tr>
-          <!-- 联系方式行：管理员看真实号码；普通用户只见聊天入口 -->
-          <tr class="border-b border-slate-800 bg-slate-900/60">
-            <td class="w-24 px-4 py-2.5 text-slate-500">联系方式</td>
-            <td class="flex flex-wrap items-center gap-3 px-4 py-2.5">
-              <template v-if="session.isAdmin && item.contact_username">
-                <span>@{{ item.contact_username }}</span>
-              </template>
-              <template v-else>
-                <span class="text-slate-500">通过立即聊天联系</span>
-              </template>
-              <button @click="startChat"
-                class="nx-grad hidden items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-semibold text-white hover:opacity-90 lg:flex">
-                <MessageCircle class="size-4" />立即聊天
-              </button>
-            </td>
-          </tr>
-          <tr v-for="([label, value], i) in fieldRowsBottom(item)" :key="label"
-            class="border-b border-slate-800 last:border-0" :class="i % 2 ? '' : 'bg-slate-900/60'">
-            <td class="w-24 px-4 py-2.5 text-slate-500">{{ label }}</td>
-            <td class="px-4 py-2.5">{{ value ?? "—" }}</td>
-          </tr>
-        </tbody>
-      </table>
+      <template v-if="!editing">
+        <!-- 身体档案网格：缺失的指标不渲染单个格子 -->
+        <section v-if="profileMetrics.length"
+          class="grid grid-cols-4 gap-2 sm:grid-cols-4">
+          <div v-for="metric in profileMetrics" :key="metric.label"
+            class="rounded-xl border border-slate-800 bg-slate-900 px-2 py-3 text-center">
+            <p class="flex items-center justify-center gap-1 text-[11px] text-slate-500">
+              <Ruler class="size-3" />{{ metric.label }}
+            </p>
+            <p class="mt-0.5 truncate text-lg font-bold text-slate-100">{{ metric.value }}</p>
+          </div>
+        </section>
+
+        <!-- 阶梯资费看板 -->
+        <section v-if="tariffGroups.length"
+          class="rounded-xl border border-slate-800 bg-slate-900 p-4">
+          <h3 class="mb-2.5 flex items-center gap-1.5 text-sm font-semibold text-slate-300">
+            <Wallet class="size-4 text-sky-400" />阶梯资费
+          </h3>
+          <div class="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <div v-for="group in tariffGroups" :key="group.label"
+              class="rounded-lg border border-slate-800 bg-slate-950 p-2.5">
+              <p class="text-[11px] font-semibold" :class="group.tone">{{ group.label }}</p>
+              <p v-for="(line, i) in group.lines" :key="i"
+                class="mt-1 break-words text-xs leading-5 text-slate-200">{{ line }}</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- 服务与特色标签云 -->
+        <section v-if="serviceTags.length"
+          class="rounded-xl border border-slate-800 bg-slate-900 p-4">
+          <h3 class="mb-2.5 flex items-center gap-1.5 text-sm font-semibold text-slate-300">
+            <Sparkles class="size-4 text-sky-400" />服务与特色
+          </h3>
+          <div class="flex flex-wrap gap-1.5">
+            <span v-for="tag in serviceTags" :key="tag"
+              class="rounded-full bg-slate-800 px-3 py-1 text-xs text-slate-300">{{ tag }}</span>
+          </div>
+        </section>
+
+        <!-- 禁忌规范警示栏 -->
+        <section v-if="restrictionTags.length"
+          class="rounded-xl border border-rose-600/40 bg-rose-600/10 p-4">
+          <h3 class="mb-2.5 flex items-center gap-1.5 text-sm font-semibold text-rose-400">
+            <TriangleAlert class="size-4" />禁忌规范
+          </h3>
+          <div class="flex flex-wrap gap-1.5">
+            <span v-for="tag in restrictionTags" :key="tag"
+              class="rounded-full border border-rose-500/40 bg-rose-500/15 px-3 py-1 text-xs font-medium text-rose-300">{{ tag }}</span>
+          </div>
+        </section>
+
+        <!-- 基本信息：状态 / 在岗 / 发布时间 / 联系方式 -->
+        <section class="rounded-xl border border-slate-800 bg-slate-900 p-4">
+          <dl class="grid grid-cols-2 gap-x-4 gap-y-3 text-sm">
+            <div><dt class="text-xs text-slate-500">状态</dt>
+              <dd class="mt-0.5">{{ statusText() }}</dd></div>
+            <div><dt class="text-xs text-slate-500">在岗</dt>
+              <dd class="mt-0.5">{{ dutyText() ?? "—" }}</dd></div>
+            <div class="col-span-2"><dt class="text-xs text-slate-500">发布时间</dt>
+              <dd class="mt-0.5">{{ formatTime(item.published_at) ?? "—" }}</dd></div>
+            <div class="col-span-2"><dt class="text-xs text-slate-500">联系方式</dt>
+              <dd class="mt-1 flex flex-wrap items-center gap-3">
+                <template v-if="session.isAdmin && item.contact_username">
+                  <span>@{{ item.contact_username }}</span>
+                </template>
+                <template v-else>
+                  <span class="text-slate-500">通过立即聊天联系</span>
+                </template>
+                <button @click="startChat"
+                  class="nx-grad flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-semibold text-white hover:opacity-90">
+                  <MessageCircle class="size-4" />立即聊天
+                </button>
+              </dd></div>
+          </dl>
+        </section>
+
+        <!-- 管理员专属：OCR 溯源抽屉 -->
+        <details v-if="session.isAdmin"
+          class="rounded-xl border border-slate-800 bg-slate-900 open:pb-4">
+          <summary class="flex cursor-pointer select-none items-center gap-1.5 px-4 py-3 text-sm font-semibold text-slate-300 [&::-webkit-details-marker]:hidden">
+            <ScanSearch class="size-4 text-sky-400" />OCR 溯源
+            <ChevronDown class="ml-auto size-4 text-slate-500" />
+          </summary>
+          <div class="space-y-3 border-t border-slate-800 px-4 pt-3 text-xs">
+            <p v-if="!ocrTrace.length" class="text-slate-500">本卡片没有已完成的 OCR 图像记录。</p>
+            <div v-for="card in ocrTrace" :key="card.media_path"
+              class="space-y-2 rounded-lg border border-slate-800 bg-slate-950 p-3">
+              <div class="flex items-center justify-between gap-2">
+                <span class="min-w-0 truncate text-slate-300">{{ card.media_path.split("/").pop() }}</span>
+                <span class="shrink-0 rounded-md bg-slate-800 px-2 py-0.5 text-[10px] text-slate-300">
+                  {{ card.classification }} · {{ formatConf(card.confidence) }}
+                </span>
+              </div>
+              <div v-for="(entry, key) in card.evidence" :key="key"
+                class="flex items-start gap-2 border-b border-slate-800/60 pb-1.5 last:border-0 last:pb-0">
+                <span class="w-28 shrink-0 text-slate-500">{{ key }}</span>
+                <span class="min-w-0 flex-1 break-words text-slate-300">
+                  {{ entry.line || entry.value }}
+                </span>
+                <span class="shrink-0 text-slate-500">{{ formatConf(entry.score ?? entry.ocr_confidence) }}</span>
+              </div>
+            </div>
+            <div v-if="Object.keys(listingEvidence).length"
+              class="space-y-2 rounded-lg border border-slate-800 bg-slate-950 p-3">
+              <p class="text-[11px] font-semibold text-slate-400">卡片级抽取证据（evidence_json）</p>
+              <div v-for="(entry, key) in listingEvidence" :key="key"
+                class="flex items-start gap-2">
+                <span class="w-28 shrink-0 text-slate-500">{{ key }}</span>
+                <span class="min-w-0 flex-1 break-words text-slate-300">
+                  {{ entry.value != null ? entry.value : entry }}
+                  <template v-if="entry && typeof entry === 'object' && entry.line">
+                    <span class="text-slate-500">（{{ entry.line }}）</span>
+                  </template>
+                </span>
+                <span v-if="entry && typeof entry === 'object'" class="shrink-0 text-slate-500">
+                  {{ entry.src }}<template v-if="entry.ocr_confidence != null"> · {{ formatConf(entry.ocr_confidence) }}</template>
+                </span>
+              </div>
+            </div>
+          </div>
+        </details>
+      </template>
       <p v-if="!editing && item.description"
         class="whitespace-pre-wrap rounded-xl border border-slate-800 bg-slate-900 p-4 text-sm leading-relaxed text-slate-300">
         {{ item.description }}

@@ -10,6 +10,12 @@ through Telethon clients kept alive for each logged-in account, with:
   site user's display name so the contact knows who is writing;
 - failure classification: Telethon errors map to friendly text shown
   (admin-only) next to the message;
+- outbound pacing: every send passes a per-account rate limiter
+  (minimum gap + sliding-window per-minute cap) so bursty outbox
+  backlogs never hammer the API;
+- FloodWait cooldown: FloodWait errors put the account into a timed
+  cooldown and requeue the job — never an immediate retry, no retry
+  storms while the account is cooling;
 - stranger-limit handling: once an account trips Telegram's
   cannot-message-strangers restriction, its day flag flips to
   bot-first — brand-new sessions go through the contact's own bot
@@ -24,6 +30,7 @@ import logging
 import os
 import random
 import re
+import time
 
 import asyncpg
 from PIL import Image
@@ -48,6 +55,129 @@ BOT_RE = re.compile(r"(?:@|t\.me/)([A-Za-z0-9_]{4,32}bot)\b", re.IGNORECASE)
 # a send that gets no ACK in 45s is treated as failed (the proxy path
 # occasionally stalls a request forever); the retry cycle resends it
 SEND_TIMEOUT_S = 45
+
+
+# ---------------------------------------------------------------------------
+# outbound pacing: rate limiter + FloodWait cooldown
+# ---------------------------------------------------------------------------
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+class SendRateLimiter:
+    """Per-account outbound pacing.
+
+    Two gates, both sliding-window on a monotonic clock (injectable for
+    tests): a minimum gap between consecutive sends and a per-minute
+    send cap. A bursty outbox backlog therefore drains at a steady,
+    platform-safe pace instead of triggering 429s."""
+
+    def __init__(self, min_gap_s=None, per_minute=None, clock=None):
+        self._min_gap = (
+            float(min_gap_s) if min_gap_s is not None
+            else _env_float("NEXUS_BRIDGE_SEND_MIN_GAP_S", 3.0)
+        )
+        self._per_minute = (
+            int(per_minute) if per_minute is not None
+            else int(_env_float("NEXUS_BRIDGE_SEND_PER_MINUTE", 20))
+        )
+        self._clock = clock or time.monotonic
+        self._last: dict = {}
+        self._window: dict = {}
+
+    def delay_for(self, account_id) -> float:
+        """Seconds the account must still wait before its next send."""
+        now = self._clock()
+        stamps = [
+            stamp for stamp in self._window.get(account_id, [])
+            if now - stamp < 60.0
+        ]
+        self._window[account_id] = stamps
+        delay = 0.0
+        if self._per_minute > 0 and len(stamps) >= self._per_minute:
+            delay = max(delay, 60.0 - (now - stamps[0]))
+        last = self._last.get(account_id)
+        if last is not None and self._min_gap > 0:
+            delay = max(delay, self._min_gap - (now - last))
+        return max(0.0, delay)
+
+    def record(self, account_id) -> None:
+        """Mark a send as happened right now."""
+        now = self._clock()
+        self._last[account_id] = now
+        self._window.setdefault(account_id, []).append(now)
+
+
+class AccountCooldown:
+    """FloodWait-driven account cooldown registry.
+
+    While an account is cooling, the sender loop refuses to claim any
+    of its jobs — that is what turns an official FloodWait into a
+    clean pause instead of a retry storm."""
+
+    def __init__(self, clock=None):
+        self._clock = clock or time.monotonic
+        self._until: dict = {}
+
+    def cool(self, account_id, seconds) -> float:
+        """Put the account on cooldown; returns the effective seconds."""
+        effective = max(1, int(seconds))
+        deadline = self._clock() + effective
+        self._until[account_id] = max(self._until.get(account_id, 0), deadline)
+        return effective
+
+    def remaining(self, account_id) -> float:
+        return max(0.0, self._until.get(account_id, 0) - self._clock())
+
+    def clear(self, account_id) -> None:
+        self._until.pop(account_id, None)
+
+
+# telethon raises FloodWaitError; pyrogram FloodWait carries .value —
+# same convention as runner.duty_collection
+def _is_flood_wait(exc) -> bool:
+    return type(exc).__name__ in {"FloodWaitError", "FloodPremiumWaitError", "FloodWait"}
+
+
+def _flood_wait_seconds(exc) -> int:
+    for attr in ("seconds", "value"):
+        raw = getattr(exc, attr, None)
+        try:
+            if raw:
+                return max(1, int(raw))
+        except (TypeError, ValueError):
+            continue
+    return 1
+
+
+# shared state for the sender loop (single asyncio process by design)
+RATE_LIMITER = SendRateLimiter()
+COOLDOWN = AccountCooldown()
+
+
+def _account_wait(account_id) -> float:
+    """Total seconds before this account may claim its next job."""
+    return max(COOLDOWN.remaining(account_id), RATE_LIMITER.delay_for(account_id))
+
+
+async def _handle_flood_wait(pool, account_id, job, exc) -> None:
+    """FloodWait path: enter cooldown, requeue the job with a clear
+    cooling_down status — the loop will not touch this account again
+    until the official wait expires."""
+    wait_s = COOLDOWN.cool(account_id, _flood_wait_seconds(exc))
+    await _finish(
+        pool, job["job_id"], False,
+        f"官方限流：账号冷却 {wait_s} 秒后自动重试", None,
+        account_id=account_id,
+    )
+    logger.warning(
+        "outbox job %s -> cooling_down (account %s waits %ss)",
+        job["job_id"], account_id, wait_s,
+    )
 
 
 def classify_error(exc) -> tuple:
@@ -109,7 +239,10 @@ async def _real_account_ids(pool: asyncpg.Pool) -> list:
     return [r["id"] for r in rows]
 
 
-async def _finish(pool, job_id, ok, error, platform_msg_id, channel=None):
+async def _finish(pool, job_id, ok, error, platform_msg_id, channel=None,
+                  account_id=None):
+    if ok and account_id is not None:
+        RATE_LIMITER.record(account_id)
     rows = await pool.fetch(SQL_FINISH, job_id, ok, error, platform_msg_id, channel)
     outcome = rows[0]["outcome"]
     (logger.info if ok or outcome == "retry" else logger.warning)(
@@ -221,10 +354,16 @@ async def _send_real(pool, account_id, job) -> None:
         return
 
     msg = None
+    friendly = "发送失败"
     try:
         msg = await _send_any(client, target, kind, payload,
                               caption=_prefixed_text(job) if kind == "photo" else "")
     except Exception as exc:
+        if _is_flood_wait(exc):
+            # official rate limit: cool the account, requeue the job —
+            # never retry without waiting
+            await _handle_flood_wait(pool, account_id, job, exc)
+            return
         error_kind, friendly = classify_error(exc)
         if error_kind in ("flood", "timeout"):
             # today this account messages strangers through bots only
@@ -243,6 +382,9 @@ async def _send_real(pool, account_id, job) -> None:
                         friendly, bot,
                     )
                 except Exception as exc2:
+                    if _is_flood_wait(exc2):
+                        await _handle_flood_wait(pool, account_id, job, exc2)
+                        return
                     _, friendly = classify_error(exc2)
         if msg is None:
             await _finish(pool, job["job_id"], False, friendly, None)
@@ -257,7 +399,8 @@ async def _send_real(pool, account_id, job) -> None:
             sqlres.load("chat_bind_peer.sql"), job["session_id"], user_id,
         )
     channel = "bot" if use_bot else "direct"
-    await _finish(pool, job["job_id"], True, None, msg.id, channel)
+    await _finish(pool, job["job_id"], True, None, msg.id, channel,
+                  account_id=account_id)
 
 
 async def run_sender(pool: asyncpg.Pool, stop: asyncio.Event) -> None:
@@ -280,6 +423,17 @@ async def run_sender(pool: asyncpg.Pool, stop: asyncio.Event) -> None:
     while not stop.is_set():
         try:
             for account_id in account_ids:
+                wait = _account_wait(account_id)
+                if wait > 0:
+                    # cooling down (FloodWait) or pacing (rate limiter):
+                    # do not claim jobs for this account at all, and
+                    # never spin — pause briefly, stay stop-responsive
+                    logger.info(
+                        "account %s state=cooling_down (%.0fs until clear)",
+                        account_id, COOLDOWN.remaining(account_id),
+                    )
+                    await _sleep(stop, min(wait, max(POLL_S, 1.0)))
+                    continue
                 jobs = await pool.fetch(SQL_CLAIM, account_id)
                 for job in jobs:
                     logger.info(

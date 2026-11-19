@@ -34,6 +34,26 @@ const dutyText = () =>
   props.item.duty_label === "today" ? "今日在岗"
     : props.item.duty_label === "yesterday" ? "昨日在岗" : "";
 
+// 身体微胶囊：22岁 · 168cm · 48kg · C —— 缺失项整体隐藏
+const profileParts = () => {
+  const profile = props.item.attributes?.profile || {};
+  const parts = [];
+  if (profile.age != null) parts.push(`${profile.age}岁`);
+  if (profile.height != null) parts.push(`${profile.height}cm`);
+  if (profile.weight != null) parts.push(`${profile.weight}kg`);
+  if (profile.bust) parts.push(profile.bust);
+  return parts;
+};
+// 阶梯资费提示：1P/2P 行里取最低单价（如 "课费：1P800 2P1500" → "800起/1P"）
+const tariffHint = () => {
+  const tariffs = props.item.attributes?.tariffs || {};
+  for (const line of [...(tariffs.p1 || []), ...(tariffs.p2 || [])]) {
+    const match = String(line).match(/([12])\s*[pP]\s*(\d{2,5})/);
+    if (match) return `${match[2]}起/${match[1]}P`;
+  }
+  return null;
+};
+
 async function toggleFavorite() {
   // optimistic: the caller owns the state and updates instantly; on
   // failure the caller reverts (the API result decides the truth)
@@ -68,10 +88,13 @@ async function toggleFavorite() {
           <Play class="size-6" />
         </span>
       </span>
-      <!-- 悬浮价格徽章 -->
-      <span v-if="item.price_amount != null"
+      <!-- 悬浮价格徽章：有阶梯资费时展示更精确的资费提示 -->
+      <span v-if="item.price_amount != null || tariffHint()"
         class="nx-price-chip absolute left-2.5 top-2.5 rounded-xl px-2.5 py-0.5 text-[15px]">
-        {{ item.price_amount }}<small class="ml-0.5 text-[10px] font-normal opacity-85">{{ item.price_currency }}</small>
+        <template v-if="tariffHint()">{{ tariffHint() }}</template>
+        <template v-else>
+          {{ item.price_amount }}<small class="ml-0.5 text-[10px] font-normal opacity-85">{{ item.price_currency }}</small>
+        </template>
       </span>
       <span v-if="mediaCount() > 1"
         class="absolute right-2.5 top-2.5 flex items-center gap-1 rounded-lg bg-slate-950/70 px-2 py-0.5 text-[10px] text-slate-200 backdrop-blur">
@@ -94,6 +117,10 @@ async function toggleFavorite() {
         <span class="size-2 shrink-0 rounded-full ring-2 ring-slate-950/20"
           :class="tierClass()" :title="tierText()" :aria-label="tierText()"></span>
         <span class="min-w-0 truncate font-semibold text-slate-100">{{ item.nickname || "未命名" }}</span>
+      </div>
+      <div v-if="profileParts().length"
+        class="truncate text-[11px] leading-4 text-slate-400">
+        {{ profileParts().join(" · ") }}
       </div>
       <div class="flex min-w-0 items-center gap-1 text-xs text-slate-500">
         <MapPin class="size-3 shrink-0" />

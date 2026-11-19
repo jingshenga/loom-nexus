@@ -5,6 +5,7 @@ WITH clock AS (
 ), filtered AS (
     SELECT l.id, rm.source_id, l.nickname, l.district, l.price_amount, l.price_currency,
            l.description, l.media_json, l.confidence, l.published_at, l.created_at,
+           l.evidence_json, ocr.ocr_cards,
            COALESCE(cp.is_online, FALSE) AS is_online,
            COALESCE(cp.status_tier, 'unknown') AS presence_tier,
            CASE WHEN $9::text = 'yesterday' THEN 'yesterday'
@@ -31,6 +32,12 @@ WITH clock AS (
     FROM listings l
     LEFT JOIN raw_messages rm ON rm.id = l.source_msg_id
     LEFT JOIN contact_presence cp ON cp.contact_peer_id = l.contact_peer_id
+    LEFT JOIN LATERAL (
+        SELECT jsonb_agg(m.fields_json ORDER BY m.confidence DESC NULLS LAST, m.id) AS ocr_cards
+        FROM listing_media_ocr m
+        WHERE m.raw_id = rm.id AND m.status = 'done'
+          AND m.classification IN ('info_card', 'uncertain')
+    ) ocr ON TRUE
     CROSS JOIN clock c
     WHERE l.status = 'published'
       AND ($1::text IS NULL OR l.nickname ILIKE '%' || $1 || '%'
@@ -47,8 +54,8 @@ WITH clock AS (
       ))
 )
 SELECT id, source_id, nickname, district, price_amount, price_currency,
-       description, media_json, confidence, published_at, is_online,
-       presence_tier, duty_label, favorited
+       description, media_json, evidence_json, ocr_cards, confidence,
+       published_at, is_online, presence_tier, duty_label, favorited
 FROM filtered
 ORDER BY (on_duty_today AND newly_collected) DESC,
          on_duty_today DESC, newly_collected DESC, created_at DESC, id DESC

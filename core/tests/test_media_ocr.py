@@ -74,7 +74,14 @@ class MediaOcrTests(unittest.TestCase):
         ]
         public = _visible_media(media, False)
         self.assertEqual([item["path"] for item in public], ["portrait.jpg", "clip.mp4"])
-        self.assertEqual(_visible_media(media, True), media)
+        # admins see everything, ordered manual_order → photos first →
+        # visibility → score (sorting introduced with admin card editing)
+        ordered = _visible_media(media, True)
+        self.assertEqual(
+            [item["path"] for item in ordered],
+            ["portrait.jpg", "pending.jpg", "card.jpg", "clip.mp4"],
+        )
+        self.assertEqual(len(ordered), len(media))
 
 
 if __name__ == "__main__":
