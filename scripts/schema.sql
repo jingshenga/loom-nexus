@@ -3287,3 +3287,117 @@ CREATE TABLE IF NOT EXISTS golden_rule_samples (
     saved_by bigint REFERENCES site_users(id) ON DELETE SET NULL,
     saved_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- ============================================================
+-- M18: deep backfill cursors + per-source AI extraction profile
+-- backfill jobs gain a cursor (offset_id): 0 = newest page (legacy
+-- "sync latest"), -1 = resolve to the source's local min_msg_id at
+-- execution time (deep history walk), >0 = explicit platform msg id.
+-- Sources gain a learned extraction_profile (JSON) produced by the
+-- channel-profile LLM pass and its learning timestamp.
+-- ============================================================
+ALTER TABLE backfill_jobs ADD COLUMN IF NOT EXISTS offset_id BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE ingest_sources ADD COLUMN IF NOT EXISTS extraction_profile JSONB;
+ALTER TABLE ingest_sources ADD COLUMN IF NOT EXISTS profile_learned_at TIMESTAMPTZ;
+
+DROP FUNCTION IF EXISTS backfill_enqueue(BIGINT, BIGINT, BIGINT, INT, VARCHAR);
+CREATE OR REPLACE FUNCTION backfill_enqueue(
+    p_source_id BIGINT,
+    p_account_id BIGINT,
+    p_peer_id BIGINT,
+    p_limit INT,
+    p_job_mode VARCHAR(12) DEFAULT 'history',
+    p_offset_id BIGINT DEFAULT 0
+) RETURNS BIGINT
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_id BIGINT;
+BEGIN
+    INSERT INTO backfill_jobs (source_id, account_id, peer_id, msg_limit,
+                               job_mode, offset_id)
+    VALUES (p_source_id, p_account_id, p_peer_id,
+            GREATEST(1, LEAST(p_limit, 2000)), p_job_mode,
+            GREATEST(-1, COALESCE(p_offset_id, 0)))
+    RETURNING id INTO v_id;
+    RETURN v_id;
+END
+$fn$;
+
+DROP FUNCTION IF EXISTS admin_sources();
+CREATE OR REPLACE FUNCTION admin_sources()
+RETURNS TABLE(source_id BIGINT, peer_id BIGINT, title VARCHAR(255),
+              username VARCHAR(128), is_active BOOLEAN, account_id BIGINT,
+              account_name VARCHAR(128), last_msg_id BIGINT, raw_count BIGINT,
+              min_msg_id BIGINT, max_msg_id BIGINT,
+              extraction_profile JSONB, profile_learned_at TIMESTAMPTZ)
+LANGUAGE plpgsql STABLE AS $fn$
+BEGIN
+    RETURN QUERY
+    SELECT s.id, s.peer_id, s.title, s.username, s.is_active,
+           s.assigned_account_id, a.display_name,
+           s.last_msg_id,
+           (SELECT count(*) FROM raw_messages rm WHERE rm.source_id = s.id),
+           (SELECT COALESCE(MIN(rm.platform_msg_id), 0)
+            FROM raw_messages rm WHERE rm.source_id = s.id),
+           (SELECT COALESCE(MAX(rm.platform_msg_id), 0)
+            FROM raw_messages rm WHERE rm.source_id = s.id),
+           s.extraction_profile,
+           s.profile_learned_at
+    FROM ingest_sources s
+    LEFT JOIN bridge_accounts a ON a.id = s.assigned_account_id
+    ORDER BY s.id;
+END
+$fn$;
+
+-- claim batch also carries the bound source's learned profile so the
+-- extractor can parse messages against the channel's own conventions
+DROP FUNCTION IF EXISTS extract_claim_batch(INT);
+CREATE OR REPLACE FUNCTION extract_claim_batch(p_limit INT)
+RETURNS TABLE(
+    raw_id BIGINT,
+    source_id BIGINT,
+    platform_msg_id BIGINT,
+    sender_peer_id BIGINT,
+    grouped_id BIGINT,
+    raw_text TEXT,
+    media_json JSONB,
+    posted_at TIMESTAMPTZ,
+    rule_config JSONB,
+    extraction_profile JSONB
+)
+LANGUAGE plpgsql AS $fn$
+BEGIN
+    RETURN QUERY
+    WITH claimed AS (
+        SELECT r.id
+        FROM raw_messages r
+        WHERE r.extract_state = 'new'
+           OR (r.extract_state = 'processing'
+               AND r.extract_claimed_at < NOW() - INTERVAL '10 minutes')
+        ORDER BY r.id
+        LIMIT GREATEST(1, p_limit)
+        FOR UPDATE OF r SKIP LOCKED
+    )
+    UPDATE raw_messages rm
+    SET extract_state = 'processing', extract_claimed_at = NOW()
+    FROM claimed c, ingest_sources s
+    WHERE rm.id = c.id AND s.id = rm.source_id
+    RETURNING rm.id, rm.source_id, rm.platform_msg_id, rm.sender_peer_id,
+              rm.grouped_id, rm.raw_text, rm.media_json, rm.posted_at,
+              COALESCE(
+                  (SELECT ir.config_json
+                   FROM source_rule_bindings b
+                   JOIN ingest_rules ir ON ir.id = b.rule_id
+                       AND ir.is_active AND ir.rule_type = 'listing'
+                   WHERE b.source_id = rm.source_id
+                   ORDER BY b.priority DESC, ir.id
+                   LIMIT 1),
+                  (SELECT ir.config_json
+                   FROM ingest_rules ir
+                   WHERE ir.rule_name = 'default-rule' AND ir.is_active
+                   LIMIT 1)
+              ) AS rule_config,
+              s.extraction_profile;
+END
+$fn$;
+

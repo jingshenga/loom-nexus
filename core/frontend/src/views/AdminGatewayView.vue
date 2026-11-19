@@ -99,6 +99,47 @@ async function backfillMedia() {
   }
 }
 
+// ---- 单来源采集操作：增量同步 / 游标深采 / 画像学习 ----
+
+async function backfillOne(s, limit, offsetId, label) {
+  try {
+    await api(`/api/admin/sources/${s.id}/backfill`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ limit, offset_id: offsetId }),
+    });
+    notify(`${s.title || `来源#${s.id}`}：${label}任务已排队（去重幂等，可在队列看板观察进度）`);
+  } catch (e) {
+    notify(`发起失败: ${String(e.message).slice(0, 60)}`);
+  }
+}
+
+const learning = ref({});
+
+async function learnProfile(s) {
+  learning.value = { ...learning.value, [s.id]: true };
+  try {
+    const r = await api(`/api/admin/sources/${s.id}/learn-profile`, { method: "POST" });
+    notify(
+      `${s.title || `来源#${s.id}`}：画像已学习 —— ${r.style_notes || "完成"}` +
+      `（few-shot ${r.few_shot_count} 条，价格写法 ${(r.price_patterns || []).length} 种）`,
+    );
+    await loadAll();
+  } catch (e) {
+    notify(`画像学习失败: ${String(e.message).slice(0, 90)}`);
+  } finally {
+    learning.value = { ...learning.value, [s.id]: false };
+  }
+}
+
+const profileSummary = (s) => {
+  const p = s.extraction_profile;
+  if (!p) return null;
+  const bits = [p.style_notes, (p.price_patterns || []).slice(0, 3).join(" / ")]
+    .filter(Boolean);
+  return bits.join(" · ") || "已学习";
+};
+
 onMounted(loadAll);
 </script>
 
@@ -183,10 +224,42 @@ onMounted(loadAll);
             <tbody>
               <tr v-for="s in sources" :key="s.id" class="border-t border-slate-800">
                 <td class="px-4 py-2.5">
-                  <div class="font-medium">{{ s.title || `来源#${s.id}` }}</div>
+                  <div class="flex items-center gap-2">
+                    <span class="font-medium">{{ s.title || `来源#${s.id}` }}</span>
+                    <span v-if="s.extraction_profile"
+                      class="rounded bg-sky-900/40 px-1.5 py-0.5 text-[10px] text-sky-300">✨ 画像已学习</span>
+                  </div>
                   <div class="text-xs text-slate-500">
                     {{ s.username ? "@" + s.username : s.peer_id }} · 账号 {{ s.account_name || s.account_id || "未分配" }}
-                    · 已采集 {{ s.raw_count }} 条 · 游标 {{ s.last_msg_id }}
+                  </div>
+                  <!-- 采集水位：最新 ID / 最早 ID / 本地卡片数 -->
+                  <div class="mt-0.5 text-[11px] text-slate-600">
+                    水位 {{ s.max_msg_id || 0 }} ← {{ s.min_msg_id || 0 }}
+                    · 本地 {{ s.raw_count }} 条 · 游标 {{ s.last_msg_id }}
+                  </div>
+                  <div v-if="profileSummary(s)"
+                    class="mt-0.5 truncate text-[11px] text-sky-300/80"
+                    :title="profileSummary(s)">✨ {{ profileSummary(s) }}</div>
+                  <div class="mt-1.5 flex flex-wrap gap-1.5">
+                    <button @click="backfillOne(s, 50, 0, '增量同步')"
+                      class="rounded-lg border border-slate-600 px-2.5 py-1 text-xs text-slate-300 hover:bg-slate-800">
+                      增量同步
+                    </button>
+                    <button @click="backfillOne(s, 100, -1, '向后深采 100 条')"
+                      class="rounded-lg border border-sky-700/60 px-2.5 py-1 text-xs text-sky-300 hover:bg-sky-900/30">
+                      深采 100
+                    </button>
+                    <button @click="backfillOne(s, 500, -1, '向后深采 500 条')"
+                      class="rounded-lg border border-sky-700/60 px-2.5 py-1 text-xs text-sky-300 hover:bg-sky-900/30">
+                      深采 500
+                    </button>
+                    <button @click="learnProfile(s)" :disabled="learning[s.id]"
+                      class="rounded-lg border px-2.5 py-1 text-xs disabled:opacity-40"
+                      :class="s.extraction_profile
+                        ? 'border-violet-700/60 text-violet-300 hover:bg-violet-900/30'
+                        : 'border-amber-700/60 text-amber-300 hover:bg-amber-900/30'">
+                      {{ learning[s.id] ? "学习中…" : s.extraction_profile ? "重新学习" : "学习画像" }}
+                    </button>
                   </div>
                   <div class="mt-2 flex flex-wrap items-center gap-2">
                     <span class="text-xs text-slate-500">备用账号</span>
@@ -201,7 +274,7 @@ onMounted(loadAll);
                       class="rounded border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800">保存</button>
                   </div>
                 </td>
-                <td class="px-4 py-2.5 text-right">
+                <td class="px-4 py-2.5 text-right align-top">
                   <button @click="toggleSource(s)"
                     class="rounded-lg border px-3 py-1.5 text-xs"
                     :class="s.is_active

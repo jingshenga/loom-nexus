@@ -19,11 +19,12 @@ import json
 import logging
 import os
 import re
+import time
 
 import asyncpg
 
-from app import sqlres
-from app.extractor import ast_rules, media_ocr, ocr_fields
+from app import llm, sqlres
+from app.extractor import ast_rules, media_ocr, ocr_fields, profile_extract
 from app.extractor.ocr_worker import OcrWorker
 
 logger = logging.getLogger("nexus-core.extractor")
@@ -150,6 +151,20 @@ class Extractor:
         self._ocr_enabled = ocr_enabled
         self._ocr = ocr_worker or OcrWorker()
         self._media_ocr_processor = media_ocr_processor
+        # LLM endpoint config cached briefly — profile extraction only
+        # runs when a model endpoint is actually configured
+        self._llm_cfg: dict | None = None
+        self._llm_cfg_at = 0.0
+
+    async def _llm_config(self) -> dict:
+        if self._llm_cfg is None or time.monotonic() - self._llm_cfg_at > 60:
+            try:
+                self._llm_cfg = await llm.load_config(self._pool)
+            except Exception:
+                logger.exception("llm config load failed; profile pass disabled")
+                self._llm_cfg = {}
+            self._llm_cfg_at = time.monotonic()
+        return self._llm_cfg
 
     async def run(self, stop: asyncio.Event, batch_size: int, idle_s: float) -> None:
         logger.info(
@@ -274,6 +289,37 @@ class Extractor:
                 for card_fields, card_evidence, confidence in cards:
                     filled, filled_ev = ocr_fields.card_to_listing_fields(card_fields, card_evidence, confidence)
                     fields, evidence = ast_rules.merge_extraction(fields, evidence, filled, filled_ev)
+
+            # (c) channel profile: a learned per-source extraction
+            # profile + configured model endpoint lets the LLM parse
+            # the message straight into the standard schema — it fills
+            # whatever regex/OCR still missed and contributes the
+            # structured tariffs/services/restrictions extras; any
+            # model failure degrades silently to the deterministic result
+            profile = _decode_jsonb(row.get("extraction_profile"), None)
+            if profile_extract.profile_ready(profile, await self._llm_config()):
+                needs_fill = bool(missing_triggers(fields, triggers))
+                has_extras = any(
+                    key in evidence for key in (
+                        "service_text", "restriction_text",
+                        "price_1p_text", "price_text",
+                    )
+                )
+                if needs_fill or not has_extras:
+                    cfg = await self._llm_config()
+                    parsed = await profile_extract.extract_with_profile(
+                        lambda messages, timeout=60: llm.chat(cfg, messages, timeout),
+                        text, profile,
+                    )
+                    if parsed:
+                        fields, evidence, filled = profile_extract.merge_profile_result(
+                            fields, evidence, parsed,
+                        )
+                        if filled:
+                            logger.info(
+                                "raw %s profile-llm filled %s",
+                                raw_id, ",".join(sorted(set(filled))),
+                            )
 
             has_structure = any(
                 k in fields

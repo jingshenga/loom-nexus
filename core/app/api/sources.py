@@ -8,8 +8,9 @@ import json
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from app import db, sqlres
+from app import db, llm, sqlres
 from app.api.auth import require_admin
+from app.extractor import profile_extract
 
 router = APIRouter(
     prefix="/api/admin/sources", tags=["admin-sources"],
@@ -30,6 +31,8 @@ SQL_BACKUP_DELETE = sqlres.load("source_backup_accounts.sql")
 SQL_BACKUP_INSERT = sqlres.load("source_backup_account_insert.sql")
 SQL_BACKUP_REMOVE_PRIMARY = sqlres.load("source_backup_remove_primary.sql")
 SQL_VISIBLE_DIALOG_ACCOUNTS = sqlres.load("source_dialog_accounts.sql")
+SQL_WATERMARK = sqlres.load("source_watermark.sql")
+SQL_PROFILE_GET = sqlres.load("source_profile_get.sql")
 
 
 def _pool():
@@ -60,10 +63,33 @@ async def list_sources() -> dict:
                     if isinstance(r["backup_accounts"], str)
                     else r["backup_accounts"]
                 ),
+                # 采集水位：本地最早/最新消息 ID + 入库总数 + 画像状态
+                "min_msg_id": r["min_msg_id"],
+                "max_msg_id": r["max_msg_id"],
+                "profile_learned_at": (
+                    r["profile_learned_at"].isoformat()
+                    if r["profile_learned_at"] else None
+                ),
+                "extraction_profile": _decode_profile(r["extraction_profile"]),
             }
             for r in rows
         ]
     }
+
+
+def _decode_profile(value):
+    """jsonb arrives as raw text through asyncpg unless a codec is
+    registered; legacy rows keep None."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, dict):
+        return value
+    try:
+        import json
+
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return None
 
 
 @router.get("/dialogs")
@@ -158,11 +184,16 @@ async def set_active(source_id: int, body: ActiveBody) -> dict:
 
 class BackfillBody(BaseModel):
     limit: int = 50
+    # 游标：None/0 = 最新一页（增量同步）；-1 = 从本地最早水位向历史
+    # 深处回溯（深度补采）；>0 = 显式 platform_msg_id
+    offset_id: int = 0
 
 
 @router.post("/{source_id}/backfill")
 async def start_backfill(source_id: int, body: BackfillBody) -> dict:
-    """Queue a history pull (text + media) for rule-tuning samples."""
+    """Queue a cursor-based history pull (text + media). Deep walks
+    (offset_id=-1) page backward from the local min_msg_id watermark;
+    the executor dedupes via ON CONFLICT so re-runs are idempotent."""
     pool = _pool()
     rows = await pool.fetch(SQL_SOURCE_OF, source_id)
     if not rows:
@@ -172,9 +203,14 @@ async def start_backfill(source_id: int, body: BackfillBody) -> dict:
         raise HTTPException(status_code=409, detail="source has no assigned account")
     job = await pool.fetch(
         SQL_BF_ENQUEUE, source_id, account_id, rows[0]["peer_id"],
-        max(1, min(body.limit, 200)), "history",
+        max(1, min(body.limit, 2000)), "history", max(-1, body.offset_id),
     )
-    return {"job_id": job[0]["job_id"], "status": "pending"}
+    return {
+        "job_id": job[0]["job_id"],
+        "status": "pending",
+        "limit": max(1, min(body.limit, 2000)),
+        "offset_id": max(-1, body.offset_id),
+    }
 
 
 @router.post("/backfill-media-all")
@@ -213,4 +249,75 @@ async def backfill_status(source_id: int) -> dict:
         "status": rows[0]["status"],
         "fetched": rows[0]["fetched"],
         "error": rows[0]["error"],
+    }
+
+
+@router.get("/{source_id}/watermark")
+async def source_watermark(source_id: int) -> dict:
+    """采集水位：本地最早/最新消息 ID 与入库总数。"""
+    pool = _pool()
+    rows = await pool.fetch(SQL_SOURCE_OF, source_id)
+    if not rows:
+        raise HTTPException(status_code=404, detail="source not found")
+    mark = await pool.fetch(SQL_WATERMARK, source_id)
+    r = mark[0]
+    return {
+        "source_id": source_id,
+        "min_msg_id": int(r["min_msg_id"] or 0),
+        "max_msg_id": int(r["max_msg_id"] or 0),
+        "total_ingested": int(r["total_ingested"] or 0),
+    }
+
+
+@router.get("/{source_id}/profile")
+async def get_profile(source_id: int) -> dict:
+    """当前频道的 AI 抽取画像（未学习时 status=none）。"""
+    pool = _pool()
+    rows = await pool.fetch(SQL_PROFILE_GET, source_id)
+    if not rows:
+        raise HTTPException(status_code=404, detail="source not found")
+    profile = _decode_profile(rows[0]["extraction_profile"])
+    return {
+        "source_id": source_id,
+        "status": "learned" if profile else "none",
+        "profile": profile,
+        "learned_at": (
+            rows[0]["profile_learned_at"].isoformat()
+            if rows[0]["profile_learned_at"] else None
+        ),
+    }
+
+
+@router.post("/{source_id}/learn-profile")
+async def learn_profile(source_id: int) -> dict:
+    """频道冷启动画像：抽 10~20 条本地样本让模型学习排版习惯，
+    生成并持久化 extraction_profile（含 2~3 个 few-shot）。任何失败
+    （样本不足 / LLM 未配置 / 输出不可解析）都给出可操作的提示。"""
+    pool = _pool()
+    rows = await pool.fetch(SQL_SOURCE_OF, source_id)
+    if not rows:
+        raise HTTPException(status_code=404, detail="source not found")
+    cfg = await llm.load_config(pool)
+    if not (cfg.get("base_url") and cfg.get("model")):
+        raise HTTPException(
+            status_code=400,
+            detail="尚未配置大模型端点：请在系统设置中填写 LLM Base URL 与模型名",
+        )
+    try:
+        profile = await profile_extract.learn_channel_profile(
+            pool, llm.chat, cfg, source_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"画像学习失败：{str(exc)[:120]}（请检查模型端点与密钥）",
+        )
+    return {
+        "source_id": source_id,
+        "status": "learned",
+        "style_notes": profile.get("style_notes"),
+        "price_patterns": profile.get("price_patterns") or [],
+        "few_shot_count": len(profile.get("few_shot") or []),
     }

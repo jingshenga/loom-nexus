@@ -2,6 +2,15 @@
 media) into the pipeline, or run a media-only pass that attaches
 photos/videos to already-stored messages.
 
+Cursor pagination: a history job carries offset_id — 0 pulls the
+newest page (increment sync), -1 resolves to the source's local
+min_msg_id at execution time so repeated deep jobs walk further back,
+and any positive value is used as an explicit Telethon offset_id.
+The per-source watermark (min/max msg id + local count) comes from
+source_watermark.sql. ingest_append_sample's ON CONFLICT DO NOTHING
+keeps the walk idempotent: locally-known messages are skipped in
+microseconds, unknown ones land and enter the extraction pipeline.
+
 Media policy: photos always; videos only up to
 NEXUS_BRIDGE_MEDIA_MAX_MB (default 50) to protect NAS disk.
 After a media pass, cards still missing a price are requeued so the
@@ -25,6 +34,7 @@ SQL_SESSION_OF = sqlres.load("session_file_of.sql")
 SQL_SET_MEDIA = sqlres.load("set_media.sql")
 SQL_RESET_PRICE = sqlres.load("reset_missing_price.sql")
 SQL_RAW_IDS = sqlres.load("raw_ids_for_source.sql")
+SQL_WATERMARK = sqlres.load("source_watermark.sql")
 
 POLL_S = float(os.getenv("NEXUS_BRIDGE_BACKFILL_INTERVAL", "3"))
 MEDIA_DIR = os.getenv("NEXUS_MEDIA_DIR", "/app/data/media")
@@ -106,12 +116,17 @@ def order_media(media: list) -> list:
     )
 
 
-async def _fetch_history(client, peer_id: int, limit: int, source_id: int):
-    """[(msg_id, sender, grouped, text, date, media_json)] oldest first.
+async def _fetch_history(client, peer_id: int, limit: int, source_id: int,
+                         offset_id: int = 0):
+    """[(msg_id, sender, grouped, text, date, media_json)] oldest first,
+    walking BACKWARD from offset_id (Telethon semantics: offset_id is
+    the exclusive upper bound — messages older than it are returned).
     Album parts sharing a grouped_id are MERGED into one row anchored
     on the caption-bearing part, carrying all photos + videos."""
     entity = await client.get_entity(peer_id)
-    messages = list(reversed((await client.get_messages(entity, limit=limit)) or []))
+    messages = list(reversed(
+        (await client.get_messages(entity, limit=limit, offset_id=offset_id)) or []
+    ))
     rows = []
     i = 0
     while i < len(messages):
@@ -140,8 +155,24 @@ async def _fetch_history(client, peer_id: int, limit: int, source_id: int):
     return rows
 
 
+async def _resolve_offset(pool, job) -> int:
+    """Cursor for a history job: explicit positive offset wins; -1
+    means "walk backward from the source's local watermark" (deep
+    mode); 0 pulls the newest page (increment sync)."""
+    offset = int(job.get("offset_id") or 0)
+    if offset > 0:
+        return offset
+    if offset == -1:
+        mark = await pool.fetch(SQL_WATERMARK, job["source_id"])
+        return int(mark[0]["min_msg_id"] or 0)
+    return 0
+
+
 async def _backfill_history(pool, job, client) -> int:
-    history = await _fetch_history(client, job["peer_id"], job["msg_limit"], job["source_id"])
+    offset = await _resolve_offset(pool, job)
+    history = await _fetch_history(
+        client, job["peer_id"], job["msg_limit"], job["source_id"], offset,
+    )
     inserted = 0
     for msg_id, sender, grouped, text, date, media in history:
         rows = await pool.fetch(
@@ -150,6 +181,11 @@ async def _backfill_history(pool, job, client) -> int:
         )
         if rows[0]["raw_id"] is not None:
             inserted += 1
+    logger.info(
+        "history walk source=%s cursor=%s limit=%s: %d new / %d seen",
+        job["source_id"], offset or "newest", job["msg_limit"],
+        inserted, len(history),
+    )
     return inserted
 
 
