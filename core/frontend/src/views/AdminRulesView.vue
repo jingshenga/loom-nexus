@@ -115,6 +115,108 @@ function notify(msg) {
   setTimeout(() => (flash.value = ""), 3000);
 }
 
+// ---- 动态黑话词表与纠偏建议（热更新闭环） ----
+
+const slangItems = ref([]);
+const insightMinHits = 2;
+const insights = ref([]);
+const preview = ref(null);
+const previewBusy = ref(false);
+const pendingAdopt = ref(null);
+const slangForm = ref({ category: "tariff_alias", source_term: "", target_action: "", factor: null });
+
+async function loadSlang() {
+  slangItems.value = (await api("/api/admin/rules/slang-registry")).items;
+}
+async function loadInsights() {
+  insights.value = (
+    await api(`/api/admin/rules/correction-insights?days=30&min_hits=${insightMinHits}`)
+  ).items;
+}
+async function reloadSlang() {
+  const data = await api("/api/admin/rules/slang-registry/reload", { method: "POST" });
+  notify(`词表已重载：${data.applied_terms} 条动态词条生效`);
+  await loadSlang();
+}
+async function upsertSlang() {
+  const body = {
+    category: slangForm.value.category,
+    source_term: slangForm.value.source_term.trim(),
+    target_action: slangForm.value.target_action.trim() || null,
+    factor: slangForm.value.factor || null,
+    enabled: true,
+  };
+  try {
+    const data = await api("/api/admin/rules/slang-registry", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    notify(`词条「${data.item.source_term}」已热生效（动态词表 ${data.applied_terms} 条）`);
+    slangForm.value = { category: slangForm.value.category, source_term: "", target_action: "", factor: null };
+    await loadSlang();
+  } catch (e) {
+    notify(`保存失败: ${String(e.message).slice(0, 80)}`);
+  }
+}
+async function toggleSlang(item) {
+  await api(`/api/admin/rules/slang-registry/${item.id}/toggle`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled: !item.enabled }),
+  });
+  await loadSlang();
+}
+async function deleteSlang(item) {
+  await api(`/api/admin/rules/slang-registry/${item.id}`, { method: "DELETE" });
+  await loadSlang();
+}
+async function adoptSuggestion(suggestion) {
+  pendingAdopt.value = suggestion;
+  previewBusy.value = true;
+  try {
+    // 先热应用候选跑回测（服务端跑完会恢复基线，未入库不残留）
+    let config = {};
+    try { config = JSON.parse(configText.value || "{}"); } catch { config = {}; }
+    preview.value = await api("/api/admin/rules/slang-registry/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        category: suggestion.category,
+        source_term: suggestion.source_term,
+        target_action: suggestion.target_action,
+        config,
+        sample_set: "golden",
+        sample_limit: 30,
+      }),
+    });
+  } catch (e) {
+    notify(`回测失败: ${String(e.message).slice(0, 80)}`);
+    pendingAdopt.value = null;
+  } finally {
+    previewBusy.value = false;
+  }
+}
+async function confirmAdopt() {
+  if (!pendingAdopt.value) return;
+  previewBusy.value = true;
+  try {
+    const data = await api("/api/admin/rules/slang-registry", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...pendingAdopt.value, enabled: true }),
+    });
+    notify(`词条「${data.item.source_term}」已入库并热生效（动态词表 ${data.applied_terms} 条）`);
+    preview.value = null;
+    pendingAdopt.value = null;
+    await loadSlang();
+  } catch (e) {
+    notify(`入库失败: ${String(e.message).slice(0, 80)}`);
+  } finally {
+    previewBusy.value = false;
+  }
+}
+
 const boundGroups = () => (current.value && current.value.bindings) || [];
 
 function select(rule) {
@@ -456,6 +558,8 @@ onMounted(async () => {
   llm.value = await api("/api/admin/rules/llm-status");
   sources.value = (await api("/api/admin/sources")).items;
   dialogs.value = (await api("/api/admin/sources/dialogs")).items;
+  loadSlang();
+  loadInsights();
   profileRefreshTimer = setInterval(() => {
     if (["profile_collection", "bot_collection", "checkin_reverse"].includes(activeTab.value) && current.value?.id) {
       loadProfileResults(current.value.id);
@@ -482,6 +586,129 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
         <Settings2 class="size-3.5" />AI 设置
       </button>
     </div>
+
+    <!-- 动态黑话词表 + 纠偏建议：审核纠偏 → 差分沉淀 → 一键采纳回测 → 热生效 -->
+    <details class="space-y-3 rounded-xl border border-emerald-800/50 bg-emerald-950/10 p-4 text-sm" open>
+      <summary class="cursor-pointer select-none text-sm font-semibold text-emerald-300">
+        动态黑话库与纠偏建议（热更新，无需发版）
+        <span class="ml-2 text-xs font-normal text-slate-500">
+          已启用 {{ slangItems.filter(i => i.enabled).length }} 条
+        </span>
+      </summary>
+      <div class="grid gap-4 lg:grid-cols-2">
+        <div class="space-y-2">
+          <div class="flex items-center justify-between">
+            <span class="text-xs text-slate-400">黑话词表（金额单位 / 资费别名 / 引导词）</span>
+            <button @click="reloadSlang"
+              class="flex items-center gap-1 rounded-lg border border-slate-700 px-2 py-0.5 text-xs text-slate-300 hover:bg-slate-800">
+              <RefreshCw class="size-3" />重载
+            </button>
+          </div>
+          <div class="max-h-56 space-y-1.5 overflow-y-auto pr-1">
+            <div v-for="item in slangItems" :key="item.id"
+              class="flex items-center gap-2 rounded-lg border border-slate-800 bg-slate-900/60 px-2.5 py-1.5 text-xs">
+              <span class="rounded px-1.5 py-0.5 text-[10px]"
+                :class="item.category === 'money_slang' ? 'bg-amber-900/40 text-amber-300' : 'bg-sky-900/40 text-sky-300'">
+                {{ item.category }}
+              </span>
+              <span class="font-mono text-slate-200">{{ item.source_term }}</span>
+              <span class="text-slate-500">→</span>
+              <span class="text-slate-300">{{ item.target_action || (item.factor ? `×${item.factor}` : "?") }}</span>
+              <button @click="toggleSlang(item)"
+                class="ml-auto rounded px-2 py-0.5 text-[10px]"
+                :class="item.enabled ? 'bg-emerald-900/40 text-emerald-300' : 'bg-slate-800 text-slate-500'">
+                {{ item.enabled ? "启用中" : "已禁用" }}
+              </button>
+              <button @click="deleteSlang(item)" aria-label="删除词条"
+                class="rounded p-0.5 text-slate-600 hover:text-rose-400">
+                <Trash2 class="size-3" />
+              </button>
+            </div>
+            <div v-if="!slangItems.length" class="rounded-lg border border-slate-800 bg-slate-900/40 p-3 text-xs text-slate-500">
+              词表为空：内置黑话（张/米/章/1P…）仍生效；在此添加新词即可热更新，无需发版。
+            </div>
+          </div>
+          <div class="flex flex-wrap items-center gap-1.5 border-t border-slate-800 pt-2">
+            <select v-model="slangForm.category"
+              class="rounded border border-slate-700 bg-slate-950 px-1.5 py-1 text-xs">
+              <option value="money_slang">金额单位</option>
+              <option value="tariff_alias">资费别名</option>
+              <option value="bust_alias">胸围引导</option>
+              <option value="age_alias">年龄引导</option>
+            </select>
+            <input v-model="slangForm.source_term" placeholder="词（如 双次）" maxlength="64"
+              class="w-24 rounded border border-slate-700 bg-slate-950 px-1.5 py-1 text-xs" />
+            <input v-model="slangForm.target_action" placeholder="→ 目标（如 2p）" maxlength="64"
+              class="w-24 rounded border border-slate-700 bg-slate-950 px-1.5 py-1 text-xs" />
+            <input v-model.number="slangForm.factor" type="number" placeholder="倍数" min="1"
+              class="w-16 rounded border border-slate-700 bg-slate-950 px-1.5 py-1 text-xs" />
+            <button @click="upsertSlang"
+              class="rounded-lg bg-emerald-700 px-2.5 py-1 text-xs font-medium text-white hover:bg-emerald-600">
+              添加并热生效
+            </button>
+          </div>
+        </div>
+        <div class="space-y-2">
+          <div class="flex items-center justify-between">
+            <span class="text-xs text-slate-400">高频纠偏建议（近 30 天，≥{{ insightMinHits }} 次）</span>
+            <button @click="loadInsights"
+              class="flex items-center gap-1 rounded-lg border border-slate-700 px-2 py-0.5 text-xs text-slate-300 hover:bg-slate-800">
+              <FlaskConical class="size-3" />刷新分析
+            </button>
+          </div>
+          <div class="max-h-64 space-y-1.5 overflow-y-auto pr-1">
+            <div v-for="(insight, index) in insights" :key="index"
+              class="rounded-lg border border-slate-800 bg-slate-900/60 p-2.5 text-xs">
+              <div class="flex items-center gap-2">
+                <span class="font-mono text-slate-400">{{ insight.field_name }}</span>
+                <span class="truncate text-slate-300">{{ insight.old_value }} → {{ insight.new_value }}</span>
+                <span class="ml-auto shrink-0 rounded bg-rose-900/40 px-1.5 py-0.5 text-[10px] text-rose-300">
+                  ×{{ insight.hits }}
+                </span>
+              </div>
+              <div v-for="(suggestion, sIndex) in insight.suggestions" :key="sIndex"
+                class="mt-1.5 flex items-center gap-2">
+                <span class="text-slate-400">
+                  建议词条 <span class="font-mono text-emerald-300">{{ suggestion.source_term }}</span>
+                  → {{ suggestion.target_action }}
+                </span>
+                <button @click="adoptSuggestion(suggestion)"
+                  :disabled="previewBusy"
+                  class="ml-auto rounded-lg border border-emerald-700/60 px-2 py-0.5 text-[11px] text-emerald-300 hover:bg-emerald-900/30 disabled:opacity-40">
+                  一键采纳回测
+                </button>
+              </div>
+            </div>
+            <div v-if="!insights.length" class="rounded-lg border border-slate-800 bg-slate-900/40 p-3 text-xs text-slate-500">
+              暂无高频纠偏。管理员在审核工作台的每次就地修改都会被记录为差分，反复出现的修正会汇总到这里。
+            </div>
+          </div>
+          <div v-if="preview" class="space-y-2 rounded-lg border border-emerald-700/50 bg-emerald-900/10 p-2.5">
+            <p class="text-xs text-emerald-300">
+              回测完成（{{ preview.sample_set }} 样本 {{ preview.baseline.total }} 条）：
+              命中率 {{ preview.baseline.hit_rate }} → {{ preview.with_candidate.hit_rate }}
+              <template v-if="preview.baseline.passed != null">
+                ，通过 {{ preview.baseline.passed }} → {{ preview.with_candidate.passed }}
+              </template>
+            </p>
+            <p class="text-[11px] text-slate-400">
+              候选词条 {{ preview.entry.source_term }} → {{ preview.entry.target_action || `×${preview.entry.factor}` }}
+              尚未入库；确认后才会正式生效。
+            </p>
+            <div class="flex gap-2">
+              <button @click="confirmAdopt" :disabled="previewBusy"
+                class="rounded-lg bg-emerald-700 px-3 py-1 text-xs font-medium text-white hover:bg-emerald-600 disabled:opacity-40">
+                确认入库生效
+              </button>
+              <button @click="preview = null; pendingAdopt = null"
+                class="rounded-lg border border-slate-700 px-3 py-1 text-xs text-slate-400 hover:bg-slate-800">
+                放弃
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </details>
 
     <div v-if="showSettings"
       class="space-y-3 rounded-xl border border-violet-800/50 bg-violet-950/20 p-4 text-sm">
