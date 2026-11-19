@@ -1,6 +1,6 @@
 <script setup>
 import { RouterLink } from "vue-router";
-import { MapPin, Star, Images, MessageCircle, Play, ShieldAlert } from "lucide-vue-next";
+import { MapPin, Star, Images, MessageCircle, Play } from "lucide-vue-next";
 import { api, mediaUrl } from "../api/client";
 
 const props = defineProps({
@@ -11,12 +11,12 @@ const props = defineProps({
 const emit = defineEmits(["toggle-favorite"]);
 // cover = best photo (already score-ordered server-side) or a video
 // with a poster frame; focus drives the face-aware cover crop
-const cover = () => props.item.cover ||
+const cover = () =>
   (props.item.media || []).find((m) => m.kind === "photo") ||
   (props.item.media || []).find((m) => m.kind === "video" && m.poster) ||
   null;
 const isPosterCover = () => cover() && cover().kind === "video";
-const mediaCount = () => props.item.media_count ?? (props.item.media || []).length;
+const mediaCount = () => (props.item.media || []).length;
 const focusStyle = () => {
   const c = cover() || {};
   return {
@@ -31,26 +31,28 @@ const tierClass = () =>
   props.item.online_tier === "online" ? "bg-emerald-400"
     : props.item.online_tier === "recent" ? "bg-amber-400" : "bg-slate-400";
 const dutyText = () =>
-  props.item.duty_label === "today" ? "今日签到"
-    : props.item.duty_label === "yesterday" ? "昨日签到" : "";
-const profileText = () => {
+  props.item.duty_label === "today" ? "今日在岗"
+    : props.item.duty_label === "yesterday" ? "昨日在岗" : "";
+
+// 身体微胶囊：22岁 · 168cm · 48kg · C —— 缺失项整体隐藏
+const profileParts = () => {
   const profile = props.item.attributes?.profile || {};
-  return [
-    profile.age != null ? `${profile.age}岁` : null,
-    profile.height != null ? `${profile.height}cm` : null,
-    profile.weight != null ? `${profile.weight}kg` : null,
-    profile.bust,
-  ].filter(Boolean).join(" · ");
+  const parts = [];
+  if (profile.age != null) parts.push(`${profile.age}岁`);
+  if (profile.height != null) parts.push(`${profile.height}cm`);
+  if (profile.weight != null) parts.push(`${profile.weight}kg`);
+  if (profile.bust) parts.push(profile.bust);
+  return parts;
 };
+// 阶梯资费提示：1P/2P 行里取最低单价（如 "课费：1P800 2P1500" → "800起/1P"）
 const tariffHint = () => {
-  const lines = props.item.attributes?.tariffs?.p1 || [];
-  for (const line of lines) {
-    const match = String(line).match(/1\s*p\s*[:：]?\s*[¥￥]?\s*(\d{2,6})|[¥￥]?\s*(\d{2,6})\s*元?\s*\/\s*1\s*p/i);
-    if (match) return `${match[1] || match[2]}起/1P`;
+  const tariffs = props.item.attributes?.tariffs || {};
+  for (const line of [...(tariffs.p1 || []), ...(tariffs.p2 || [])]) {
+    const match = String(line).match(/([12])\s*[pP]\s*(\d{2,5})/);
+    if (match) return `${match[2]}起/${match[1]}P`;
   }
-  return "";
+  return null;
 };
-const hasRestriction = () => (props.item.attributes?.restrictions || []).some((line) => line.startsWith("禁"));
 
 async function toggleFavorite() {
   // optimistic: the caller owns the state and updates instantly; on
@@ -67,15 +69,13 @@ async function toggleFavorite() {
 <template>
   <RouterLink
     :to="`/explore/${item.id}`"
-    :id="`listing-card-${item.id}`"
-    :data-listing-id="item.id"
     class="group block overflow-hidden rounded-2xl border border-slate-800 bg-slate-900 transition hover:border-sky-400/60 hover:shadow-lg hover:shadow-sky-400/5"
   >
     <div class="relative aspect-[4/5] bg-slate-800">
       <!-- cover crop keeps the detected face in frame via object-position -->
       <img
         v-if="cover()"
-        :src="mediaUrl(isPosterCover() ? cover().poster : cover().path, { thumbnail: true })" :alt="item.nickname"
+        :src="mediaUrl(isPosterCover() ? cover().poster : cover().path)" :alt="item.nickname"
         class="size-full object-cover" :style="focusStyle()" loading="lazy"
       />
       <div v-else class="flex size-full items-center justify-center text-slate-600">
@@ -88,11 +88,13 @@ async function toggleFavorite() {
           <Play class="size-6" />
         </span>
       </span>
-      <!-- 悬浮价格徽章 -->
-      <span v-if="tariffHint() || item.price_amount != null"
-        class="nx-price-chip absolute left-2.5 top-2.5 max-w-[calc(100%-5rem)] truncate rounded-xl px-2.5 py-0.5 text-xs sm:text-[15px]">
+      <!-- 悬浮价格徽章：有阶梯资费时展示更精确的资费提示 -->
+      <span v-if="item.price_amount != null || tariffHint()"
+        class="nx-price-chip absolute left-2.5 top-2.5 rounded-xl px-2.5 py-0.5 text-[15px]">
         <template v-if="tariffHint()">{{ tariffHint() }}</template>
-        <template v-else>{{ item.price_amount }}<small class="ml-0.5 text-[10px] font-normal opacity-85">{{ item.price_currency }}</small></template>
+        <template v-else>
+          {{ item.price_amount }}<small class="ml-0.5 text-[10px] font-normal opacity-85">{{ item.price_currency }}</small>
+        </template>
       </span>
       <span v-if="mediaCount() > 1"
         class="absolute right-2.5 top-2.5 flex items-center gap-1 rounded-lg bg-slate-950/70 px-2 py-0.5 text-[10px] text-slate-200 backdrop-blur">
@@ -116,16 +118,14 @@ async function toggleFavorite() {
           :class="tierClass()" :title="tierText()" :aria-label="tierText()"></span>
         <span class="min-w-0 truncate font-semibold text-slate-100">{{ item.nickname || "未命名" }}</span>
       </div>
+      <div v-if="profileParts().length"
+        class="truncate text-[11px] leading-4 text-slate-400">
+        {{ profileParts().join(" · ") }}
+      </div>
       <div class="flex min-w-0 items-center gap-1 text-xs text-slate-500">
         <MapPin class="size-3 shrink-0" />
         <span class="truncate">{{ item.district || "位置未标注" }}</span>
       </div>
-      <p v-if="profileText()" :title="profileText()" class="truncate rounded-full bg-slate-800 px-2 py-1 text-[11px] text-slate-300">
-        {{ profileText() }}
-      </p>
-      <p v-if="hasRestriction()" class="flex items-center gap-1 text-[10px] text-amber-300">
-        <ShieldAlert class="size-3 shrink-0" /> <span class="truncate">有服务禁忌，请查看详情</span>
-      </p>
     </div>
   </RouterLink>
 </template>

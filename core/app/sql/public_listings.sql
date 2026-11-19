@@ -51,6 +51,9 @@ WITH clock AS (
       AND (($10::int IS NULL AND $11::int IS NULL) OR COALESCE(
           CASE WHEN l.custom_fields->>'age_years' ~ '^[0-9]{1,3}[[:space:]]*岁?$'
                THEN substring(l.custom_fields->>'age_years' from '^[0-9]{1,3}')::int END,
+          CASE WHEN NOT (COALESCE(l.custom_fields, '{}'::jsonb) ? 'age_years')
+               AND (l.evidence_json->'age_years'->>'value') ~ '^[0-9]{1,3}$'
+               THEN (l.evidence_json->'age_years'->>'value')::int END,
           (SELECT CASE WHEN o.fields_json->>'age_years' ~ '^[0-9]{1,3}$'
                        THEN (o.fields_json->>'age_years')::int END
            FROM listing_media_ocr o
@@ -61,7 +64,7 @@ WITH clock AS (
                  SELECT max(r.id) FROM profile_collection_results r
                  WHERE r.job_id = l.profile_collection_job_id))
              AND o.fields_json ? 'age_years'
-           ORDER BY o.id LIMIT 1)
+           ORDER BY o.confidence DESC NULLS LAST, o.id LIMIT 1)
       ) BETWEEN COALESCE($10::int, 0) AND COALESCE($11::int, 120))
       AND ($12::text IS NULL OR l.custom_fields->'fixed_intro_terms' @> jsonb_build_array($12::text)
            OR l.custom_fields->>'fixed_intro_terms' = $12::text

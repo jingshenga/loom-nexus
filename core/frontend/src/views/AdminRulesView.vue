@@ -1,5 +1,4 @@
 <script setup>
-import AdminTabs from "../components/AdminTabs.vue";
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { Save, FlaskConical, Sparkles, Trash2, Link2, Settings2, PlugZap, RefreshCw, Copy } from "lucide-vue-next";
 import { api, mediaUrl } from "../api/client";
@@ -294,7 +293,7 @@ async function bindDutyDialog() {
   if (fresh) select(fresh);
 }
 
-async function runDryRun() {
+async function runDryRun(sampleSet = "recent") {
   let config;
   try {
     config = JSON.parse(configText.value);
@@ -302,11 +301,15 @@ async function runDryRun() {
     notify("JSON 语法错误");
     return;
   }
-  dryrun.value = await api("/api/admin/rules/dryrun", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ config, sample_limit: 50 }),
-  });
+  try {
+    dryrun.value = await api("/api/admin/rules/dryrun", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ config, sample_limit: 50, sample_set: sampleSet }),
+    });
+  } catch (err) {
+    notify(err.message || "回测失败");
+  }
 }
 
 async function remove() {
@@ -466,7 +469,6 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
 
 <template>
   <div class="space-y-3">
-  <AdminTabs />
 
     <div class="flex items-center gap-3">
       <h2 class="text-lg font-semibold">AI 规则工坊</h2>
@@ -811,13 +813,18 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
           <div class="mb-2 flex items-center gap-2 text-sm font-medium">
             <FlaskConical class="size-4 text-emerald-400" />沙盒回测
             <span v-if="dryrun" class="ml-auto text-xs text-slate-400">
-              命中 {{ dryrun.hits }}/{{ dryrun.total }}（{{ (dryrun.hit_rate * 100).toFixed(0) }}%）
+              {{ dryrun.sample_set === "golden" ? `通过 ${dryrun.passed}/${dryrun.total}` : `命中 ${dryrun.hits}/${dryrun.total}` }}
             </span>
           </div>
-          <button @click="runDryRun"
+          <button @click="runDryRun()"
             class="mb-2 w-full rounded-lg border border-emerald-700/60 py-2 text-sm text-emerald-300 hover:bg-emerald-900/30">
             对最近 50 条真实消息回测
           </button>
+          <button @click="runDryRun('golden')"
+            class="mb-2 w-full rounded-lg border border-sky-700/60 py-2 text-sm text-sky-300 hover:bg-sky-900/30">
+            回测标准样本
+          </button>
+          <p v-if="dryrun?.sample_set === 'golden' && !dryrun.total" class="text-xs text-slate-400">尚未保存标准样本。</p>
           <div v-if="dryrun" class="max-h-80 space-y-1.5 overflow-y-auto">
             <div v-for="r in dryrun.results" :key="r.raw_id"
               class="rounded-lg border p-2 text-xs"
@@ -830,6 +837,16 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
                   class="rounded bg-slate-800 px-1.5 py-0.5">{{ k }}={{ v }}</span>
               </div>
               <div class="mt-1 truncate text-slate-500">{{ r.text }}</div>
+              <div v-if="r.media?.length" class="mt-2 flex flex-wrap gap-2">
+                <a v-for="asset in r.media.filter(item => item.kind === 'photo')" :key="asset.path"
+                  :href="mediaUrl(asset.path)" target="_blank" rel="noopener noreferrer">
+                  <img :src="mediaUrl(asset.path, { thumbnail: true })" alt="标准样本原图"
+                    loading="lazy" class="h-12 w-12 rounded object-cover" />
+                </a>
+              </div>
+              <p v-for="(diff, field) in r.differences" :key="field" class="mt-1 break-words text-amber-300">
+                {{ field }}：预期 {{ diff.expected ?? "空" }}，实际 {{ diff.actual ?? "空" }}
+              </p>
             </div>
           </div>
         </div>

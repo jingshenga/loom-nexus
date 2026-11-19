@@ -1,5 +1,4 @@
 <script setup>
-import AdminTabs from "../components/AdminTabs.vue";
 import { onMounted, ref } from "vue";
 import { UserPlus, KeyRound, Trash2, ShieldCheck, UserCog } from "lucide-vue-next";
 import { api } from "../api/client";
@@ -95,7 +94,6 @@ onMounted(load);
 
 <template>
   <div class="mx-auto max-w-4xl space-y-5">
-  <AdminTabs />
 
     <div class="flex items-center gap-3">
       <h2 class="text-lg font-semibold">站点用户</h2>

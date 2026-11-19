@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, watch, ref } from "vue";
 import { RouterLink, RouterView, useRouter, useRoute } from "vue-router";
+import { adminCenters } from "./router";
 import { useSession } from "./stores/session";
 import { api } from "./api/client";
 import { useTheme } from "./theme";
@@ -13,10 +14,6 @@ import {
   ShieldCheck,
   Wrench,
   Activity,
-  ShieldQuestion,
-  Users,
-  UserCog,
-  ImageIcon,
   Sun,
   Moon,
   MonitorSmartphone,
@@ -33,15 +30,10 @@ const nav = [
   { to: "/messages", label: "消息", icon: MessageSquare },
 ];
 const adminNav = [
-  { to: "/admin/workbench", label: "审核工作台", icon: ShieldCheck },
-  { to: "/admin/ocr", label: "OCR核对", icon: ImageIcon },
-  { to: "/admin/ocr-classifier", label: "分类训练", icon: Wrench },
-  { to: "/admin/rules", label: "规则", icon: Wrench },
-  { to: "/admin/probe", label: "穿透", icon: ShieldQuestion },
-  { to: "/admin/gateway", label: "大盘", icon: Activity },
-  { to: "/admin/users", label: "用户", icon: UserCog },
-  { to: "/admin/accounts", label: "账号", icon: Users },
-];
+  { ...adminCenters.workbench, icon: ShieldCheck },
+  { ...adminCenters.rules, icon: Wrench },
+  { ...adminCenters.gateway, icon: Activity },
+].map(({ path, ...item }) => ({ ...item, to: path }));
 
 const themeIcon = computed(() =>
   theme.pref.value === "dark" ? Moon

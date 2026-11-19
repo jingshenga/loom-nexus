@@ -31,7 +31,7 @@ class ListingAttributesTests(unittest.TestCase):
         self.assertEqual(item["attributes"]["profile"],
                          {"age": 23, "height": 168, "weight": 48.0, "bust": None})
         self.assertEqual(item["attributes"]["tariffs"]["p1"], ["1P600 60分钟"])
-        self.assertEqual(item["attributes"]["services"], ["服务：陪浴", "长发"])
+        self.assertEqual(item["attributes"]["services"], ["陪浴", "长发"])
         self.assertEqual(item["attributes"]["restrictions"], ["禁无套"])
         self.assertIsNone(item["description"])
         self.assertNotIn("evidence_json", item)
@@ -42,7 +42,8 @@ class ListingAttributesTests(unittest.TestCase):
         item = _row_to_item(row, is_admin=True)
         self.assertEqual(item["attributes"]["profile"],
                          {"age": None, "height": None, "weight": None, "bust": None})
-        self.assertEqual(item["attributes"]["services"], ["[已隐藏] [已隐藏] 服务"])
+        public_item = _row_to_item(row, is_admin=False)
+        self.assertEqual(public_item["attributes"]["services"], ["服务"])
         self.assertEqual(item["evidence_json"], {"source": "telegram"})
         self.assertEqual(item["ocr_evidence"], [])
         legacy = _row_to_item(self.row(custom_fields=None, evidence_json=None), is_admin=False)

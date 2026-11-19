@@ -1,5 +1,4 @@
 <script setup>
-import AdminTabs from "../components/AdminTabs.vue";
 import { onMounted, ref } from "vue";
 import { api } from "../api/client";
 
@@ -105,7 +104,6 @@ onMounted(loadAll);
 
 <template>
   <div v-if="data" class="space-y-6">
-  <AdminTabs />
 
     <div class="flex items-center gap-3">
       <h2 class="text-lg font-semibold">系统大盘</h2>

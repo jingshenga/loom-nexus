@@ -33,6 +33,7 @@ SQL_ENQUEUE = sqlres.load("chat_enqueue.sql")
 SQL_HISTORY = sqlres.load("chat_history.sql")
 SQL_SESSIONS = sqlres.load("chat_sessions.sql")
 SQL_LISTING_CONTACT = sqlres.load("listing_contact.sql")
+SQL_SESSION_CONTEXT = sqlres.load("session_context.sql")
 SQL_CLOSE = sqlres.load("chat_close.sql")
 SQL_MARK_READ = sqlres.load("chat_mark_read.sql")
 SQL_RETRY = sqlres.load("retry_message.sql")
@@ -90,6 +91,49 @@ async def open_session(body: OpenBody, authorization: str = Header(default="")) 
         "contact_username": username,
         "external_url": EXTERNAL_CLIENT_URL if r["status"] == "CONFLICT_LOCKED" else None,
     }
+
+
+def build_quick_phrases(district=None, nickname=None) -> list:
+    """Quick-confirm phrases shown above the chat input; the user picks
+    one and it fills the draft — sending stays an explicit action."""
+    phrases = []
+    if nickname:
+        phrases.append(f"你好，想咨询{nickname}的项目")
+    phrases.append("请问今日在岗吗？")
+    if district:
+        phrases.append(f"目前是在{district}附近吗？")
+    phrases.append("方便介绍一下服务内容吗？")
+    phrases.append("现在方便过去吗？")
+    return phrases
+
+
+def _session_context_row(row) -> dict:
+    """Shape a session_context.sql row for the frontend; every listing
+    column degrades to null on legacy sessions without a listing."""
+    price = float(row["price_amount"]) if row["price_amount"] is not None else None
+    return {
+        "session_id": row["session_id"],
+        "status": row["status"],
+        "listing_id": row["listing_id"],
+        "nickname": row["nickname"],
+        "district": row["district"],
+        "price_amount": price,
+        "price_currency": row["price_currency"],
+        "quick_phrases": build_quick_phrases(row["district"], row["nickname"]),
+    }
+
+
+@router.get("/sessions/{session_id}/context")
+async def session_context(session_id: int, authorization: str = Header(default="")) -> dict:
+    """Card context for the chat UI: stage name / district / price
+    summary plus quick phrases. Sessions from before the listing link
+    (or without a published listing) return null fields, never 500."""
+    pool = _pool()
+    user_id = _user_id(authorization)
+    rows = await pool.fetch(SQL_SESSION_CONTEXT, session_id, user_id)
+    if not rows:
+        raise HTTPException(status_code=404, detail="session not found")
+    return _session_context_row(rows[0])
 
 
 @router.get("/sessions")
@@ -185,6 +229,10 @@ async def retry_message(session_id: int, message_id: int, body: RetryBody,
 
 @router.post("/sessions/{session_id}/messages")
 async def send(session_id: int, body: SendBody, authorization: str = Header(default="")) -> dict:
+    """Queue one outbound message. Every external send originates from
+    this explicit, authenticated user action — the bridge sender only
+    drains what the user typed and submitted here; nothing auto-sends
+    in the background."""
     pool = _pool()
     user_id = _user_id(authorization)
     if not (body.content or "").strip() and not body.data_url:
@@ -201,7 +249,9 @@ async def send(session_id: int, body: SendBody, authorization: str = Header(defa
     if r["status"] in ("NOT_FOUND", "FORBIDDEN"):
         raise HTTPException(status_code=404, detail="session not found")
     if r["status"] == "CLOSED":
-        raise HTTPException(status_code=409, detail="session closed")
+        # covers both a closed conversation and a session that never
+        # got a gateway account (CONFLICT_LOCKED) — friendly, not a 500
+        raise HTTPException(status_code=409, detail="会话已结束或网关不可用，暂时无法发送")
     return {"message_id": r["message_id"], "job_id": r["job_id"], "status": r["status"]}
 
 

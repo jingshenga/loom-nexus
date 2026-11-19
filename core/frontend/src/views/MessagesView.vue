@@ -15,6 +15,7 @@ const menuOpen = ref(false);
 const sessions = ref([]);
 const current = ref(null);
 const messages = ref([]);
+const context = ref(null); // 当前会话挂载的卡片摘要（艺名/城区/资费）
 const flash = ref("");
 const draft = ref("");
 const conflict = ref(false);
@@ -64,9 +65,33 @@ async function select(item) {
   chatOpen.value = true;
   conflict.value = false;
   messages.value = (await api(`/api/chat/sessions/${item.session_id}/messages`)).items;
+  loadContext(item.session_id);
   scrollBottom();
   connectWs();
 }
+
+// 卡片上下文：老会话/无挂载卡片时静默降级为通用快捷短语
+async function loadContext(sessionId) {
+  try {
+    context.value = await api(`/api/chat/sessions/${sessionId}/context`);
+  } catch {
+    context.value = null;
+  }
+}
+
+const quickPhrases = () =>
+  (context.value && context.value.quick_phrases) || ["请问今日在岗吗？", "方便介绍一下服务内容吗？"];
+const contextLine = () => {
+  if (!context.value) return null;
+  const parts = [
+    context.value.nickname,
+    context.value.district,
+    context.value.price_amount != null
+      ? `${context.value.price_amount} ${context.value.price_currency || "CNY"}`
+      : null,
+  ].filter(Boolean);
+  return parts.join(" · ") || null;
+};
 
 function connectWs() {
   if (ws) { ws.close(); ws = null; }
@@ -290,7 +315,13 @@ function onViewportChange(event) {
           class="flex size-9 shrink-0 items-center justify-center rounded-lg hover:bg-slate-800">
           <ArrowLeft class="size-5" />
         </button>
-        <span class="min-w-0 flex-1 truncate">{{ current.contact_username ? "@" + current.contact_username : "联系人 " + current.contact_peer_id }} · 网关账号#{{ current.account_id }} 代理</span>
+        <div class="min-w-0 flex-1">
+          <p class="truncate">{{ current.contact_username ? "@" + current.contact_username : "联系人 " + current.contact_peer_id }} · 网关账号#{{ current.account_id }} 代理</p>
+          <p v-if="contextLine()"
+            class="mt-0.5 truncate text-[11px] text-sky-300/90" title="来自咨询卡片的摘要">
+            🪪 {{ contextLine() }}
+          </p>
+        </div>
         <div v-if="mobile" class="relative shrink-0">
           <button @click="menuOpen = !menuOpen" aria-label="会话操作" :aria-expanded="menuOpen"
             class="flex size-9 items-center justify-center rounded-lg hover:bg-slate-800">
@@ -349,6 +380,15 @@ function onViewportChange(event) {
           </div>
         </div>
         <div ref="bottomEl"></div>
+      </div>
+
+      <!-- 快捷问句：点击仅填入输入框，发送仍由用户显式点击触发 -->
+      <div v-if="current && !conflict && current.status === 'open'"
+        class="flex gap-1.5 overflow-x-auto border-t border-slate-800 px-3 py-2">
+        <button v-for="phrase in quickPhrases()" :key="phrase" @click="draft = phrase"
+          class="shrink-0 rounded-full border border-slate-700 bg-slate-900 px-3 py-1 text-xs text-slate-300 hover:border-sky-500/60 hover:text-sky-300">
+          {{ phrase }}
+        </button>
       </div>
 
       <form class="flex gap-2 border-t border-slate-800 p-3" @submit.prevent="send">

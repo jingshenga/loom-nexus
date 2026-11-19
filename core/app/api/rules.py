@@ -6,6 +6,7 @@ config, validated endpoints).
 """
 import json
 import re
+from decimal import Decimal, InvalidOperation
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -13,7 +14,8 @@ from pydantic import BaseModel, Field
 
 from app import db, llm, sqlres
 from app.api.auth import require_admin
-from app.extractor import ast_rules
+from app.extractor import ast_rules, ocr_fields
+from app.extractor.pipeline import DEFAULT_TRIGGERS, extract_custom_fields, missing_triggers
 
 router = APIRouter(
     prefix="/api/admin/rules", tags=["admin-rules"],
@@ -68,7 +70,8 @@ class ReextractBody(BaseModel):
 
 class DryRunBody(BaseModel):
     config: dict
-    sample_limit: int = 50
+    sample_limit: int = Field(50, ge=1, le=200)
+    sample_set: Literal["recent", "golden"] = "recent"
 
 
 class GenerateBody(BaseModel):
@@ -350,31 +353,107 @@ async def reextract_source(body: ReextractBody) -> dict:
     return {"requeued": rows[0]["requeued"]}
 
 
+def _golden_values(config, fields, evidence, cards, custom_definitions, text):
+    options = config.get("ocr") or {}
+    triggers = options.get("trigger_when_missing") or DEFAULT_TRIGGERS
+    card_values = {}
+    for card in cards:
+        for key, value in card["fields"].items():
+            if isinstance(value, list):
+                existing = card_values.setdefault(key, [])
+                if isinstance(existing, list):
+                    existing.extend(item for item in value if item not in existing)
+            elif value is not None:
+                card_values.setdefault(key, value)
+
+    if missing_triggers(fields, triggers):
+        for card in cards:
+            recovered, proof = ocr_fields.card_to_listing_fields(card["fields"])
+            fields, evidence = ast_rules.merge_extraction(fields, evidence, recovered, proof)
+    ocr_text = "\n".join(card["raw_text"] for card in cards if card["raw_text"])
+    if options.get("enabled") and ocr_text and missing_triggers(fields, triggers):
+        recovered, proof = ast_rules.extract_fields(config, " ".join(ocr_text.splitlines()), src="ocr")
+        fields, evidence = ast_rules.merge_extraction(fields, evidence, recovered, proof)
+
+    custom = extract_custom_fields(text, [d for d in custom_definitions if d["extraction_source"] == "telegram"])
+    if options.get("enabled"):
+        custom.update(extract_custom_fields(ocr_text, [d for d in custom_definitions if d["extraction_source"] == "ocr"]))
+    return card_values | custom | fields
+
+
+def _golden_differences(expected, actual):
+    comparable = dict(expected["fields"])
+    comparable.pop("description", None)
+    comparable["username"] = comparable.pop("contact_username", None)
+    comparable.update(expected["attributes"])
+    comparable.update(expected["custom_fields"])
+    differences = {}
+    for key, value in comparable.items():
+        predicted = actual.get(key)
+        if value in (None, "", []) and predicted in (None, "", []):
+            continue
+        if key in {"price_amount", "age_years", "height_cm", "weight_kg"} and value is not None and predicted is not None:
+            try:
+                if Decimal(str(value)) == Decimal(str(predicted)):
+                    continue
+            except InvalidOperation:
+                pass
+        if value != predicted:
+            differences[key] = {"expected": value, "actual": predicted}
+    return differences
+
+
 @router.post("/dryrun")
 async def dry_run(body: DryRunBody) -> dict:
     pool = _pool()
-    rows = await pool.fetch(SQL_SAMPLES, body.sample_limit)
+    golden = body.sample_set == "golden"
+    definitions = []
+    if golden:
+        rows = await pool.fetch(
+            """SELECT listing_id AS raw_id, raw_text, sender_peer_id, media_json, ocr_json, expected_json
+               FROM golden_rule_samples ORDER BY saved_at DESC, listing_id DESC LIMIT $1""",
+            body.sample_limit,
+        )
+        definitions = await pool.fetch(
+            "SELECT field_key,aliases,extraction_source FROM listing_field_definitions WHERE is_active"
+        )
+    else:
+        rows = await pool.fetch(SQL_SAMPLES, body.sample_limit)
     results = []
     hits = 0
+    passed = 0
     for r in rows:
         text = r["raw_text"] or ""
-        ok, reason = ast_rules.gate_pass(body.config, text, None)
+        sender = r["sender_peer_id"] if golden else None
+        ok, reason = ast_rules.gate_pass(body.config, text, sender)
         term = ast_rules.hit_lifecycle(body.config, text) if ok else None
-        fields, _ = ast_rules.extract_fields(body.config, text) if ok else ({}, {})
-        matched = bool(fields) or term is not None
-        hits += 1 if matched else 0
-        results.append({
+        fields, evidence = ast_rules.extract_fields(body.config, text) if ok and (term is None or not golden) else ({}, {})
+        result = {
             "raw_id": r["raw_id"],
             "text": text[:120],
             "gate": "pass" if ok else f"blocked ({reason})",
             "lifecycle": term,
-            "fields": {k: v for k, v in fields.items()},
-            "matched": matched,
-        })
+            "fields": fields,
+        }
+        if golden:
+            cards = [card for card in _decode_jsonb(r["ocr_json"], [])
+                     if card["status"] == "done" and card["classification"] == "info_card"]
+            if ok and term is None:
+                fields = _golden_values(body.config, fields, evidence, cards, definitions, text)
+            result["fields"] = fields
+            result["media"] = _decode_jsonb(r["media_json"], [])
+            result["differences"] = _golden_differences(_decode_jsonb(r["expected_json"], {}), fields)
+            result["passed"] = ok and term is None and not result["differences"]
+            passed += int(result["passed"])
+        result["matched"] = bool(fields) or term is not None
+        hits += int(result["matched"])
+        results.append(result)
     return {
         "total": len(results),
         "hits": hits,
         "hit_rate": round(hits / len(results), 3) if results else 0.0,
+        "passed": passed if golden else None,
+        "sample_set": body.sample_set,
         "results": results,
     }
 

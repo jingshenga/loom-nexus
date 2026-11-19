@@ -1,9 +1,8 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
-import { onBeforeRouteLeave } from "vue-router";
+import { onBeforeRouteLeave, onBeforeRouteUpdate } from "vue-router";
 import { ArrowDown, ArrowLeft, ArrowRight, Check, ChevronDown, ImageIcon, Save, X } from "lucide-vue-next";
 import { api, mediaUrl } from "../api/client";
-import AdminTabs from "../components/AdminTabs.vue";
 
 const endpoint = "/api/admin/moderation/workbench";
 const pageSize = 30;
@@ -85,6 +84,9 @@ function confirmLeave() {
 }
 
 onBeforeRouteLeave(() => !working.value && confirmLeave());
+onBeforeRouteUpdate((to, from) => {
+  if (to.query.section !== from.query.section) return !working.value && confirmLeave();
+});
 
 async function load({ id, page = offset.value, mode = filter.value, reveal = false } = {}) {
   if (loading.value) return;
@@ -166,7 +168,7 @@ async function submit(action) {
   error.value = "";
   const id = card.value.id;
   const payload = { action, expected_updated_at: card.value.updated_at };
-  if (dirty.value || action === "approve") {
+  if (dirty.value || action === "approve" || action === "sample") {
     Object.assign(payload, changes("fields"));
     if (payload.price_amount === "") payload.price_amount = null;
     const numeric = new Set(profileFields.filter((field) => field.type === "number").map((field) => field.key));
@@ -189,6 +191,10 @@ async function submit(action) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+    if (action === "sample") {
+      notice.value = "标准样本已保存，可在抽取规则中回测。";
+      return;
+    }
     notice.value = { approve: "卡片已发布", save: "修改已保存", reject: "卡片已驳回" }[action];
     if (action === "save") {
       card.value.updated_at = result.updated_at;
@@ -245,10 +251,8 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
 </script>
 
 <template>
-  <AdminTabs />
   <header class="mb-4 flex flex-wrap items-center justify-between gap-3">
     <h1 class="text-2xl font-semibold text-slate-100">审核工作台</h1>
-    <RouterLink to="/admin/review" class="text-sm text-sky-300 hover:underline">批量审核与重复卡片 <ArrowRight class="inline size-3.5" /></RouterLink>
   </header>
 
   <div v-if="error || notice" class="mb-4 flex flex-wrap items-center gap-3 rounded-lg border px-3 py-2 text-sm"
@@ -402,6 +406,8 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
           <button type="button" :disabled="busy" :class="secondaryButton" class="!border-rose-700/60 !text-rose-200" @click="submit('reject')">
             <X class="size-4 shrink-0" />驳回并归档
           </button>
+          <button type="button" :disabled="busy" :class="secondaryButton" class="col-span-2"
+            @click="submit('sample')">设为标准测试样本</button>
           <button type="button" :disabled="busy || !canAdvance" :class="secondaryButton" @click="move(1)">下一条 <ArrowRight class="size-4 shrink-0" /></button>
         </div>
       </form>

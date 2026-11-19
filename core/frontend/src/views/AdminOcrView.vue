@@ -1,5 +1,4 @@
 <script setup>
-import AdminTabs from "../components/AdminTabs.vue";
 import { computed, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { api, mediaUrl } from "../api/client";
@@ -348,8 +347,7 @@ async function reclassifySelected() {
 
 <template>
   <div class="space-y-3">
-    <AdminTabs />
-    <div class="flex flex-wrap items-center gap-2">
+      <div class="flex flex-wrap items-center gap-2">
       <h2 class="mr-2 text-lg font-semibold">OCR 资料核对</h2>
       <select v-model="status" @change="changeStatus" class="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1 text-sm">
         <option value="pending">待核对</option>

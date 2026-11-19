@@ -1,5 +1,19 @@
+import { defineAsyncComponent } from "vue";
 import { createRouter, createWebHistory } from "vue-router";
 import { useSession } from "../stores/session";
+
+export const adminCenters = {
+  workbench: { path: "/admin/workbench", label: "审核工作台" },
+  rules: { path: "/admin/rules", label: "规则与样本" },
+  gateway: { path: "/admin/gateway", label: "网关与运维" },
+};
+
+const center = () => import("../views/AdminCenterView.vue");
+const tab = (key, label, loader) => ({ key, label, component: defineAsyncComponent(loader) });
+const legacy = (path, target, section) => ({
+  path: `/admin/${path}`,
+  redirect: (to) => ({ path: adminCenters[target].path, query: { ...to.query, section }, hash: to.hash }),
+});
 
 const routes = [
   { path: "/", redirect: "/explore" },
@@ -16,55 +30,37 @@ const routes = [
     redirect: "/admin/workbench",
   },
   {
-    path: "/admin/workbench",
-    component: () => import("../views/AdminWorkbenchView.vue"),
-    meta: { admin: true },
+    path: adminCenters.workbench.path, component: center, meta: { admin: true },
+    props: { tabs: [
+      tab("review", "卡片纠偏", () => import("../views/AdminWorkbenchView.vue")),
+      tab("bulk", "批量审核与去重", () => import("../views/AdminReviewView.vue")),
+      tab("ocr", "图片核对", () => import("../views/AdminOcrView.vue")),
+    ] },
   },
   {
-    path: "/admin/review",
-    component: () => import("../views/AdminReviewView.vue"),
-    meta: { admin: true },
+    path: adminCenters.rules.path, component: center, meta: { admin: true },
+    props: { tabs: [
+      tab("extract", "抽取规则", () => import("../views/AdminRulesView.vue")),
+      tab("classifier", "OCR 样本分类", () => import("../views/AdminOcrClassifierView.vue")),
+      tab("history", "历史抽样库", () => import("../views/AdminHistoryView.vue")),
+    ] },
   },
   {
-    path: "/admin/history",
-    component: () => import("../views/AdminHistoryView.vue"),
-    meta: { admin: true },
+    path: adminCenters.gateway.path, component: center, meta: { admin: true },
+    props: { tabs: [
+      tab("monitor", "网关大盘与监控", () => import("../views/AdminGatewayView.vue")),
+      tab("accounts", "TG 账号管理与会话", () => import("../views/AdminAccountsView.vue")),
+      tab("probe", "简介穿透审批", () => import("../views/AdminProbeView.vue")),
+      tab("users", "系统用户", () => import("../views/AdminUsersView.vue")),
+    ] },
   },
-  {
-    path: "/admin/ocr",
-    component: () => import("../views/AdminOcrView.vue"),
-    meta: { admin: true },
-  },
-  {
-    path: "/admin/ocr-classifier",
-    component: () => import("../views/AdminOcrClassifierView.vue"),
-    meta: { admin: true },
-  },
-  {
-    path: "/admin/rules",
-    component: () => import("../views/AdminRulesView.vue"),
-    meta: { admin: true },
-  },
-  {
-    path: "/admin/probe",
-    component: () => import("../views/AdminProbeView.vue"),
-    meta: { admin: true },
-  },
-  {
-    path: "/admin/gateway",
-    component: () => import("../views/AdminGatewayView.vue"),
-    meta: { admin: true },
-  },
-  {
-    path: "/admin/users",
-    component: () => import("../views/AdminUsersView.vue"),
-    meta: { admin: true },
-  },
-  {
-    path: "/admin/accounts",
-    component: () => import("../views/AdminAccountsView.vue"),
-    meta: { admin: true },
-  },
+  legacy("review", "workbench", "bulk"),
+  legacy("ocr", "workbench", "ocr"),
+  legacy("ocr-classifier", "rules", "classifier"),
+  legacy("history", "rules", "history"),
+  legacy("accounts", "gateway", "accounts"),
+  legacy("probe", "gateway", "probe"),
+  legacy("users", "gateway", "users"),
 ];
 
 const router = createRouter({

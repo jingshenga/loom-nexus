@@ -1,5 +1,4 @@
 <script setup>
-import AdminTabs from "../components/AdminTabs.vue";
 import { onMounted, ref } from "vue";
 import { ShieldQuestion, CheckCircle2, XCircle } from "lucide-vue-next";
 import { api } from "../api/client";
@@ -36,7 +35,6 @@ onMounted(() => {
 
 <template>
   <div class="space-y-4">
-  <AdminTabs />
 
     <div class="flex items-center gap-3">
       <h2 class="flex items-center gap-2 text-lg font-semibold">

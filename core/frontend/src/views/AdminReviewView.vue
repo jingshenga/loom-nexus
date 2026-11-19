@@ -1,5 +1,4 @@
 <script setup>
-import AdminTabs from "../components/AdminTabs.vue";
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { CheckCircle2, XCircle, Save, Inbox, ArchiveRestore, Trash2 } from "lucide-vue-next";
 import { api, mediaUrl } from "../api/client";
@@ -672,7 +671,6 @@ function onReviewVisibilityChange() {
 
 <template>
   <div class="space-y-3">
-  <AdminTabs />
     <div v-if="flash" role="status" aria-live="polite" class="pointer-events-none fixed right-4 top-4 z-[100] max-w-[min(28rem,calc(100vw-2rem))] rounded-lg border border-emerald-700/60 bg-slate-950/95 px-4 py-3 text-sm text-emerald-200 shadow-xl backdrop-blur">
       {{ flash }}
     </div>

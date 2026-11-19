@@ -1,5 +1,4 @@
 <script setup>
-import AdminTabs from "../components/AdminTabs.vue";
 import AdminMediaGrid from "../components/AdminMediaGrid.vue";
 import { computed, onMounted, ref } from "vue";
 import { api, mediaUrl } from "../api/client";
@@ -73,8 +72,7 @@ onMounted(async () => {
 
 <template>
   <div class="space-y-4">
-    <AdminTabs />
-    <div class="flex flex-wrap items-center gap-3">
+      <div class="flex flex-wrap items-center gap-3">
       <div class="mr-auto">
         <h1 class="text-xl font-semibold">历史签到资料库</h1>
         <p class="mt-1 text-xs text-slate-400">浏览已保存的天一和小木屋历史消息，不会触发 Telegram 采集。</p>

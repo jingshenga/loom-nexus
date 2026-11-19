@@ -52,7 +52,7 @@ ORDER BY l.created_at DESC NULLS LAST, l.id DESC
 LIMIT $2 OFFSET $3
 """
 SQL_DETAIL = f"""
-SELECT l.*, {SOURCE_TITLE} AS source_title, rm.posted_at AS original_posted_at,
+SELECT l.*, rm.sender_peer_id, {SOURCE_TITLE} AS source_title, rm.posted_at AS original_posted_at,
        COALESCE(rm.raw_text, p.description, l.description) AS original_text,
        CASE WHEN rm.raw_text IS NOT NULL THEN 'telegram'
             WHEN p.description IS NOT NULL THEN 'profile' ELSE 'listing' END AS original_text_source,
@@ -102,7 +102,7 @@ class AttributeEdits(BaseModel):
 class Decision(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    action: Literal["approve", "save", "reject"]
+    action: Literal["approve", "save", "reject", "sample"]
     expected_updated_at: AwareDatetime | None
     nickname: str | None = Field(None, max_length=128)
     district: str | None = Field(None, max_length=64)
@@ -126,7 +126,7 @@ def _object(value):
     return data if isinstance(data, dict) else {}
 
 
-def _attribute_values(custom, ocr):
+def _attribute_values(custom, ocr, evidence=None):
     values = {}
     for asset in ocr:
         if asset["status"] != "done" or asset["classification"] != "info_card":
@@ -143,6 +143,9 @@ def _attribute_values(custom, ocr):
                 ))
             else:
                 values.setdefault(key, value)
+    for key, entry in (evidence or {}).items():
+        if key in WORKBENCH_ATTRIBUTE_KEYS - LIST_FIELDS and isinstance(entry, dict) and entry.get("value") is not None:
+            values[key] = entry["value"]
     values.update({key: custom[key] for key in WORKBENCH_ATTRIBUTE_KEYS if key in custom})
     return values
 
@@ -231,7 +234,7 @@ async def next_card(
                     "original_text_source": row["original_text_source"],
                     "original_posted_at": row["original_posted_at"],
                     "fields": {key: row[key] for key in BASE_FIELDS},
-                    "attributes": _attribute_values(custom_fields, ocr),
+                    "attributes": _attribute_values(custom_fields, ocr, _object(row["evidence_json"])),
                     "required_attribute_keys": [field["field_key"] for field in required
                                                 if field["field_key"] in WORKBENCH_ATTRIBUTE_KEYS
                                                 and not str(custom_fields.get(field["field_key"]) or "").strip()],
@@ -270,6 +273,30 @@ async def decide(listing_id: int, body: Decision, authorization: str = Header(de
                 raise HTTPException(422, "包含未定义的必填字段")
             before_custom = _object(row["custom_fields"])
             custom = before_custom | body.attributes.model_dump(exclude_unset=True) | body.required_fields
+            if body.action == "sample":
+                snapshot = await conn.fetchrow(SQL_DETAIL, listing_id)
+                ocr = [_ocr_item(asset) for asset in await conn.fetch(SQL_OCR, listing_id)]
+                expected = {
+                    "fields": fields,
+                    "attributes": _attribute_values(custom, ocr, _object(row["evidence_json"])),
+                    "custom_fields": {key: custom[key] for key in known_keys if key in custom},
+                }
+                await conn.execute(
+                    """INSERT INTO golden_rule_samples
+                       (listing_id,raw_text,sender_peer_id,media_json,ocr_json,expected_json,saved_by)
+                       VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6::jsonb,$7)
+                       ON CONFLICT (listing_id) DO UPDATE SET
+                         raw_text=excluded.raw_text,sender_peer_id=excluded.sender_peer_id,
+                         media_json=excluded.media_json,ocr_json=excluded.ocr_json,
+                         expected_json=excluded.expected_json,saved_by=excluded.saved_by,saved_at=now()""",
+                    listing_id, snapshot["original_text"] or "", snapshot["sender_peer_id"],
+                    json.dumps(_media(snapshot, ocr), ensure_ascii=False, default=str),
+                    json.dumps(ocr, ensure_ascii=False, default=str),
+                    json.dumps(expected, ensure_ascii=False, default=str),
+                    current_user_id(authorization),
+                )
+                return {"id": listing_id, "decision": "sample_saved"}
+
             if body.action == "approve":
                 missing = missing_publish_fields(fields, custom, required)
                 if missing:

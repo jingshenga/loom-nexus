@@ -1,4 +1,5 @@
 """Public square APIs: published listings, detail, favorites."""
+import math
 import re
 import time
 from collections import defaultdict
@@ -23,7 +24,8 @@ SQL_FAV_LIST = sqlres.load("favorites_list.sql")
 SQL_FAV_TOGGLE = sqlres.load("favorite_toggle.sql")
 SQL_DISPLAY_RULES = sqlres.load("display_rules.sql")
 SQL_OCR_ATTRIBUTES = """
-SELECT l.id AS listing_id, o.media_path, o.fields_json, o.evidence_json, o.confidence
+SELECT l.id AS listing_id, o.media_path, o.fields_json, o.evidence_json, o.confidence, o.review_status,
+       COALESCE(o.human_classification, o.classification) AS classification
 FROM listings l
 JOIN listing_media_ocr o ON (
     o.listing_id = l.id OR o.raw_id = l.source_msg_id OR o.profile_result_id = (
@@ -32,8 +34,8 @@ JOIN listing_media_ocr o ON (
     )
 )
 WHERE l.id = ANY($1::bigint[]) AND o.status = 'done'
-  AND COALESCE(o.human_classification, o.classification) = 'info_card'
-ORDER BY o.id
+  AND ($2::boolean OR COALESCE(o.human_classification, o.classification) = 'info_card')
+ORDER BY o.confidence DESC NULLS LAST, o.id
 """
 
 # rule-level display filters (regex per source) cached briefly so the
@@ -116,76 +118,196 @@ def _visible_media(media, is_admin: bool) -> list:
     return sorted(items, key=order)
 
 
-def _number(value, minimum, maximum, integer=False):
-    if isinstance(value, str):
-        value = re.sub(r"\s*(?:岁|厘米|cm|公斤|kg)$", "", value.strip(), flags=re.I)
+# ---------------------------------------------------------------------------
+# structured attributes: OCR card fields + extraction evidence
+# ---------------------------------------------------------------------------
+# The structured data produced by the extractor (body profile, 1p/2p
+# tariffs, services, restrictions) lives in listings.evidence_json and
+# in the per-image listing_media_ocr.fields_json cards. Everything here
+# is defensive: legacy cards without any of it degrade to null/empty.
+
+_CARD_SCALAR_KEYS = ("age_years", "height_cm", "weight_kg", "weight_value", "bust_size")
+_CARD_LIST_KEYS = (
+    "price_1p_text", "price_2p_text", "cash_text", "price_text",
+    "service_text", "features_text", "restriction_text", "fixed_intro_terms",
+)
+_RESTRICT_TAG = re.compile(r"禁[\u4e00-\u9fff]{1,3}")
+_SERVICE_LABEL = re.compile(
+    r"^(?:服务详情|服务内容|服务项目|服务|课表|项目|套餐|特点|特征|特色)[:：]?\s*"
+)
+# non-admin payloads carry no contact handles or phone numbers
+_HANDLE_RE = re.compile(r"(?:@[A-Za-z0-9_]{3,}|(?:https?://)?t\.me/\S+)")
+_PHONE_RE = re.compile(r"(?<!\d)(?:\+?\d[\d\- ]{6,}\d)(?!\d)")
+
+
+def _redact(text: str) -> str:
+    return _PHONE_RE.sub("[联系]", _HANDLE_RE.sub("[联系]", text or ""))
+
+
+def _as_int(value):
     try:
-        number = float(value)
-    except (TypeError, ValueError):
+        return int(float(re.sub(r"\s*(?:岁|厘米|cm)$", "", str(value).strip(), flags=re.I)))
+    except (TypeError, ValueError, OverflowError):
         return None
-    if not minimum <= number <= maximum or (integer and not number.is_integer()):
+
+
+def _as_float(value):
+    try:
+        weight = float(re.sub(r"\s*(?:公斤|kg)$", "", str(value).strip(), flags=re.I))
+        return round(weight, 1) if math.isfinite(weight) else None
+    except (TypeError, ValueError, OverflowError):
         return None
-    return int(number) if integer else number
 
 
-def _texts(value):
-    values = value if isinstance(value, list) else [value]
-    result = []
-    for value in values:
-        if not isinstance(value, str):
+def _attr_list(values, limit=8) -> list:
+    out = []
+    for value in values or []:
+        text = str(value).strip()
+        if text and text not in out:
+            out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _merge_card_fields(cards) -> dict:
+    """Merge per-image OCR cards: best-confidence card wins for scalar
+    body values; list fields (fee/service/restriction lines) union so
+    multi-image albums contribute everything."""
+    scalars, lists = {}, {}
+    for card in cards or []:
+        fields = card.get("fields") if isinstance(card, dict) else None
+        if not isinstance(fields, dict):
             continue
-        clean = re.sub(r"https?://\S+|t\.me/\S+|@[A-Za-z0-9_]{3,}|(?<!\d)1[3-9](?:[\s-]?\d){9}(?!\d)",
-                       "[已隐藏]", value.strip(), flags=re.I).strip()
-        if clean and clean not in result:
-            result.append(clean)
-    return result
+        for key in _CARD_SCALAR_KEYS:
+            if key not in scalars and fields.get(key) not in (None, ""):
+                scalars[key] = fields[key]
+        for key in _CARD_LIST_KEYS:
+            value = fields.get(key)
+            if isinstance(value, list):
+                bucket = lists.setdefault(key, [])
+                for item in value:
+                    text = str(item).strip()
+                    if text and text not in bucket:
+                        bucket.append(text)
+    return {**scalars, **lists}
 
 
-def _attributes(custom_fields, ocr_entries):
-    fields = {}
-    for entry in ocr_entries:
-        source = _decode(entry["fields_json"], {})
-        if not isinstance(source, dict):
-            continue
-        for key, value in source.items():
-            if key in {"service_text", "features_text", "restriction_text", "fixed_intro_terms",
-                       "price_1p_text", "price_2p_text", "price_text", "cash_text"}:
-                fields[key] = [*fields.get(key, []), *_texts(value)]
-            elif key not in fields or fields[key] in (None, ""):
-                fields[key] = value
-    custom = _decode(custom_fields, {})
-    if isinstance(custom, dict):
-        fields.update(custom)
-    profile = {
-        "age": _number(fields.get("age_years"), 0, 120, integer=True),
-        "height": _number(fields.get("height_cm"), 50, 250, integer=True),
-        "weight": _number(fields.get("weight_kg", fields.get("weight_value")), 0, 500),
-        "bust": (_texts(fields.get("bust_size")) or [None])[0],
-    }
-    def merged(*keys):
-        result = []
-        for key in keys:
-            for value in _texts(fields.get(key)):
-                if value not in result:
-                    result.append(value)
-        return result
+def _service_tags(card_fields) -> list:
+    tags = []
+    for key in ("service_text", "features_text"):
+        for line in card_fields.get(key) or []:
+            body = _SERVICE_LABEL.sub("", str(line))
+            for token in re.split(r"[\s，,、/／;；|]+", body):
+                token = token.strip("。，,；;：:!？?·.")
+                if token == "[联系]":
+                    continue
+                if 1 <= len(token) <= 10 and re.search(r"[\u4e00-\u9fffA-Za-z0-9]", token):
+                    tags.append(token)
+    return _attr_list(tags, 16)
+
+
+def _restriction_tags(card_fields) -> list:
+    tags = []
+    for line in card_fields.get("restriction_text") or []:
+        found = _RESTRICT_TAG.findall(str(line))
+        if found:
+            tags.extend(found)
+        elif len(str(line)) <= 12:
+            tags.append(str(line).strip())
+    tags.extend(str(term) for term in card_fields.get("fixed_intro_terms") or [])
+    return _attr_list(tags, 12)
+
+
+def build_attributes(evidence, card_fields, corrections=None) -> dict:
+    """Standardized attributes payload shared by every viewer.
+
+    `evidence` is the listing-level extraction evidence (its values
+    already merged regex-over-OCR in the extractor, so regex wins);
+    `card_fields` is the merged per-image OCR card data. Missing keys
+    degrade to null / empty lists, never raise."""
+    corrections = corrections or {}
+    card_fields = dict(card_fields or {})
+    for key in _CARD_LIST_KEYS:
+        if key in corrections:
+            value = corrections[key]
+            card_fields[key] = value if isinstance(value, list) else ([value] if isinstance(value, str) else [])
+    if "weight_kg" not in card_fields and "weight_value" in card_fields:
+        card_fields["weight_kg"] = card_fields["weight_value"]
+
+    def pick(key, cast):
+        if key in corrections:
+            value = corrections[key]
+            return cast(value) if value not in (None, "") else None
+        for source in (evidence, card_fields):
+            value = (source or {}).get(key)
+            # evidence entries wrap their payload in {"value": ...}
+            if isinstance(value, dict) and "value" in value:
+                value = value.get("value")
+            if value in (None, ""):
+                continue
+            converted = cast(value)
+            if converted is not None:
+                return converted
+        return None
+
     return {
-        "profile": profile,
-        "tariffs": {
-            "p1": merged("price_1p_text"), "p2": merged("price_2p_text"),
-            "cash_note": merged("cash_text"), "raw_fees": merged("price_text"),
+        "profile": {
+            "age": pick("age_years", _as_int),
+            "height": pick("height_cm", _as_int),
+            "weight": pick("weight_kg", _as_float),
+            "bust": pick("bust_size", lambda v: str(v).strip() or None),
         },
-        "services": merged("service_text", "features_text"),
-        "restrictions": merged("fixed_intro_terms", "restriction_text"),
+        "tariffs": {
+            "p1": _attr_list(card_fields.get("price_1p_text")),
+            "p2": _attr_list(card_fields.get("price_2p_text")),
+            "cash_note": _attr_list(card_fields.get("cash_text"), 4),
+            "raw_fees": _attr_list(card_fields.get("price_text"), 8),
+        },
+        "services": _service_tags(card_fields),
+        "restrictions": _restriction_tags(card_fields),
     }
 
 
-async def _ocr_by_listing(pool, rows):
+def _sanitize_attributes(attributes: dict) -> dict:
+    """Strip handles/phone numbers from every string a regular user sees."""
+    def walk(value):
+        if isinstance(value, str):
+            return _redact(value)
+        if isinstance(value, list):
+            return [walk(item) for item in value]
+        if isinstance(value, dict):
+            return {key: walk(item) for key, item in value.items()}
+        return value
+
+    return walk(attributes)
+
+
+def _row_attributes(row, is_admin: bool, ocr_entries=()) -> dict:
+    keys = row.keys()
+    evidence = _decode(row["evidence_json"] if "evidence_json" in keys else None, {}) or {}
+    raw_cards = _decode(row["ocr_cards"] if "ocr_cards" in keys else None, []) or []
+    card_fields = _merge_card_fields(
+        [{"fields": _decode(card["fields_json"], {})} for card in ocr_entries
+         if card.get("classification", "info_card") == "info_card"]
+        + [{"fields": card} for card in raw_cards if isinstance(card, dict)]
+    )
+    custom = _decode(row.get("custom_fields"), {})
+    evidence = evidence if isinstance(evidence, dict) else {}
+    custom = custom if isinstance(custom, dict) else {}
+    if not is_admin:
+        evidence = _sanitize_attributes(evidence)
+        card_fields = _sanitize_attributes(card_fields)
+        custom = _sanitize_attributes(custom)
+    return build_attributes(evidence, card_fields, custom)
+
+
+async def _ocr_by_listing(pool, rows, *, include_all=False):
     ids = [row["id"] for row in rows]
     if not ids:
         return {}
     entries = defaultdict(list)
-    for row in await pool.fetch(SQL_OCR_ATTRIBUTES, ids):
+    for row in await pool.fetch(SQL_OCR_ATTRIBUTES, ids, include_all):
         entries[row["listing_id"]].append(row)
     return entries
 
@@ -209,7 +331,6 @@ def _row_to_item(row, display_filters=None, is_admin=True, include_full_media=Fa
         "price_currency": row["price_currency"],
         "bot_url": row["bot_url"] if "bot_url" in row.keys() else "",
         "description": description,
-        "attributes": _attributes(row["custom_fields"] if "custom_fields" in row.keys() else {}, ocr_entries),
         "media": media if include_full_media else media[:1],
         "media_count": len(media),
         "published_at": row["published_at"].isoformat() if row["published_at"] else None,
@@ -217,11 +338,16 @@ def _row_to_item(row, display_filters=None, is_admin=True, include_full_media=Fa
         "online_tier": tier or "unknown",
         "duty_label": row["duty_label"] if "duty_label" in row.keys() else None,
         "favorited": bool(row["favorited"]) if "favorited" in row.keys() else False,
+        # sanitized (handles/phones stripped) for regular users; admins
+        # additionally get the raw evidence/OCR trace on the detail page
+        "attributes": _row_attributes(row, is_admin, ocr_entries),
     }
     if is_admin:
         item["evidence_json"] = _decode(row["evidence_json"], {}) if "evidence_json" in row.keys() else {}
         item["ocr_evidence"] = [{
             "media_path": entry["media_path"],
+            "classification": entry.get("classification"),
+            "review_status": entry.get("review_status"),
             "fields": _decode(entry["fields_json"], {}),
             "evidence": _decode(entry["evidence_json"], {}),
             "confidence": float(entry["confidence"]) if entry["confidence"] is not None else None,
@@ -279,17 +405,21 @@ async def listing_detail(
         raise HTTPException(status_code=404, detail="not found or not published")
     identity = bearer_identity(authorization)
     filters = await _compiled_display_filters(pool)
-    ocr = await _ocr_by_listing(pool, rows)
-    item = _row_to_item(rows[0], filters, bool(identity and identity[1]),
+    is_admin = bool(identity and identity[1])
+    ocr = await _ocr_by_listing(pool, rows, include_all=is_admin)
+    item = _row_to_item(rows[0], filters, is_admin,
                         include_full_media=True, ocr_entries=ocr.get(listing_id))
     # the raw handle stays admin-only; regular users reach the contact
     # through the proxied chat instead
     item["contact_username"] = (
-        rows[0]["contact_username"] if (identity and identity[1]) else None
+        rows[0]["contact_username"] if is_admin else None
     )
     item["confidence"] = float(rows[0]["confidence"]) if rows[0]["confidence"] is not None else None
     item["online_tier"] = rows[0]["presence_tier"] or "unknown"
     item["online"] = item["online_tier"] == "online"
+    if is_admin:
+        item["evidence"] = item["evidence_json"]
+        item["ocr_trace"] = item["ocr_evidence"]
     return item
 
 

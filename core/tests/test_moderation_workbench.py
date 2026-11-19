@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import datetime
 import os
 from pathlib import Path
 import unittest
@@ -10,7 +11,7 @@ import asyncpg
 from fastapi import FastAPI
 
 from app import db
-from app.api import auth, listings, moderation
+from app.api import auth, listings, moderation, rules
 
 
 DSN = os.environ.get("NEXUS_TEST_DATABASE_URL")
@@ -18,6 +19,7 @@ SCHEMA = Path(__file__).resolve().parents[2] / "scripts/schema.sql"
 ENDPOINT = "/api/admin/moderation/workbench"
 app = FastAPI()
 app.include_router(moderation.router)
+app.include_router(rules.router)
 
 
 async def request(method, path, *, params=None, body=None, actor=None):
@@ -201,6 +203,26 @@ class ModerationDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dict(await self.pool.fetchrow("SELECT nickname,status FROM listings WHERE id=821")),
                          {"nickname": "示例卡片", "status": "pending"})
         self.assertEqual(await self.pool.fetchval("SELECT count(*) FROM listing_edit_history WHERE listing_id=821"), 0)
+
+    async def test_golden_sample_snapshots_unsaved_edits_and_reports_replay_difference(self):
+        _, data = await self.get(listing_id=821)
+        stamp = data["card"]["updated_at"]
+        status, saved = await self.decide(
+            821, action="sample", expected_updated_at=stamp, price_amount=680,
+            attributes={"height_cm": 169},
+        )
+        self.assertEqual((status, saved["decision"]), (200, "sample_saved"))
+        listing = await self.pool.fetchrow("SELECT status,price_amount,updated_at FROM listings WHERE id=821")
+        self.assertEqual(listing["status"], "pending")
+        self.assertIsNone(listing["price_amount"])
+        self.assertEqual(listing["updated_at"], datetime.fromisoformat(stamp))
+        status, replay = await request(
+            "POST", "/api/admin/rules/dryrun", body={"config": {}, "sample_set": "golden"}, actor=self.actor,
+        )
+        self.assertEqual((status, replay["total"], replay["passed"]), (200, 1, 0))
+        result = replay["results"][0]
+        self.assertEqual(result["differences"]["height_cm"], {"expected": 169, "actual": 168})
+        self.assertIn("album.jpg", [asset["path"] for asset in result["media"]])
 
     async def test_concurrent_rejection_has_one_winner_and_removes_card(self):
         _, data = await self.get(listing_id=821)

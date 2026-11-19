@@ -1,11 +1,10 @@
 <script setup>
 import { computed, onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { Star, ArrowLeft, MessageCircle, TriangleAlert, ExternalLink, Pencil, Save, X, RotateCcw, ArchiveRestore, ShieldAlert, ChevronDown } from "lucide-vue-next";
-import { api } from "../api/client";
+import { Star, ArrowLeft, MessageCircle, TriangleAlert, ExternalLink, Pencil, Save, X, ChevronUp, ChevronDown, RotateCcw, Wallet, Sparkles, ScanSearch, Ruler } from "lucide-vue-next";
+import { api, mediaUrl } from "../api/client";
 import { useSession } from "../stores/session";
 import MediaGallery from "../components/MediaGallery.vue";
-import AdminMediaGrid from "../components/AdminMediaGrid.vue";
 import BackToTop from "../components/BackToTop.vue";
 
 const route = useRoute();
@@ -14,36 +13,12 @@ const session = useSession();
 const item = ref(null);
 const favorited = ref(false);
 const error = ref("");
-const withdrawError = ref("");
 const conflict = ref(false);
 const editing = ref(false);
 const savingEdit = ref(false);
-const withdrawing = ref(false);
 const editError = ref("");
 const editForm = ref(null);
 const manualOrder = ref(false);
-const showEvidence = ref(false);
-const attributes = computed(() => item.value?.attributes || {});
-const profileFacts = computed(() => {
-  const profile = attributes.value.profile || {};
-  return [
-    ["年龄", profile.age != null ? `${profile.age}岁` : null],
-    ["身高", profile.height != null ? `${profile.height}cm` : null],
-    ["体重", profile.weight != null ? `${profile.weight}kg` : null],
-    ["胸围", profile.bust],
-    ["城区", item.value?.district],
-  ].filter(([, value]) => value != null && value !== "");
-});
-const tariffs = computed(() => attributes.value.tariffs || {});
-const hasTariffs = computed(() => ["p1", "p2", "cash_note", "raw_fees"]
-  .some((key) => tariffs.value[key]?.length));
-const extraFees = computed(() => (tariffs.value.raw_fees || []).filter((line) =>
-  !(tariffs.value.p1 || []).includes(line) && !(tariffs.value.p2 || []).includes(line)));
-const evidenceRows = (entry) => Object.entries(entry.fields || {}).map(([key, value]) => ({
-  key, value: Array.isArray(value) ? value.join("、") : String(value),
-  line: entry.evidence?.[key]?.line,
-  score: entry.evidence?.[key]?.score,
-}));
 
 function startEdit() {
   editForm.value = {
@@ -65,20 +40,28 @@ function cancelEdit() {
   editError.value = "";
 }
 
+function moveMedia(index, delta) {
+  const target = index + delta;
+  if (target < 0 || target >= editForm.value.media.length) return;
+  const media = editForm.value.media;
+  [media[index], media[target]] = [media[target], media[index]];
+  manualOrder.value = true;
+}
+
+function setVisibility(index, value) {
+  const media = editForm.value.media[index];
+  media.visibility = value;
+  media.visibility_override = true;
+}
+
 function restoreAutomaticMedia() {
   for (const media of editForm.value.media) {
-    if (media.image_data) {
-      media.visibility = "admin";
-      media.visibility_override = true;
-      continue;
-    }
     delete media.manual_order;
     delete media.visibility_override;
     if (media.kind === "photo") {
       media.visibility = media.ocr_classification === "profile_photo"
         ? "public"
-        : media.ocr_classification === "info_card" ? "admin"
-          : media.ocr_classification ? "pending" : (media.visibility || "admin");
+        : media.ocr_classification === "info_card" ? "admin" : "pending";
     }
   }
   editForm.value.media.sort((a, b) => {
@@ -111,8 +94,6 @@ async function saveEdit() {
           path: media.path,
           visibility: media.visibility,
           visibility_override: media.visibility_override === true,
-          image_data: media.image_data,
-          image_mime: media.image_mime,
         })),
       }),
     });
@@ -128,20 +109,6 @@ async function saveEdit() {
 async function toggleFavorite() {
   const data = await api(`/api/favorites/${route.params.id}`, { method: "POST" });
   favorited.value = data.favorited;
-}
-
-async function withdrawListing() {
-  if (!item.value || withdrawing.value) return;
-  if (!window.confirm(`将「${item.value.nickname || "该卡片"}」从广场下架？`)) return;
-  withdrawing.value = true;
-  try {
-    await api(`/api/admin/review/${item.value.id}/withdraw`, { method: "POST" });
-    await router.push("/explore");
-  } catch (err) {
-    withdrawError.value = err.message || "下架失败，请重试";
-  } finally {
-    withdrawing.value = false;
-  }
 }
 
 async function startChat() {
@@ -170,16 +137,61 @@ onMounted(async () => {
   }
 });
 
+const statusText = () =>
+  item.value?.online_tier === "online" ? "在线"
+    : item.value?.online_tier === "recent" ? "近期活跃" : "未知";
+const dutyText = () =>
+  item.value?.duty_label === "today" ? "今日在岗"
+    : item.value?.duty_label === "yesterday" ? "昨日在岗" : null;
+
+// ---- 结构化属性模块（attributes 由后端下发，缺失字段优雅降级） ----
+
+// 身体档案：年龄 / 身高 / 体重 / 胸围，无值的指标直接不渲染
+const profileMetrics = computed(() => {
+  const profile = item.value?.attributes?.profile || {};
+  return [
+    { label: "年龄", value: profile.age != null ? `${profile.age}岁` : null },
+    { label: "身高", value: profile.height != null ? `${profile.height}cm` : null },
+    { label: "体重", value: profile.weight != null ? `${profile.weight}kg` : null },
+    { label: "胸围", value: profile.bust || null },
+  ].filter((metric) => metric.value);
+});
+
+// 阶梯资费看板：1P / 2P / 现金要求 / 其他资费
+const tariffGroups = computed(() => {
+  const tariffs = item.value?.attributes?.tariffs || {};
+  const quoted = [...(tariffs.p1 || []), ...(tariffs.p2 || [])];
+  return [
+    { label: "单人 1P", lines: tariffs.p1 || [], tone: "text-sky-400" },
+    { label: "双人 2P", lines: tariffs.p2 || [], tone: "text-violet-400" },
+    { label: "现金要求", lines: tariffs.cash_note || [], tone: "text-amber-400" },
+    {
+      label: "其他资费",
+      lines: (tariffs.raw_fees || []).filter((line) => !quoted.includes(line)),
+      tone: "text-slate-400",
+    },
+  ].filter((group) => group.lines.length);
+});
+
+const serviceTags = computed(() => item.value?.attributes?.services || []);
+const restrictionTags = computed(() => item.value?.attributes?.restrictions || []);
+
+// 管理员 OCR 溯源抽屉：识别行 + 置信度，仅管理员数据（后端已鉴权）
+const ocrTrace = computed(() => (session.isAdmin ? item.value?.ocr_trace : null) || []);
+const listingEvidence = computed(() => (session.isAdmin ? item.value?.evidence : null) || {});
+const formatConf = (value) =>
+  value == null ? "—" : `${Math.round(Number(value) * 100)}%`;
+const formatTime = (iso) =>
+  iso ? new Date(iso).toLocaleString("zh-CN") : null;
 </script>
 
 <template>
   <div v-if="error" class="py-24 text-center text-slate-500">{{ error }}</div>
   <div v-else-if="item" class="grid gap-6 pb-[calc(150px+env(safe-area-inset-bottom,0px))] lg:grid-cols-2 lg:pb-0">
-    <AdminMediaGrid v-if="editing && editForm" v-model:media="editForm.media" editable @order-change="manualOrder = true" />
-    <MediaGallery v-else :media="item.media" fixed-mobile-frame />
-    <div class="min-w-0 space-y-4">
+    <MediaGallery :media="editing && editForm ? editForm.media : item.media" fixed-mobile-frame />
+    <div class="space-y-4">
       <div class="flex flex-wrap items-center gap-2">
-        <h2 class="flex min-w-0 items-center gap-2 break-words text-2xl font-bold">
+        <h2 class="flex items-center gap-2 text-2xl font-bold">
           {{ item.nickname || "未命名" }}
           <span v-if="item.online_tier === 'online' || item.online_tier === 'recent'"
             class="inline-block size-2.5 rounded-full"
@@ -198,10 +210,6 @@ onMounted(async () => {
           class="flex items-center gap-1 rounded-lg border border-slate-700 px-3 py-1.5 text-sm text-slate-400">
           <X class="size-4" />取消
         </button>
-        <button v-if="session.isAdmin && !editing" @click="withdrawListing" :disabled="withdrawing"
-          class="flex items-center gap-1 rounded-lg border border-amber-700 px-3 py-1.5 text-sm text-amber-300 disabled:opacity-50">
-          <ArchiveRestore class="size-4" />{{ withdrawing ? "下架中" : "下架" }}
-        </button>
         <button @click="toggleFavorite"
           class="flex items-center gap-1 rounded-lg border border-slate-700 px-3 py-1.5 text-sm"
           :class="favorited ? 'border-amber-500 text-amber-400' : 'text-slate-400 hover:text-slate-200'">
@@ -211,7 +219,6 @@ onMounted(async () => {
           <ArrowLeft class="size-4" />返回广场
         </RouterLink>
       </div>
-      <p v-if="withdrawError" class="rounded-lg border border-rose-700/50 bg-rose-900/20 px-3 py-2 text-sm text-rose-300">{{ withdrawError }}</p>
       <div v-if="conflict"
         class="flex items-center gap-3 rounded-xl border border-amber-600/40 bg-amber-600/15 px-4 py-3 text-sm text-amber-300">
         <TriangleAlert class="size-5 shrink-0" />
@@ -221,85 +228,140 @@ onMounted(async () => {
           <ExternalLink class="size-3.5" />官方客户端直连
         </a>
       </div>
+      <p v-if="!editing" class="text-3xl font-bold text-sky-400">
+        {{ item.price_amount != null ? item.price_amount : "?" }}
+        <span class="text-base text-slate-400">{{ item.price_currency }}</span>
+      </p>
       <template v-if="!editing">
-        <section v-if="profileFacts.length" class="rounded-2xl border border-slate-800 bg-slate-900 p-4">
-          <h3 class="mb-3 text-sm font-semibold text-slate-200">基础档案</h3>
-          <div class="grid grid-cols-2 gap-2 sm:grid-cols-3">
-            <div v-for="([label, value]) in profileFacts" :key="label" class="min-w-0 rounded-xl bg-slate-800/70 px-3 py-2.5">
-              <p class="text-xs text-slate-500">{{ label }}</p>
-              <p class="mt-1 break-words font-semibold text-slate-100">{{ value }}</p>
+        <!-- 身体档案网格：缺失的指标不渲染单个格子 -->
+        <section v-if="profileMetrics.length"
+          class="grid grid-cols-4 gap-2 sm:grid-cols-4">
+          <div v-for="metric in profileMetrics" :key="metric.label"
+            class="rounded-xl border border-slate-800 bg-slate-900 px-2 py-3 text-center">
+            <p class="flex items-center justify-center gap-1 text-[11px] text-slate-500">
+              <Ruler class="size-3" />{{ metric.label }}
+            </p>
+            <p class="mt-0.5 truncate text-lg font-bold text-slate-100">{{ metric.value }}</p>
+          </div>
+        </section>
+
+        <!-- 阶梯资费看板 -->
+        <section v-if="tariffGroups.length"
+          class="rounded-xl border border-slate-800 bg-slate-900 p-4">
+          <h3 class="mb-2.5 flex items-center gap-1.5 text-sm font-semibold text-slate-300">
+            <Wallet class="size-4 text-sky-400" />阶梯资费
+          </h3>
+          <div class="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <div v-for="group in tariffGroups" :key="group.label"
+              class="rounded-lg border border-slate-800 bg-slate-950 p-2.5">
+              <p class="text-[11px] font-semibold" :class="group.tone">{{ group.label }}</p>
+              <p v-for="(line, i) in group.lines" :key="i"
+                class="mt-1 break-words text-xs leading-5 text-slate-200">{{ line }}</p>
             </div>
           </div>
         </section>
-        <section v-if="item.price_amount != null || hasTariffs" class="min-w-0 rounded-2xl border border-sky-500/20 bg-slate-900 p-4">
-          <h3 class="mb-3 text-sm font-semibold text-slate-200">资费与课表</h3>
-          <p v-if="item.price_amount != null" class="mb-3 text-2xl font-bold text-sky-400">
-            {{ item.price_amount }} <span class="text-sm font-normal text-slate-400">{{ item.price_currency }}</span>
-          </p>
-          <div v-if="tariffs.p1?.length || tariffs.p2?.length" class="grid gap-2 sm:grid-cols-2">
-            <div v-for="([label, lines]) in [['1P 套餐', tariffs.p1], ['2P 套餐', tariffs.p2]]" :key="label" v-show="lines?.length"
-              class="min-w-0 rounded-xl border border-slate-700 bg-slate-950/50 p-3">
-              <p class="mb-2 text-xs font-semibold text-sky-300">{{ label }}</p>
-              <p v-for="line in lines || []" :key="line" class="break-words text-sm leading-relaxed text-slate-200">{{ line }}</p>
-            </div>
-          </div>
-          <div v-if="extraFees.length" class="mt-3 space-y-1 text-sm text-slate-400">
-            <p v-for="line in extraFees" :key="line" class="break-words">{{ line }}</p>
-          </div>
-          <div v-if="tariffs.cash_note?.length" class="mt-3 rounded-lg border border-amber-600/40 bg-amber-600/10 p-3 text-sm text-amber-200">
-            <p v-for="line in tariffs.cash_note" :key="line" class="break-words">{{ line }}</p>
+
+        <!-- 服务与特色标签云 -->
+        <section v-if="serviceTags.length"
+          class="rounded-xl border border-slate-800 bg-slate-900 p-4">
+          <h3 class="mb-2.5 flex items-center gap-1.5 text-sm font-semibold text-slate-300">
+            <Sparkles class="size-4 text-sky-400" />服务与特色
+          </h3>
+          <div class="flex flex-wrap gap-1.5">
+            <span v-for="tag in serviceTags" :key="tag"
+              class="rounded-full bg-slate-800 px-3 py-1 text-xs text-slate-300">{{ tag }}</span>
           </div>
         </section>
-        <section v-if="attributes.services?.length" class="rounded-2xl border border-slate-800 bg-slate-900 p-4">
-          <h3 class="mb-3 text-sm font-semibold text-slate-200">服务与特色</h3>
-          <div class="flex flex-wrap gap-2">
-            <span v-for="line in attributes.services" :key="line" class="max-w-full break-words rounded-lg border border-violet-500/30 bg-violet-500/10 px-2.5 py-1.5 text-sm text-violet-200">{{ line }}</span>
+
+        <!-- 禁忌规范警示栏 -->
+        <section v-if="restrictionTags.length"
+          class="rounded-xl border border-rose-600/40 bg-rose-600/10 p-4">
+          <h3 class="mb-2.5 flex items-center gap-1.5 text-sm font-semibold text-rose-400">
+            <TriangleAlert class="size-4" />禁忌规范
+          </h3>
+          <div class="flex flex-wrap gap-1.5">
+            <span v-for="tag in restrictionTags" :key="tag"
+              class="rounded-full border border-rose-500/40 bg-rose-500/15 px-3 py-1 text-xs font-medium text-rose-300">{{ tag }}</span>
           </div>
         </section>
-        <section v-if="attributes.restrictions?.length" class="rounded-2xl border border-amber-600/40 bg-amber-600/10 p-4">
-          <h3 class="mb-3 flex items-center gap-2 text-sm font-semibold text-amber-200"><ShieldAlert class="size-4" />服务禁忌与规范</h3>
-          <div class="flex flex-wrap gap-2">
-            <span v-for="line in attributes.restrictions" :key="line" class="max-w-full break-words rounded-lg border px-2.5 py-1.5 text-sm"
-              :class="line.startsWith('禁') ? 'border-rose-600/50 bg-rose-600/15 text-rose-200' : 'border-amber-600/40 bg-amber-600/10 text-amber-200'">{{ line }}</span>
-          </div>
+
+        <!-- 基本信息：状态 / 在岗 / 发布时间 / 联系方式 -->
+        <section class="rounded-xl border border-slate-800 bg-slate-900 p-4">
+          <dl class="grid grid-cols-2 gap-x-4 gap-y-3 text-sm">
+            <div><dt class="text-xs text-slate-500">状态</dt>
+              <dd class="mt-0.5">{{ statusText() }}</dd></div>
+            <div><dt class="text-xs text-slate-500">在岗</dt>
+              <dd class="mt-0.5">{{ dutyText() ?? "—" }}</dd></div>
+            <div class="col-span-2"><dt class="text-xs text-slate-500">发布时间</dt>
+              <dd class="mt-0.5">{{ formatTime(item.published_at) ?? "—" }}</dd></div>
+            <div class="col-span-2"><dt class="text-xs text-slate-500">联系方式</dt>
+              <dd class="mt-1 flex flex-wrap items-center gap-3">
+                <template v-if="session.isAdmin && item.contact_username">
+                  <span>@{{ item.contact_username }}</span>
+                </template>
+                <template v-else>
+                  <span class="text-slate-500">通过立即聊天联系</span>
+                </template>
+                <button @click="startChat"
+                  class="nx-grad flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-semibold text-white hover:opacity-90">
+                  <MessageCircle class="size-4" />立即聊天
+                </button>
+              </dd></div>
+          </dl>
         </section>
-        <section class="rounded-2xl border border-slate-800 bg-slate-900 p-4 text-sm">
-          <h3 class="mb-3 font-semibold text-slate-200">联系与状态</h3>
-          <div class="space-y-2 text-slate-400">
-            <p>状态：{{ item.online_tier === 'online' ? '在线' : item.online_tier === 'recent' ? '近期活跃' : '未知' }}</p>
-            <p v-if="item.duty_label">签到：{{ item.duty_label === 'today' ? '今日签到' : '昨日签到' }}</p>
-            <p v-if="item.published_at">发布时间：{{ new Date(item.published_at).toLocaleString('zh-CN') }}</p>
-            <p class="break-words">联系方式：{{ session.isAdmin && item.contact_username ? `@${item.contact_username}` : '通过立即聊天联系' }}</p>
-          </div>
-          <div class="mt-3 flex flex-wrap gap-2">
-            <a v-if="item.bot_url" :href="item.bot_url" target="_blank" rel="noreferrer"
-              class="rounded-lg border border-violet-700/60 px-3 py-1.5 text-xs text-violet-300">联系 Bot</a>
-            <button @click="startChat" class="nx-grad hidden items-center gap-1.5 rounded-lg px-3 py-1.5 font-semibold text-white lg:flex">
-              <MessageCircle class="size-4" />立即聊天
-            </button>
-          </div>
-        </section>
-        <section v-if="session.isAdmin && (item.ocr_evidence?.length || Object.keys(item.evidence_json || {}).length)"
-          class="min-w-0 rounded-2xl border border-slate-700 bg-slate-900 p-4">
-          <button @click="showEvidence = !showEvidence" :aria-expanded="showEvidence"
-            class="flex w-full items-center justify-between text-sm font-semibold text-slate-200">
-            查看 OCR 证据 <ChevronDown class="size-4 transition" :class="showEvidence ? 'rotate-180' : ''" />
-          </button>
-          <div v-if="showEvidence" class="mt-4 space-y-4">
-            <div v-for="(entry, index) in item.ocr_evidence || []" :key="`${entry.media_path}-${index}`" class="min-w-0 rounded-xl bg-slate-950/60 p-3">
-              <p class="mb-2 break-all text-xs text-slate-400">{{ entry.media_path }} · 图像置信度 {{ entry.confidence == null ? '未知' : `${Math.round(entry.confidence * 100)}%` }}</p>
-              <div v-for="row in evidenceRows(entry)" :key="row.key" class="border-t border-slate-800 py-2 text-xs">
-                <p class="break-words text-slate-200">{{ row.key }}：{{ row.value }}</p>
-                <p v-if="row.line" class="mt-1 break-words text-slate-400">原文：{{ row.line }}<span v-if="row.score != null"> · {{ Math.round(row.score * 100) }}%</span></p>
+
+        <!-- 管理员专属：OCR 溯源抽屉 -->
+        <details v-if="session.isAdmin"
+          class="rounded-xl border border-slate-800 bg-slate-900 open:pb-4">
+          <summary class="flex cursor-pointer select-none items-center gap-1.5 px-4 py-3 text-sm font-semibold text-slate-300 [&::-webkit-details-marker]:hidden">
+            <ScanSearch class="size-4 text-sky-400" />OCR 溯源
+            <ChevronDown class="ml-auto size-4 text-slate-500" />
+          </summary>
+          <div class="space-y-3 border-t border-slate-800 px-4 pt-3 text-xs">
+            <p v-if="!ocrTrace.length" class="text-slate-500">本卡片没有已完成的 OCR 图像记录。</p>
+            <div v-for="card in ocrTrace" :key="card.media_path"
+              class="space-y-2 rounded-lg border border-slate-800 bg-slate-950 p-3">
+              <div class="flex items-center justify-between gap-2">
+                <span class="min-w-0 truncate text-slate-300">{{ card.media_path.split("/").pop() }}</span>
+                <span class="shrink-0 rounded-md bg-slate-800 px-2 py-0.5 text-[10px] text-slate-300">
+                  {{ card.classification }} · {{ formatConf(card.confidence) }}
+                </span>
+              </div>
+              <div v-for="(entry, key) in card.evidence" :key="key"
+                class="flex items-start gap-2 border-b border-slate-800/60 pb-1.5 last:border-0 last:pb-0">
+                <span class="w-28 shrink-0 text-slate-500">{{ key }}</span>
+                <span class="min-w-0 flex-1 break-words text-slate-300">
+                  {{ entry.line || entry.value }}
+                </span>
+                <span class="shrink-0 text-slate-500">{{ formatConf(entry.score ?? entry.ocr_confidence) }}</span>
               </div>
             </div>
-            <pre v-if="Object.keys(item.evidence_json || {}).length" class="max-h-60 overflow-auto whitespace-pre-wrap break-all rounded-xl bg-slate-950/60 p-3 text-xs text-slate-400">{{ JSON.stringify(item.evidence_json, null, 2) }}</pre>
+            <div v-if="Object.keys(listingEvidence).length"
+              class="space-y-2 rounded-lg border border-slate-800 bg-slate-950 p-3">
+              <p class="text-[11px] font-semibold text-slate-400">卡片级抽取证据（evidence_json）</p>
+              <div v-for="(entry, key) in listingEvidence" :key="key"
+                class="flex items-start gap-2">
+                <span class="w-28 shrink-0 text-slate-500">{{ key }}</span>
+                <span class="min-w-0 flex-1 break-words text-slate-300">
+                  {{ entry.value != null ? entry.value : entry }}
+                  <template v-if="entry && typeof entry === 'object' && entry.line">
+                    <span class="text-slate-500">（{{ entry.line }}）</span>
+                  </template>
+                </span>
+                <span v-if="entry && typeof entry === 'object'" class="shrink-0 text-slate-500">
+                  {{ entry.src }}<template v-if="entry.ocr_confidence != null"> · {{ formatConf(entry.ocr_confidence) }}</template>
+                </span>
+              </div>
+            </div>
           </div>
-        </section>
-        <p v-if="session.isAdmin && item.description" class="whitespace-pre-wrap break-words rounded-xl border border-slate-800 bg-slate-900 p-4 text-sm leading-relaxed text-slate-300">{{ item.description }}</p>
+        </details>
       </template>
+      <p v-if="!editing && item.description"
+        class="whitespace-pre-wrap rounded-xl border border-slate-800 bg-slate-900 p-4 text-sm leading-relaxed text-slate-300">
+        {{ item.description }}
+      </p>
       <div v-if="editing && editForm" class="space-y-3 rounded-xl border border-slate-800 bg-slate-900 p-4">
-        <p class="text-xs leading-relaxed text-slate-500">自动识别与排序优先；这里的修改仅覆盖当前卡片。在线和签到状态仍由自动采集维护。</p>
+        <p class="text-xs leading-relaxed text-slate-500">自动识别与排序优先；这里的修改仅覆盖当前卡片。在线和在岗状态仍由自动采集维护。</p>
         <label class="block space-y-1 text-sm"><span class="text-slate-400">昵称</span>
           <input v-model="editForm.nickname" maxlength="128" class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
         </label>
@@ -318,12 +380,34 @@ onMounted(async () => {
           <textarea v-model="editForm.description" rows="6" class="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2" />
         </label>
         <div class="flex items-center justify-between gap-2">
-          <h3 class="text-sm font-semibold">图片与顺序</h3>
+          <h3 class="text-sm font-semibold">媒体顺序与公开范围</h3>
           <button @click="restoreAutomaticMedia" class="flex items-center gap-1 text-xs text-sky-400 hover:text-sky-300">
             <RotateCcw class="size-3.5" />恢复自动识别与排序
           </button>
         </div>
-        <p class="text-xs text-slate-500">移除只会从这张卡片中取消展示，原始媒体文件保留。新增图片默认仅管理员可见。</p>
+        <div v-for="(media, index) in editForm.media" :key="media.path"
+          class="flex items-center gap-2 rounded-lg border border-slate-800 bg-slate-950 p-2">
+          <img v-if="media.kind === 'photo' || media.poster"
+            :src="mediaUrl(media.kind === 'photo' ? media.path : media.poster)"
+            class="size-14 shrink-0 rounded-md object-cover" />
+          <div v-else class="flex size-14 shrink-0 items-center justify-center rounded-md bg-slate-800 text-xs">视频</div>
+          <div class="min-w-0 flex-1">
+            <p class="truncate text-xs text-slate-300">{{ media.ocr_classification || media.kind }} · {{ media.path.split('/').pop() }}</p>
+            <label v-if="media.kind === 'photo'" class="mt-1 flex items-center gap-2 text-xs text-slate-500">
+              <span>可见范围</span>
+              <select :value="media.visibility || 'pending'" @change="setVisibility(index, $event.target.value)"
+                class="rounded border border-slate-700 bg-slate-900 px-1.5 py-1 text-slate-300">
+                <option value="public">公开</option><option value="admin">仅管理员</option>
+              </select>
+            </label>
+          </div>
+          <div class="flex shrink-0 flex-col">
+            <button @click="moveMedia(index, -1)" :disabled="index === 0" aria-label="上移"
+              class="rounded p-1 text-slate-400 disabled:opacity-30"><ChevronUp class="size-4" /></button>
+            <button @click="moveMedia(index, 1)" :disabled="index === editForm.media.length - 1" aria-label="下移"
+              class="rounded p-1 text-slate-400 disabled:opacity-30"><ChevronDown class="size-4" /></button>
+          </div>
+        </div>
         <p v-if="editError" class="text-sm text-rose-400">{{ editError }}</p>
       </div>
     </div>

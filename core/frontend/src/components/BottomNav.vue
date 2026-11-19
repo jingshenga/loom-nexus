@@ -13,7 +13,7 @@ const tabs = [
   { to: "/favorites", label: "收藏", icon: Star },
   { to: "/messages", label: "消息", icon: MessageCircle },
 ];
-const adminTab = { to: "/admin/review", label: "管理", icon: ShieldCheck };
+const adminTab = { to: "/admin/workbench", label: "管理", icon: ShieldCheck };
 </script>
 
 <template>
