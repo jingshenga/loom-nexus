@@ -108,36 +108,56 @@ FROM (
 ) src
 WHERE l.id=src.id;
 
--- The same criteria feed the queue and manual-review API validation.
+-- Search one card through separate indexed profile and text paths.
+CREATE OR REPLACE FUNCTION listing_conflicts_for(p_listing BIGINT, p_min_id BIGINT DEFAULT 0)
+RETURNS TABLE(other_id BIGINT, match_reason TEXT)
+LANGUAGE sql STABLE AS $fn$
+    WITH target AS MATERIALIZED (
+        SELECT a.*, m.group_id,
+               listing_dedup_normalize(a.nickname) AS normalized_nickname,
+               listing_dedup_normalize(a.district) AS normalized_district,
+               cardinality(a.dedup_trigrams) AS trigram_count
+        FROM listings a
+        LEFT JOIN listing_person_group_members m ON m.listing_id=a.id
+        WHERE a.id=p_listing AND a.status IN ('pending','published','duplicate_pending')
+    ), candidate_ids AS (
+        SELECT b.id, TRUE AS exact_profile
+        FROM target a JOIN listings b
+          ON listing_dedup_normalize(b.nickname)=a.normalized_nickname
+         AND listing_dedup_normalize(b.district)=a.normalized_district
+         AND b.price_amount=a.price_amount
+        WHERE b.status IN ('pending','published','duplicate_pending')
+          AND b.id>p_min_id AND b.id<>p_listing
+          AND a.normalized_nickname<>'' AND a.normalized_district<>''
+          AND upper(COALESCE(a.price_currency,'CNY'))=upper(COALESCE(b.price_currency,'CNY'))
+        UNION ALL
+        SELECT b.id, FALSE
+        FROM target a JOIN listings b ON b.dedup_trigrams && a.dedup_trigrams
+        WHERE b.status IN ('pending','published','duplicate_pending')
+          AND b.id>p_min_id AND b.id<>p_listing
+          AND length(a.dedup_text)>=24 AND length(b.dedup_text)>=24
+          AND cardinality(b.dedup_trigrams) BETWEEN ceil(0.82*a.trigram_count) AND floor(a.trigram_count/0.82)
+    )
+    SELECT b.id, CASE WHEN bool_or(c.exact_profile) THEN '昵称、城区及资费一致'
+                     ELSE '原文高度相似' END
+    FROM target a CROSS JOIN candidate_ids c
+    JOIN listings b ON b.id=c.id
+    LEFT JOIN listing_person_group_members m ON m.listing_id=b.id
+    LEFT JOIN listing_duplicate_decisions d ON d.left_listing_id=LEAST(p_listing,b.id)
+                                           AND d.right_listing_id=GREATEST(p_listing,b.id)
+    WHERE d.left_listing_id IS NULL
+      AND (a.group_id IS NULL OR m.group_id IS DISTINCT FROM a.group_id)
+      AND (a.contact_peer_id>0 OR b.contact_peer_id>0
+           OR NULLIF(a.contact_username,'') IS NOT NULL OR NULLIF(b.contact_username,'') IS NOT NULL)
+      AND NOT listing_same_account(a.contact_peer_id,a.contact_username,b.contact_peer_id,b.contact_username)
+      AND CASE WHEN c.exact_profile THEN TRUE ELSE listing_dedup_similar(a.dedup_trigrams,b.dedup_trigrams) END
+    GROUP BY b.id
+$fn$;
+
 CREATE OR REPLACE VIEW listing_cross_account_conflicts AS
-SELECT a.id AS left_id, b.id AS right_id,
-       CASE WHEN profile.matches THEN '昵称、城区及资费一致'
-            ELSE '原文高度相似' END AS match_reason
-FROM listings a
-JOIN listings b ON a.id < b.id
-CROSS JOIN LATERAL (
-    SELECT (NULLIF(listing_dedup_normalize(a.nickname), '') IS NOT NULL
-       AND listing_dedup_normalize(a.nickname) = listing_dedup_normalize(b.nickname)
-       AND NULLIF(listing_dedup_normalize(a.district), '') IS NOT NULL
-       AND listing_dedup_normalize(a.district) = listing_dedup_normalize(b.district)
-       AND a.price_amount = b.price_amount
-       AND upper(COALESCE(a.price_currency, 'CNY')) = upper(COALESCE(b.price_currency, 'CNY'))) AS matches
-) profile
-LEFT JOIN listing_person_group_members ga ON ga.listing_id=a.id
-LEFT JOIN listing_person_group_members gb ON gb.listing_id=b.id
-LEFT JOIN listing_duplicate_decisions decision ON decision.left_listing_id=a.id AND decision.right_listing_id=b.id
-WHERE a.status IN ('pending', 'published', 'duplicate_pending')
-  AND b.status IN ('pending', 'published', 'duplicate_pending')
-  AND decision.left_listing_id IS NULL
-  AND (ga.group_id IS NULL OR gb.group_id IS NULL OR ga.group_id <> gb.group_id)
-  AND (a.contact_peer_id > 0 OR b.contact_peer_id > 0
-       OR NULLIF(a.contact_username, '') IS NOT NULL OR NULLIF(b.contact_username, '') IS NOT NULL)
-  AND NOT listing_same_account(a.contact_peer_id, a.contact_username, b.contact_peer_id, b.contact_username)
-  AND (profile.matches OR (
-      length(a.dedup_text) >= 24 AND length(b.dedup_text) >= 24
-      AND a.dedup_trigrams && b.dedup_trigrams
-      AND listing_dedup_similar(a.dedup_trigrams, b.dedup_trigrams)
-  ));
+SELECT a.id AS left_id, c.other_id AS right_id, c.match_reason
+FROM listings a CROSS JOIN LATERAL listing_conflicts_for(a.id, a.id) c
+WHERE a.status IN ('pending','published','duplicate_pending');
 
 CREATE OR REPLACE FUNCTION listing_lock_intake() RETURNS VOID
 LANGUAGE sql AS $fn$
@@ -319,7 +339,7 @@ BEGIN
     ORDER BY COALESCE(source_posted_at, created_at) DESC NULLS LAST, id DESC
     LIMIT 1;
     IF v_winner=p_listing AND EXISTS (
-        SELECT 1 FROM listing_cross_account_conflicts WHERE left_id=p_listing OR right_id=p_listing
+        SELECT 1 FROM listing_conflicts_for(p_listing)
     ) THEN
         -- A conflicting candidate never displaces an incumbent before review.
         UPDATE listings SET status='duplicate_pending', auto_published=FALSE, published_at=NULL, updated_at=NOW()
@@ -333,7 +353,7 @@ BEGIN
     END IF;
     PERFORM listing_inherit_attributes(v_winner, array_remove(array_prepend(p_listing, v_related), v_winner));
     IF v_winner=p_listing AND EXISTS (
-        SELECT 1 FROM listing_cross_account_conflicts WHERE left_id=p_listing OR right_id=p_listing
+        SELECT 1 FROM listing_conflicts_for(p_listing)
     ) THEN
         UPDATE listings SET status='duplicate_pending', auto_published=FALSE, published_at=NULL, updated_at=NOW()
         WHERE id=p_listing AND (status='pending' OR (status='published' AND auto_published));

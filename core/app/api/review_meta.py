@@ -143,7 +143,7 @@ async def queue_total(
         "AND ($9::int IS NULL OR (SELECT count(*) FROM jsonb_array_elements(COALESCE(l.media_json,'[]'::jsonb)) m "
         "WHERE m->>'kind' IN ('photo','video') AND COALESCE(m->>'path',m->>'poster','') <> '') <= $9::int) "
         "AND ($1::text <> 'pending' OR NOT EXISTS ("
-        "SELECT 1 FROM listing_cross_account_conflicts c WHERE l.id IN (c.left_id, c.right_id)))",
+        "SELECT 1 FROM listing_conflicts_for(l.id)))",
         status, nickname or None, source or None, media, bucket or None,
         collected_from, collected_to, min_media, max_media, original_from, original_to,
     )

@@ -46,7 +46,7 @@ CROSS JOIN LATERAL (
     FROM listing_media_ocr o WHERE {OCR_LINK}
 ) ocr
 WHERE l.status='pending'
-AND NOT EXISTS (SELECT 1 FROM listing_cross_account_conflicts c WHERE l.id IN (c.left_id,c.right_id))
+AND NOT EXISTS (SELECT 1 FROM listing_conflicts_for(l.id))
 AND CASE $1::text
     WHEN 'low_confidence' THEN l.confidence < 0.79
     WHEN 'missing_price' THEN l.price_amount IS NULL
@@ -64,7 +64,7 @@ SELECT l.*, rm.sender_peer_id, {SOURCE_TITLE} AS source_title, rm.posted_at AS o
 FROM listings l
 {SOURCE_JOINS}
 WHERE l.id=$1 AND l.status='pending'
-AND NOT EXISTS (SELECT 1 FROM listing_cross_account_conflicts c WHERE l.id IN (c.left_id,c.right_id))
+AND NOT EXISTS (SELECT 1 FROM listing_conflicts_for(l.id))
 """
 SQL_OCR = f"""
 SELECT o.id, o.media_path, o.raw_text, o.fields_json, o.evidence_json,

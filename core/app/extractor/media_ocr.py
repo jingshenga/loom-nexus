@@ -640,8 +640,7 @@ class MediaOcrProcessor:
                         "status=CASE WHEN pair.conflict THEN 'duplicate_pending' ELSE 'published' END,"
                         "auto_published=NOT pair.conflict,"
                         "published_at=CASE WHEN pair.conflict THEN NULL ELSE NOW() END "
-                        "FROM (SELECT EXISTS (SELECT 1 FROM listing_cross_account_conflicts "
-                        "WHERE $1 IN (left_id,right_id)) AS conflict) pair "
+                        "FROM (SELECT EXISTS (SELECT 1 FROM listing_conflicts_for($1)) AS conflict) pair "
                         "WHERE l.id=$1 AND (pair.conflict OR $2::boolean)",
                         result["listing_id"], bool(ready),
                     )

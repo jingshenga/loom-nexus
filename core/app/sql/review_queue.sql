@@ -30,8 +30,7 @@ WHERE l.status = $1::text
   AND ($13::date IS NULL OR (rm.posted_at AT TIME ZONE 'Asia/Shanghai')::date >= $13::date)
   AND ($14::date IS NULL OR (rm.posted_at AT TIME ZONE 'Asia/Shanghai')::date <= $14::date)
   AND ($1::text <> 'pending' OR NOT EXISTS (
-      SELECT 1 FROM listing_cross_account_conflicts c
-      WHERE l.id IN (c.left_id, c.right_id)
+      SELECT 1 FROM listing_conflicts_for(l.id)
   ))
 ORDER BY CASE WHEN $15::text = 'original' AND $7::text = 'oldest' THEN rm.posted_at END ASC NULLS LAST,
          CASE WHEN $15::text = 'original' AND $7::text <> 'oldest' THEN rm.posted_at END DESC NULLS LAST,
