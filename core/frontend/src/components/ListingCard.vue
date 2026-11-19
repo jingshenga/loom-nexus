@@ -44,14 +44,18 @@ const profileParts = () => {
   if (profile.bust) parts.push(profile.bust);
   return parts;
 };
-// 阶梯资费提示：1P/2P 行里取最低单价（如 "课费：1P800 2P1500" → "800起/1P"）
+// 阶梯资费提示：p1/p2 已是清洗后的价格串（"600 元 (40分钟)"），取
+// 首个金额生成角标；兼容老卡片的原始行（"课费：1P800" → "800起/1P"）
 const tariffHint = () => {
   const tariffs = props.item.attributes?.tariffs || {};
-  for (const line of [...(tariffs.p1 || []), ...(tariffs.p2 || [])]) {
-    const match = String(line).match(/([12])\s*[pP]\s*(\d{2,5})/);
-    if (match) return `${match[2]}起/${match[1]}P`;
-  }
-  return null;
+  const pick = (lines, tag) => {
+    for (const line of lines || []) {
+      const match = String(line).match(/(\d{2,5})\s*(?:元|块)?/);
+      if (match) return `${match[1]}起/${tag}`;
+    }
+    return null;
+  };
+  return pick(tariffs.p1, "1P") || pick(tariffs.p2, "2P");
 };
 
 async function toggleFavorite() {

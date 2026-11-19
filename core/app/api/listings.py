@@ -8,6 +8,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
 from app import db, sqlres
+from app.extractor.ocr_fields import format_fee_text
 
 from app.api.auth import bearer_identity, current_user_id, require_user
 
@@ -126,12 +127,15 @@ def _visible_media(media, is_admin: bool) -> list:
 # in the per-image listing_media_ocr.fields_json cards. Everything here
 # is defensive: legacy cards without any of it degrade to null/empty.
 
-_CARD_SCALAR_KEYS = ("age_years", "height_cm", "weight_kg", "weight_value", "bust_size")
+_CARD_SCALAR_KEYS = (
+    "age_years", "height_cm", "weight_kg", "weight_value", "bust_size",
+    "price_1p", "price_1p_display", "price_2p", "price_2p_display",
+)
 _CARD_LIST_KEYS = (
     "price_1p_text", "price_2p_text", "cash_text", "price_text",
     "service_text", "features_text", "restriction_text", "fixed_intro_terms",
 )
-_RESTRICT_TAG = re.compile(r"禁[\u4e00-\u9fff]{1,3}")
+_RESTRICT_TAG = re.compile(r"禁[\u4e00-\u9fff]{1,6}")
 _SERVICE_LABEL = re.compile(
     r"^(?:服务详情|服务内容|服务项目|服务|课表|项目|套餐|特点|特征|特色)[:：]?\s*"
 )
@@ -219,6 +223,39 @@ def _restriction_tags(card_fields) -> list:
     return _attr_list(tags, 12)
 
 
+def _quote_list(card_fields, display_key, lines_key) -> list:
+    """Clean 1P/2P display strings ("600 元 (40分钟)"): the structured
+    quote display value wins; legacy dirty lines ("1P800 2P1500") are
+    re-formatted, and unparsable ones are dropped entirely."""
+    display = card_fields.get(display_key)
+    if display not in (None, ""):
+        text = str(display).strip()
+        return [text] if text else []
+    out = []
+    for line in card_fields.get(lines_key) or []:
+        text = format_fee_text(line)
+        if text and text not in out:
+            out.append(text)
+        if len(out) >= 6:
+            break
+    return out
+
+
+def _raw_fees(card_fields) -> list:
+    """price_text lines that are NOT 1P/2P quotes (包夜 / 包时 / BT …)
+    keep their original text; tiered quotes live in p1/p2 instead."""
+    out = []
+    for line in card_fields.get("price_text") or []:
+        if format_fee_text(line):
+            continue
+        text = str(line).strip()
+        if text and text not in out:
+            out.append(text)
+        if len(out) >= 8:
+            break
+    return out
+
+
 def build_attributes(evidence, card_fields, corrections=None) -> dict:
     """Standardized attributes payload shared by every viewer.
 
@@ -232,6 +269,9 @@ def build_attributes(evidence, card_fields, corrections=None) -> dict:
         if key in corrections:
             value = corrections[key]
             card_fields[key] = value if isinstance(value, list) else ([value] if isinstance(value, str) else [])
+    for key in ("price_1p_display", "price_2p_display"):
+        if key in corrections:
+            card_fields[key] = corrections[key]
     if "weight_kg" not in card_fields and "weight_value" in card_fields:
         card_fields["weight_kg"] = card_fields["weight_value"]
 
@@ -259,10 +299,11 @@ def build_attributes(evidence, card_fields, corrections=None) -> dict:
             "bust": pick("bust_size", lambda v: str(v).strip() or None),
         },
         "tariffs": {
-            "p1": _attr_list(card_fields.get("price_1p_text")),
-            "p2": _attr_list(card_fields.get("price_2p_text")),
+            # 干净的 "600 元 (40分钟)" 式价格串；1P/2P 是轮次而非人数
+            "p1": _quote_list(card_fields, "price_1p_display", "price_1p_text"),
+            "p2": _quote_list(card_fields, "price_2p_display", "price_2p_text"),
             "cash_note": _attr_list(card_fields.get("cash_text"), 4),
-            "raw_fees": _attr_list(card_fields.get("price_text"), 8),
+            "raw_fees": _raw_fees(card_fields),
         },
         "services": _service_tags(card_fields),
         "restrictions": _restriction_tags(card_fields),

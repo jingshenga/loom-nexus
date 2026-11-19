@@ -30,7 +30,7 @@ class ListingAttributesTests(unittest.TestCase):
                             is_admin=False, ocr_entries=ocr)
         self.assertEqual(item["attributes"]["profile"],
                          {"age": 23, "height": 168, "weight": 48.0, "bust": None})
-        self.assertEqual(item["attributes"]["tariffs"]["p1"], ["1P600 60分钟"])
+        self.assertEqual(item["attributes"]["tariffs"]["p1"], ["600 元 (60分钟)"])
         self.assertEqual(item["attributes"]["services"], ["陪浴", "长发"])
         self.assertEqual(item["attributes"]["restrictions"], ["禁无套"])
         self.assertIsNone(item["description"])

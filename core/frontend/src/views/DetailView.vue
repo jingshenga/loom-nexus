@@ -157,13 +157,13 @@ const profileMetrics = computed(() => {
   ].filter((metric) => metric.value);
 });
 
-// 阶梯资费看板：1P / 2P / 现金要求 / 其他资费
+// 阶梯资费看板：1P/2P 是轮次（单次/加钟两轮），而非人数
 const tariffGroups = computed(() => {
   const tariffs = item.value?.attributes?.tariffs || {};
   const quoted = [...(tariffs.p1 || []), ...(tariffs.p2 || [])];
   return [
-    { label: "单人 1P", lines: tariffs.p1 || [], tone: "text-sky-400" },
-    { label: "双人 2P", lines: tariffs.p2 || [], tone: "text-violet-400" },
+    { label: "1P 价格", lines: tariffs.p1 || [], tone: "text-sky-400" },
+    { label: "2P 价格", lines: tariffs.p2 || [], tone: "text-violet-400" },
     { label: "现金要求", lines: tariffs.cash_note || [], tone: "text-amber-400" },
     {
       label: "其他资费",

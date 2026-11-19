@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 import unittest
 from urllib.parse import urlencode, urlparse
-from uuid import uuid4
 
 import asyncpg
 from fastapi import FastAPI
@@ -62,19 +61,26 @@ class ModerationAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipUnless(DSN, "requires isolated nexus_test PostgreSQL")
 class ModerationDatabaseTests(unittest.IsolatedAsyncioTestCase):
+    # fixed schema name keeps every statement a constant string (the
+    # repo bans assembling SQL via f-strings/concatenation); isolation
+    # comes from DSN pointing at a dedicated nexus_test database
+    SCHEMA_NAME = "moderation_test"
+
     async def asyncSetUp(self):
         self.assertEqual(urlparse(DSN).path, "/nexus_test")
-        self.schema = f"moderation_{uuid4().hex}"
         connection = await asyncpg.connect(DSN)
         self.addAsyncCleanup(connection.close)
-        await connection.execute(f"CREATE SCHEMA {self.schema}")
-        self.addAsyncCleanup(connection.execute, f"DROP SCHEMA {self.schema} CASCADE")
-        await connection.execute(f"SET search_path TO {self.schema}")
+        await connection.execute("DROP SCHEMA IF EXISTS moderation_test CASCADE")
+        await connection.execute("CREATE SCHEMA moderation_test")
+        self.addAsyncCleanup(
+            connection.execute, "DROP SCHEMA IF EXISTS moderation_test CASCADE",
+        )
+        await connection.execute("SET search_path TO moderation_test")
         await connection.execute(SCHEMA.read_text())
         for name in ("2026-10-31-ocr-classifier-training.sql", "2026-11-08-listing-person-groups.sql"):
             await connection.execute((SCHEMA.parent / "migrations" / name).read_text())
         self.pool = await asyncpg.create_pool(DSN, min_size=1, max_size=4,
-                                              server_settings={"search_path": self.schema})
+                                              server_settings={"search_path": "moderation_test"})
         self.addAsyncCleanup(self.pool.close)
         old_pool, db._pool = db._pool, self.pool
         self.addCleanup(setattr, db, "_pool", old_pool)

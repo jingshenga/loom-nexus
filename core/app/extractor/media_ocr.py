@@ -217,11 +217,11 @@ def extract_card_fields(lines: list) -> tuple[dict, dict]:
                 fixed_intro_terms.add(term)
         if re.search(r"现金|現金", line):
             cash_lines.append(line)
-        if re.search(r"(?:^|[^\w])1\s*p", line, re.I):
+        if re.search(r"(?:^|[^\w])1\s*[pP]|(?:^|[^\w])[pP]\s*[:：👉]?\s*\d{2,5}|(?<!\d)\d{3,5}\s*(?:元|块)?\s*(?:/|\s)?\s*(?:[pP]|次)\b", line, re.I):
             one_person_fees.append(line)
-        if re.search(r"(?:^|[^\w])2\s*p", line, re.I):
+        if re.search(r"(?:^|[^\w])2\s*[pP]|(?:^|[^\w])pp\s*[:：👉]?\s*\d{2,5}|(?<!\d)\d{3,5}\s*(?:元|块)?\s*(?:/|\s)?\s*(?:pp|2p)\b", line, re.I):
             two_person_fees.append(line)
-        if re.search(r"课费|水费|价格|收费|费用|\bP{1,2}\s*\d|\d\s*P{1,2}\b|\d+\s*分钟", line, re.I):
+        if re.search(r"课费|水费|价格|收费|费用|\bP{1,2}\s*[:：👉]?\s*\d|\d\s*P{1,2}\b|\d+\s*分钟|\d+\s*(?:/|\s)?\s*p{1,2}\b|\bpp\b|\d+\s*次|次\s*[:：👉]?\s*\d+", line, re.I):
             fees.append(line)
         handles.extend(re.findall(r"@[A-Za-z0-9_]{3,}", line))
         if not any(line in group for group in (locations, services, features, restrictions, fees, cash_lines)):

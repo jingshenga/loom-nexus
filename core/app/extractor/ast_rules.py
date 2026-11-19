@@ -36,6 +36,13 @@ FIELDS = ("nickname", "username", "district")
 
 _ZERO_WIDTH = re.compile(r"[\u200b-\u200f\u2060\ufeff\u00ad]")
 
+# keycap digit emoji (1️⃣ 2️⃣ 3️⃣ …) fold back to plain digits; pointing
+# arrows become spaces; prohibition emojis fold to the character 禁 so
+# restriction patterns keep matching emoji-decorated messages
+_KEYCAP_DIGIT = re.compile(r"([0-9])\uFE0F?\u20E3")
+_POINTING_MARKS = re.compile(r"[👉➡▶⏩]\uFE0F?")
+_PROHIBITION_MARKS = re.compile(r"[🈲🚫⛔]")
+
 # 0.8k / 8千 → 8000-scale rewrites; negative lookaheads keep "8cm",
 # "2P" handles and other letter-suffixed tokens intact.
 _MONEY_K = re.compile(r"(\d+(?:\.\d+)?)\s*(?:[kK千])(?![0-9A-Za-z])")
@@ -43,9 +50,12 @@ _MONEY_W = re.compile(r"(\d+(?:\.\d+)?)\s*(?:[wW万])(?![0-9A-Za-z])")
 # "8c" → 800, but bra sizes ("胸围88C") stay untouched
 _MONEY_C = re.compile(r"(\d+(?:\.\d+)?)\s*[cC](?![0-9A-Za-z])")
 _BUST_PREFIX = re.compile(r"(?:胸围|罩杯|胸)[\s:：]?$")
-# "8张" / "8米" → 800; photo counters ("3张照片"), decimals and digit
-# suffixes ("1米68") are excluded; height prefixes guard the rest.
-_MONEY_ZH = re.compile(r"(\d+(?:\.\d+)?)\s*([张米])(?![0-9.]|[照片图票券卡桌])")
+# "8张" / "6章" → 800-scale money. 章/张 carry a digit guard per spec
+# ("6章40分钟" is left untouched — folding would splice 600+40); photo
+# counters ("3张照片") are excluded statically. "8米" folds EXCEPT when
+# a digit follows ("1米68" height) or a height prefix precedes.
+_MONEY_ZH = re.compile(r"(\d+(?:\.\d+)?)\s*([张章])(?![0-9])(?![照片图票券卡桌])")
+_MONEY_MI = re.compile(r"(\d+(?:\.\d+)?)\s*米(?![照片图票券卡桌])")
 _HEIGHT_PREFIX = re.compile(r"(?:身高|净高|身量|个头)\s*[:：]?\s*$")
 
 
@@ -57,7 +67,7 @@ def _scaled(number: str, factor: int) -> str:
 def _rewrite_money_units(text: str) -> str:
     """Colloquial money units become plain yuan numbers so brittle
     numeric rule patterns see "800" whether the message said 0.8k,
-    8张, 8米 or 8c."""
+    8张, 8米, 6章 or 8c."""
 
     def k_repl(match):
         return _scaled(match.group(1), 1000)
@@ -72,23 +82,41 @@ def _rewrite_money_units(text: str) -> str:
         return _scaled(match.group(1), 100)
 
     def zh_repl(match):
+        return _scaled(match.group(1), 100)
+
+    def mi_repl(match):
+        unit_tail = match.string[match.end():match.end() + 1]
+        if unit_tail and (unit_tail.isdigit() or unit_tail == "."):
+            return match.group(0)  # "1米68" / "1.5米…" — height, not money
         prefix = match.string[max(0, match.start() - 8):match.start()]
-        if match.group(2) == "米" and _HEIGHT_PREFIX.search(prefix):
+        if _HEIGHT_PREFIX.search(prefix):
             return match.group(0)
         return _scaled(match.group(1), 100)
 
     text = _MONEY_K.sub(k_repl, text)
     text = _MONEY_W.sub(w_repl, text)
     text = _MONEY_C.sub(c_repl, text)
-    return _MONEY_ZH.sub(zh_repl, text)
+    text = _MONEY_ZH.sub(zh_repl, text)
+    return _MONEY_MI.sub(mi_repl, text)
+
+
+# public alias: OCR card lines and tariff parsing need the same slang
+# folding before they look for 1P/2P amounts ("P 6米" → "P 600")
+money_normalize = _rewrite_money_units
 
 
 def normalize_input(text: str) -> str:
-    """Pre-extraction cleanup: NFKC full-width folding, zero-width and
-    NBSP removal, digit-group commas and money-slang rewriting. Line
-    structure is preserved — chunked matching relies on it."""
+    """Pre-extraction cleanup: NFKC full-width folding, keycap digit
+    emojis back to digits, pointing marks to spaces, prohibition marks
+    to 禁, zero-width and NBSP removal, digit-group commas and
+    money-slang rewriting. Line structure is preserved — chunked
+    matching relies on it."""
     text = unicodedata.normalize("NFKC", text or "")
-    text = _ZERO_WIDTH.sub("", text).replace("\u00a0", " ")
+    text = _ZERO_WIDTH.sub("", text)
+    text = _KEYCAP_DIGIT.sub(r"\1", text)
+    text = _POINTING_MARKS.sub(" ", text)
+    text = _PROHIBITION_MARKS.sub("禁", text)
+    text = text.replace("\u00a0", " ")
     text = re.sub(r"(?<=\d),(?=\d)", "", text)
     text = _rewrite_money_units(text)
     return re.sub(r"[ \t\u3000]+", " ", text).strip()

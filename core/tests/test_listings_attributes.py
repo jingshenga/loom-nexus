@@ -30,8 +30,9 @@ class BuildAttributesTests(unittest.TestCase):
         self.assertEqual(attributes["profile"], {
             "age": 22, "height": 168, "weight": 48.0, "bust": "C",
         })
-        self.assertEqual(attributes["tariffs"]["p1"], ["课费：1P800 2P1500"])
-        self.assertEqual(attributes["tariffs"]["p2"], ["价格：2P1500"])
+        # dirty fee lines come out as clean display text ("800 元")
+        self.assertEqual(attributes["tariffs"]["p1"], ["800 元"])
+        self.assertEqual(attributes["tariffs"]["p2"], ["1500 元"])
         self.assertEqual(attributes["tariffs"]["cash_note"], ["请携带现金"])
         self.assertIn("水费600", attributes["tariffs"]["raw_fees"])
         self.assertEqual(attributes["services"], ["陪浴", "丝袜", "高跟鞋", "长发"])
@@ -78,18 +79,61 @@ class MergeCardFieldsTests(unittest.TestCase):
 class SanitizeTests(unittest.TestCase):
     def test_handles_and_phones_are_redacted_for_regular_users(self):
         attributes = build_attributes({}, {
-            "price_1p_text": ["课费800 找@abaoggio 预约"],
+            "price_1p_text": ["1P800 找@abaoggio 预约"],
             "cash_text": ["电话 13812345678 现金"],
         })
         safe = _sanitize_attributes(attributes)
-        self.assertNotIn("abaoggio", str(safe))
+        # the tiered quote is formatted clean — no handle survives, and
+        # the price itself survives ("1P800" is not a phone number)
+        self.assertEqual(safe["tariffs"]["p1"], ["800 元"])
         self.assertNotIn("13812345678", str(safe))
-        self.assertIn("[联系]", safe["tariffs"]["p1"][0])
-        # numbers inside fee quotes survive ("1P800" is not a phone)
-        self.assertNotIn("[联系]", _redact("课费：1P800 2P1500"))
+        self.assertIn("[联系]", safe["tariffs"]["cash_note"][0])
+        self.assertNotIn("[联系]", safe["tariffs"]["p1"][0])
 
     def test_redact_covers_tme_links(self):
         self.assertEqual(_redact("t.me/abaoggio"), "[联系]")
+
+
+class TariffFormattingTests(unittest.TestCase):
+    def test_structured_display_value_wins_over_dirty_lines(self):
+        attributes = build_attributes({}, {
+            "price_1p_display": "600 元 (40分钟)",
+            "price_1p_text": ["1P6章40分钟 脏串"],
+        })
+        self.assertEqual(attributes["tariffs"]["p1"], ["600 元 (40分钟)"])
+
+    def test_legacy_dirty_lines_are_reformatted_not_echoed(self):
+        attributes = build_attributes({}, {
+            "price_1p_text": ["1P6章 40分钟"],
+            "price_2p_text": ["PP 11米 90分钟"],
+        })
+        self.assertEqual(attributes["tariffs"]["p1"], ["600 元 (40分钟)"])
+        self.assertEqual(attributes["tariffs"]["p2"], ["1100 元 (90分钟)"])
+
+    def test_raw_fees_keep_only_non_tiered_lines(self):
+        attributes = build_attributes({}, {
+            "price_text": ["1P6章 40分钟", "包夜 2000", "BT 300"],
+        })
+        self.assertEqual(attributes["tariffs"]["raw_fees"], ["包夜 2000", "BT 300"])
+
+    def test_unparsable_fee_lines_are_dropped_from_p1(self):
+        attributes = build_attributes({}, {
+            "price_1p_text": ["闲聊一句话没有价格"],
+        })
+        self.assertEqual(attributes["tariffs"]["p1"], [])
+
+
+class RestrictionTagTests(unittest.TestCase):
+    def test_long_restriction_tags_are_not_truncated(self):
+        attributes = build_attributes({}, {
+            "restriction_text": ["禁中途拔套 禁吃药偷拍"],
+        })
+        self.assertIn("禁中途拔套", attributes["restrictions"])
+        self.assertIn("禁吃药偷拍", attributes["restrictions"])
+        # the old {1,3} cap would have emitted the broken "禁中途拔" /
+        # "禁吃药偷" fragments — make sure those never appear
+        self.assertNotIn("禁中途拔", attributes["restrictions"])
+        self.assertNotIn("禁吃药偷", attributes["restrictions"])
 
 
 if __name__ == "__main__":
