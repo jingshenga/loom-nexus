@@ -40,6 +40,19 @@ async def main():
         await pool.execute("INSERT INTO listing_duplicate_decisions(left_listing_id,right_listing_id,decision) VALUES($1,$2,'keep_both')",
                            keep_a, keep_b)
         assert not await automation.group_cards(pool, [keep_a, keep_b])
+        labeled_a = await card(source_a, 6, "review_labeled")
+        labeled_b = await card(source_b, 6, "review_labeled")
+        await pool.execute("""
+            UPDATE raw_messages SET raw_text='发布者 @source_notice，TG：@review_labeled'
+            WHERE id=(SELECT source_msg_id FROM listings WHERE id=$1)
+            """, labeled_a)
+        await pool.execute("""
+            UPDATE listings SET source_msg_id=NULL,evidence_json='{
+                "collection_method":"daily_checkin_source_username_search","profile_url":"https://t.me/review_labeled",
+                "nickname":"Fixture","source_messages":[{"message_id":42,"matched_by":"exact_contact_username_in_message"}]
+            }'::jsonb WHERE id=$1
+            """, labeled_b)
+        assert await automation.group_cards(pool, [labeled_a, labeled_b])
         assert await automation.group_cards(pool, [first, second])
         assert not await automation.group_cards(pool, [first, second])
         assert not await automation.group_cards(pool, [bad_a, bad_b])

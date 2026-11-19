@@ -14,6 +14,11 @@ logger = logging.getLogger("nexus-core.review-automation")
 MODEL_SHA = "bcce9b51ec7a1008e2126482198cc37d318f2347e374097238fceed6581f6f68"
 PERSON_LOCK = 58420261119
 HANDLE = re.compile(r"(?<![\w@])(?:@|(?:https?://)?(?:t\.me|telegram\.me)/)([A-Za-z][A-Za-z0-9_]{3,30})(?![\w/])", re.I)
+CONTACT_LINE = re.compile(
+    r"(?:电报|TG(?:账号|号)?|联系方式)\s*[】\]]?\s*[:：=]\s*(?:@|(?:https?://)?t\.me/)?"
+    r"([A-Za-z][A-Za-z0-9_]{3,30})(?![\w/])",
+    re.I,
+)
 CARD_WORDS = re.compile(r"(昵称|艺名|身高|年龄|价格|课费|收费|费用|区域|城区|套餐)\s*[:：]|(?:课费|价格|收费|费用)\s*\d")
 REPORT_WORDS = re.compile(r"检验报告|检测报告|检验结果|检测结果|参考区间|检验项目")
 CANDIDATE_CARDS = """
@@ -36,22 +41,40 @@ def normalized(value):
     return "".join(c for c in (value or "").casefold() if c.isalnum())
 
 
-def usable_username(card):
+def identity_signal(card):
     username = card["username"]
     if not username:
-        return bool(not card["contact_username"] and positive_peer(card))
+        return "telegram_peer" if not card["contact_username"] and positive_peer(card) else None
     manual = decode(card["manual_fields"], {})
     evidence = decode(card["evidence_json"], {})
     if manual.get("contact_username") or manual.get("username"):
-        return True
+        return "manual_contact"
     username_evidence = evidence.get("username")
     if isinstance(username_evidence, dict) and username_evidence.get("src") == "ocr":
-        return False
-    handles = {m.lower() for m in HANDLE.findall(card["raw_text"] or "") if not m.lower().endswith("bot")}
-    corroborated = handles == {username}
-    if handles and not corroborated:
-        return False
-    return corroborated or bool(card["contact_peer_id"] and card["contact_peer_id"] > 0)
+        return None
+    raw_text = card["raw_text"] or ""
+    explicit = {match.lower() for match in CONTACT_LINE.findall(raw_text)}
+    if explicit:
+        return "explicit_contact_field" if explicit == {username} else None
+    handles = {m.lower() for m in HANDLE.findall(raw_text) if not m.lower().endswith("bot")}
+    if handles == {username}:
+        return "single_original_handle"
+    if username in handles and isinstance(username_evidence, dict):
+        if (username_evidence.get("src") in {"regex", "telegram", "telegram_text"}
+                and str(username_evidence.get("value") or "").lower().lstrip("@") == username):
+            return "original_text_rule"
+    if positive_peer(card) and (not handles or username in handles):
+        return "telegram_peer"
+    if not raw_text and evidence.get("collection_method") == "daily_checkin_source_username_search":
+        matches = evidence.get("source_messages") or []
+        if (evidence.get("profile_url") == "https://t.me/" + username
+                and isinstance(evidence.get("nickname"), str)
+                and normalized(evidence["nickname"]) == normalized(card["nickname"])
+                and normalized(card["nickname"]) not in {"", username}
+                and any(isinstance(match, dict) and match.get("message_id")
+                        and match.get("matched_by") == "exact_contact_username_in_message" for match in matches)):
+            return "original_checkin_contact"
+    return None
 
 
 def positive_peer(card):
@@ -59,7 +82,8 @@ def positive_peer(card):
 
 
 def person_evidence(cards):
-    if not all(usable_username(card) for card in cards):
+    signals = {card["id"]: identity_signal(card) for card in cards}
+    if not all(signals.values()):
         return None
     peers = {positive_peer(card) for card in cards} - {None}
     if len(peers) > 1:
@@ -82,7 +106,7 @@ def person_evidence(cards):
         return None
     return {"reason": "verified_peer" if same_peer else "exact_contact_username",
             "nickname_variants": len(nicknames), "contact_variants": len(usernames),
-            "districts": len(districts), "price_variants": len(prices)}
+            "districts": len(districts), "price_variants": len(prices), "identity_signals": signals}
 
 
 def card_quality(card):
