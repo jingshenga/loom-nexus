@@ -8,7 +8,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
 from app import db, sqlres
-from app.extractor.ocr_fields import format_fee_text
+from app.extractor.ocr_fields import card_weight_kg, format_fee_text
 
 from app.api.auth import bearer_identity, current_user_id, require_user
 
@@ -128,7 +128,7 @@ def _visible_media(media, is_admin: bool) -> list:
 # is defensive: legacy cards without any of it degrade to null/empty.
 
 _CARD_SCALAR_KEYS = (
-    "age_years", "height_cm", "weight_kg", "weight_value", "bust_size",
+    "age_years", "height_cm", "bust_size",
     "price_1p", "price_1p_display", "price_2p", "price_2p_display",
 )
 _CARD_LIST_KEYS = (
@@ -183,6 +183,8 @@ def _merge_card_fields(cards) -> dict:
         fields = card.get("fields") if isinstance(card, dict) else None
         if not isinstance(fields, dict):
             continue
+        if "weight_kg" not in scalars and (weight := card_weight_kg(fields)) is not None:
+            scalars["weight_kg"] = weight
         for key in _CARD_SCALAR_KEYS:
             if key not in scalars and fields.get(key) not in (None, ""):
                 scalars[key] = fields[key]
@@ -223,7 +225,7 @@ def _restriction_tags(card_fields) -> list:
     return _attr_list(tags, 12)
 
 
-def _quote_list(card_fields, display_key, lines_key) -> list:
+def _quote_list(card_fields, display_key, lines_key, tier) -> list:
     """Clean 1P/2P display strings ("600 元 (40分钟)"): the structured
     quote display value wins; legacy dirty lines ("1P800 2P1500") are
     re-formatted, and unparsable ones are dropped entirely."""
@@ -233,7 +235,7 @@ def _quote_list(card_fields, display_key, lines_key) -> list:
         return [text] if text else []
     out = []
     for line in card_fields.get(lines_key) or []:
-        text = format_fee_text(line)
+        text = format_fee_text(line, tier)
         if text and text not in out:
             out.append(text)
         if len(out) >= 6:
@@ -269,39 +271,50 @@ def build_attributes(evidence, card_fields, corrections=None) -> dict:
         if key in corrections:
             value = corrections[key]
             card_fields[key] = value if isinstance(value, list) else ([value] if isinstance(value, str) else [])
-    for key in ("price_1p_display", "price_2p_display"):
+    def unwrapped(source, key):
+        value = (source or {}).get(key)
+        return value.get("value") if isinstance(value, dict) else value
+
+    for tier in ("1p", "2p"):
+        key = f"price_{tier}_display"
         if key in corrections:
             card_fields[key] = corrections[key]
-    if "weight_kg" not in card_fields and "weight_value" in card_fields:
-        card_fields["weight_kg"] = card_fields["weight_value"]
+        elif f"price_{tier}_text" in corrections:
+            card_fields.pop(key, None)
+        elif display := unwrapped(evidence, key):
+            card_fields[key] = display
 
     def pick(key, cast):
         if key in corrections:
             value = corrections[key]
             return cast(value) if value not in (None, "") else None
         for source in (evidence, card_fields):
-            value = (source or {}).get(key)
-            # evidence entries wrap their payload in {"value": ...}
-            if isinstance(value, dict) and "value" in value:
-                value = value.get("value")
-            if value in (None, ""):
-                continue
-            converted = cast(value)
-            if converted is not None:
+            value = unwrapped(source, key)
+            if value not in (None, "") and (converted := cast(value)) is not None:
                 return converted
         return None
+
+    def weight():
+        if "weight_kg" in corrections:
+            return _as_float(corrections["weight_kg"])
+        entry = (evidence or {}).get("weight_kg")
+        from_evidence = card_weight_kg({"weight_kg": unwrapped(evidence, "weight_kg")})
+        from_card = card_weight_kg(card_fields)
+        if isinstance(entry, dict) and entry.get("src") == "ocr":
+            return from_card if from_card is not None else from_evidence
+        return from_evidence if from_evidence is not None else from_card
 
     return {
         "profile": {
             "age": pick("age_years", _as_int),
             "height": pick("height_cm", _as_int),
-            "weight": pick("weight_kg", _as_float),
+            "weight": weight(),
             "bust": pick("bust_size", lambda v: str(v).strip() or None),
         },
         "tariffs": {
             # 干净的 "600 元 (40分钟)" 式价格串；1P/2P 是轮次而非人数
-            "p1": _quote_list(card_fields, "price_1p_display", "price_1p_text"),
-            "p2": _quote_list(card_fields, "price_2p_display", "price_2p_text"),
+            "p1": _quote_list(card_fields, "price_1p_display", "price_1p_text", "1p"),
+            "p2": _quote_list(card_fields, "price_2p_display", "price_2p_text", "2p"),
             "cash_note": _attr_list(card_fields.get("cash_text"), 4),
             "raw_fees": _raw_fees(card_fields),
         },

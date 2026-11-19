@@ -46,7 +46,7 @@ class MediaOcrTests(unittest.TestCase):
         self.assertEqual(classification, "uncertain")
         self.assertLess(confidence, 0.8)
 
-    def test_fields_keep_explicit_age_and_do_not_turn_birth_year_into_age(self):
+    def test_explicit_age_wins_over_a_separate_birth_year(self):
         lines = [
             {"text": "年龄：19"},
             {"text": "身高：165cm"},
@@ -60,9 +60,36 @@ class MediaOcrTests(unittest.TestCase):
         self.assertEqual(fields["height_cm"], 165)
         self.assertEqual(fields["weight_kg"], 45)
         self.assertEqual(fields["bust_size"], "B+")
-        self.assertEqual(fields["age_years"], 19)
         self.assertIn("02年", fields["unparsed_year_text"][0])
         self.assertIn("age_years", evidence)
+
+    def test_card_normalizes_profile_and_keeps_original_line_evidence(self):
+        lines = [
+            {"text": "07年 / 168cm", "score": 0.97},
+            {"text": "体重：165kg", "score": 0.8},
+            {"text": "体重：１０５公斤", "score": 0.92},
+            {"text": "🐻天然36C", "score": 0.91},
+            {"text": "一次6章40分钟 / 双次12米80分钟", "score": 0.94},
+        ]
+        fields, evidence = extract_card_fields(lines)
+        for key, expected, index in (
+            ("age_years", 19, 0), ("weight_kg", 52.5, 2), ("bust_size", "C", 3),
+        ):
+            with self.subTest(field=key):
+                self.assertEqual(fields[key], expected)
+                self.assertEqual(evidence[key], {"line": lines[index]["text"], "score": lines[index]["score"]})
+        self.assertEqual(fields["weight_value"], 105)
+        self.assertEqual(fields["price_1p_text"], [lines[4]["text"]])
+        self.assertEqual(fields["price_2p_text"], [lines[4]["text"]])
+        self.assertNotIn("unparsed_year_text", fields)
+        self.assertNotIn("stage_name_candidate", fields)
+
+    def test_card_omits_invalid_body_and_duration_only_quotes(self):
+        fields, _ = extract_card_fields([
+            {"text": "出生：2009年"}, {"text": "体重79.9kg"},
+            {"text": "胸围J"}, {"text": "双次40分钟"},
+        ])
+        self.assertTrue({"age_years", "weight_kg", "weight_value", "bust_size", "price_2p_text"}.isdisjoint(fields))
 
     def test_fields_capture_explicit_features_prices_and_fixed_intro_only(self):
         lines = [

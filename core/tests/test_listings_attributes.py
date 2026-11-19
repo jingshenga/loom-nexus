@@ -47,6 +47,22 @@ class BuildAttributesTests(unittest.TestCase):
         self.assertEqual(attributes["services"], [])
         self.assertEqual(attributes["restrictions"], [])
 
+    def test_legacy_weight_uses_raw_metadata_and_canonical_kg_is_stable(self):
+        cases = (
+            ({"weight_value": 110}, 55.0),
+            ({"weight_raw": "体重：110kg", "weight_kg": 110}, 55.0),
+            ({"weight_raw": "体重：38斤", "weight_kg": 19}, 19.0),
+            ({"weight_kg": 80}, 80.0),
+            ({"weight_raw": "体重：80磅", "weight_value": 80}, None),
+            ({"weight_value": 79}, None),
+        )
+        for card, expected in cases:
+            with self.subTest(card=card):
+                merged = _merge_card_fields([{"fields": card}])
+                self.assertEqual(build_attributes({}, merged)["profile"]["weight"], expected)
+        evidence = {"weight_kg": {"value": 55, "src": "regex"}}
+        self.assertEqual(build_attributes(evidence, {"weight_value": 110}, {"weight_kg": 110})["profile"]["weight"], 110)
+
     def test_invalid_values_never_raise(self):
         attributes = build_attributes(
             {"age_years": "abc", "height_cm": {"value": None}},
@@ -109,6 +125,25 @@ class TariffFormattingTests(unittest.TestCase):
         })
         self.assertEqual(attributes["tariffs"]["p1"], ["600 元 (40分钟)"])
         self.assertEqual(attributes["tariffs"]["p2"], ["1100 元 (90分钟)"])
+
+    def test_combined_ocr_line_displays_distinct_tier_quotes(self):
+        line = "单次6章40分钟 双次12章80分钟"
+        attributes = build_attributes({}, {"price_1p_text": [line], "price_2p_text": [line]})
+        self.assertEqual(attributes["tariffs"]["p1"], ["600 元 (40分钟)"])
+        self.assertEqual(attributes["tariffs"]["p2"], ["1200 元 (80分钟)"])
+
+    def test_text_tariff_evidence_is_visible_without_an_ocr_card(self):
+        from app.extractor.ast_rules import extract_fields
+
+        _, evidence = extract_fields({}, "单次6章40分钟 双次12章80分钟")
+        attributes = build_attributes(evidence, {})
+        self.assertEqual(attributes["tariffs"]["p1"], ["600 元 (40分钟)"])
+        self.assertEqual(attributes["tariffs"]["p2"], ["1200 元 (80分钟)"])
+
+    def test_manual_tariff_text_wins_over_extraction_evidence(self):
+        evidence = {"price_1p_display": {"value": "600 元", "src": "regex"}}
+        attributes = build_attributes(evidence, {}, {"price_1p_text": ["单次800元"]})
+        self.assertEqual(attributes["tariffs"]["p1"], ["800 元"])
 
     def test_raw_fees_keep_only_non_tiered_lines(self):
         attributes = build_attributes({}, {
