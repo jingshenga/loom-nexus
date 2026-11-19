@@ -29,7 +29,7 @@ _DECORATIVE = re.compile(
 )
 _KEEP_TEXT = re.compile(r"[^\w\u3400-\u9fff@+./#:%-]+", re.UNICODE)
 _LABELS = (
-    re.compile(r"艺名|昵称|身高|净高|体重|胸围|年龄"),
+    re.compile(r"艺名|昵称|身高|净高|体重|胸围|年龄|年纪|出生|罩杯"),
     re.compile(r"课费|水费|价格|收费|费用|\bprice\b|\bfee\b", re.I),
     re.compile(r"服务|课表|项目|套餐"),
     re.compile(r"禁|不接|不做|不接受|无套"),
@@ -160,7 +160,10 @@ def extract_card_fields(lines: list) -> tuple[dict, dict]:
         for index, line in enumerate(lines)
         if 2 <= len(re.sub(r"\s+", "", text_lines[index])) <= 12
         and re.search(r"[\u3400-\u9fff]", text_lines[index])
-        and not re.search(r"艺名|昵称|身高|体重|胸围|年龄|服务|特点|特征|特性|价格|课费|水费|现金|携带|禁", text_lines[index])
+        and not ast_rules.find_bust(text_lines[index])
+        and not ast_rules.find_age([text_lines[index]])
+        and not ast_rules.tariff_quotes([text_lines[index]])
+        and not re.search(r"艺名|昵称|身高|体重|胸围|年龄|年纪|出生|罩杯|服务|特点|特征|特性|价格|课费|水费|现金|携带|禁", text_lines[index])
     ]
     if title_candidates and not any(re.search(r"(?:艺名|昵称)\s*[:：]?", line) for line in text_lines):
         _, index, title = max(title_candidates)
@@ -171,24 +174,22 @@ def extract_card_fields(lines: list) -> tuple[dict, dict]:
         }
 
     take("stage_name", r"(?:艺名|昵称)\s*[:：]?\s*([^，,;；]+)")
-    take("age_years", r"年龄\s*[:：]?\s*(\d{1,2})\s*(?:岁)?", int)
     take("height_cm", r"(?:身高|净高)\s*[:：]?\s*(\d{2,3})\s*(?:cm|厘米)?", int)
 
-    weight_pattern = re.compile(r"体重\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(kg|公斤|斤|磅)?", re.I)
-    for index, line in enumerate(text_lines):
-        match = weight_pattern.search(line)
-        if match:
-            value, unit = match.group(1), (match.group(2) or "").lower()
-            fields["weight_raw"] = match.group(0).strip()
-            fields["weight_value"] = float(value) if "." in value else int(value)
-            if unit in ("kg", "公斤"):
-                fields["weight_kg"] = float(value)
-            elif unit == "斤":
-                fields["weight_kg"] = float(value) / 2
-            evidence["weight_raw"] = {"line": line, "score": lines[index].get("score")}
-            break
+    if age := ast_rules.find_age(text_lines):
+        index, value = age
+        fields["age_years"] = value
+        evidence["age_years"] = {"line": text_lines[index], "score": lines[index].get("score")}
 
-    take("bust_size", r"胸(?:围)?\s*[:：]?\s*([A-I](?:\+)?)", str.upper)
+    for index, line in enumerate(text_lines):
+        line_evidence = {"line": line, "score": lines[index].get("score")}
+        if "weight_kg" not in fields and (weight := ast_rules.find_weight(line)):
+            raw, value, kg = weight
+            fields.update(weight_raw=raw, weight_value=value, weight_kg=kg)
+            evidence["weight_raw"] = evidence["weight_kg"] = line_evidence
+        if "bust_size" not in fields and (bust := ast_rules.find_bust(line)):
+            fields["bust_size"] = bust
+            evidence["bust_size"] = line_evidence
 
     locations = []
     services = []
@@ -217,11 +218,12 @@ def extract_card_fields(lines: list) -> tuple[dict, dict]:
                 fixed_intro_terms.add(term)
         if re.search(r"现金|現金", line):
             cash_lines.append(line)
-        if re.search(r"(?:^|[^\w])1\s*[pP]|(?:^|[^\w])[pP]\s*[:：👉]?\s*\d{2,5}|(?<!\d)\d{3,5}\s*(?:元|块)?\s*(?:/|\s)?\s*(?:[pP]|次)\b", line, re.I):
+        quotes = ast_rules.tariff_quotes([line])
+        if "1p" in quotes:
             one_person_fees.append(line)
-        if re.search(r"(?:^|[^\w])2\s*[pP]|(?:^|[^\w])pp\s*[:：👉]?\s*\d{2,5}|(?<!\d)\d{3,5}\s*(?:元|块)?\s*(?:/|\s)?\s*(?:pp|2p)\b", line, re.I):
+        if "2p" in quotes:
             two_person_fees.append(line)
-        if re.search(r"课费|水费|价格|收费|费用|\bP{1,2}\s*[:：👉]?\s*\d|\d\s*P{1,2}\b|\d+\s*分钟|\d+\s*(?:/|\s)?\s*p{1,2}\b|\bpp\b|\d+\s*次|次\s*[:：👉]?\s*\d+", line, re.I):
+        if quotes or re.search(r"课费|水费|价格|收费|费用|\d+\s*分钟", line):
             fees.append(line)
         handles.extend(re.findall(r"@[A-Za-z0-9_]{3,}", line))
         if not any(line in group for group in (locations, services, features, restrictions, fees, cash_lines)):
@@ -246,7 +248,10 @@ def extract_card_fields(lines: list) -> tuple[dict, dict]:
         fields["price_2p_text"] = two_person_fees
     if handles:
         fields["contact_handles"] = sorted(set(handles))
-    year_mentions = [line for line in text_lines if re.search(r"\d{2}年", line)]
+    year_mentions = [
+        line for line in text_lines
+        if re.search(r"\d{2}年", line) and line != evidence.get("age_years", {}).get("line")
+    ]
     if year_mentions:
         fields["unparsed_year_text"] = year_mentions
     if other:
