@@ -14,10 +14,8 @@ const showFieldSettings = ref(false);
 const newField = ref({ key: "", label: "", aliases: "", extraction_source: "manual", required_for_publish: false, is_active: true });
 const duplicatePairs = ref([]);
 const personGroups = ref([]);
-const identityGroups = ref([]);
 const duplicateView = ref("pairs");
 const selectedDuplicate = ref(null);
-const selectedIdentityGroup = ref(null);
 const duplicateSaving = ref(false);
 const duplicateMediaSaving = ref(false);
 const duplicateOrderIds = ref(new Set());
@@ -252,35 +250,6 @@ async function loadDuplicatePairs() {
 async function loadPersonGroups() {
   const data = await api("/api/admin/review/person-groups");
   personGroups.value = data.items;
-}
-
-async function loadIdentityGroups() {
-  const data = await api("/api/admin/review/duplicates/identity-groups");
-  identityGroups.value = data.items;
-  const selected = data.items.find((group) => group.identity_key === selectedIdentityGroup.value?.identity_key);
-  selectedIdentityGroup.value = selected || data.items[0] || null;
-}
-
-async function confirmIdentityGroup() {
-  const group = selectedIdentityGroup.value;
-  if (!group || duplicateSaving.value) return;
-  const ids = group.cards.map((card) => card.id);
-  if (!window.confirm(`确认 @${group.contact_username || group.contact_peer_id} 的 ${ids.length} 张卡片属于同一人？只建立人员组，不删除或归档卡片。`)) return;
-  duplicateSaving.value = true;
-  try {
-    const result = await api("/api/admin/review/person-groups/confirm", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ listing_ids: ids }),
-    });
-    notify(`已确认并归组：${result.member_ids.map((id) => `#${id}`).join("、")}`);
-    selectedIdentityGroup.value = null;
-    await Promise.all([loadIdentityGroups(), loadDuplicatePairs(), loadPersonGroups()]);
-  } catch (e) {
-    notify(`归组失败：${e.message}`);
-  } finally {
-    duplicateSaving.value = false;
-  }
 }
 
 async function confirmSamePerson() {
@@ -678,7 +647,7 @@ function onReviewVisibilityChange() {
     <div class="flex gap-2">
       <button @click="setWorkbench('review')" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'review' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">审核队列</button>
       <RouterLink to="/admin/history" class="rounded-lg bg-slate-800 px-3 py-1.5 text-sm text-slate-300 hover:bg-slate-700">历史资料库</RouterLink>
-      <button @click="activeWorkbench = 'duplicates'; loadDuplicatePairs()" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'duplicates' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">疑似重复</button>
+      <button @click="activeWorkbench = 'duplicates'; loadDuplicatePairs()" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'duplicates' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">跨账号冲突</button>
       <button @click="statusTab = 'pending'; setWorkbench('checkin')" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'checkin' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">签到补采审核</button>
       <button @click="statusTab = 'pending'; setWorkbench('tgprofile')" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'tgprofile' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">TG号采集V2</button>
       <button @click="setWorkbench('duty')" class="rounded-lg px-3 py-1.5 text-sm" :class="activeWorkbench === 'duty' ? 'bg-sky-600 text-white' : 'bg-slate-800 text-slate-300'">旧签到恢复（{{ dutyRecovery.length }}）</button>
@@ -920,27 +889,18 @@ function onReviewVisibilityChange() {
     <section v-else class="grid grid-cols-1 gap-4 lg:h-[calc(100dvh-190px)] lg:grid-cols-12">
       <div class="space-y-2 lg:col-span-4">
       <div class="flex gap-2">
-        <button @click="duplicateView = 'identities'; loadIdentityGroups()" class="rounded-lg px-3 py-1.5 text-xs" :class="duplicateView === 'identities' ? 'bg-sky-700 text-white' : 'bg-slate-800 text-slate-300'">同 TG 号归组</button>
-        <button @click="duplicateView = 'pairs'; loadDuplicatePairs()" class="rounded-lg px-3 py-1.5 text-xs" :class="duplicateView === 'pairs' ? 'bg-sky-700 text-white' : 'bg-slate-800 text-slate-300'">资料相似</button>
+        <button @click="duplicateView = 'pairs'; loadDuplicatePairs()" class="rounded-lg px-3 py-1.5 text-xs" :class="duplicateView === 'pairs' ? 'bg-sky-700 text-white' : 'bg-slate-800 text-slate-300'">跨账号冲突待核验</button>
         <button @click="duplicateView = 'groups'; loadPersonGroups()" class="rounded-lg px-3 py-1.5 text-xs" :class="duplicateView === 'groups' ? 'bg-sky-700 text-white' : 'bg-slate-800 text-slate-300'">已确认人员组</button>
       </div>
       <aside v-if="duplicateView === 'pairs'" class="max-h-48 space-y-2 overflow-y-auto lg:max-h-[calc(100dvh-250px)] lg:pr-1">
         <button v-for="pair in filteredDuplicatePairs" :key="`${pair.left.id}-${pair.right.id}`" @click="selectedDuplicate = pair"
           class="w-full rounded-lg border p-3 text-left" :class="selectedDuplicate?.left.id === pair.left.id && selectedDuplicate?.right.id === pair.right.id ? 'border-sky-500 bg-sky-600/10' : 'border-slate-800 bg-slate-900 hover:border-slate-600'">
-          <div class="flex items-center justify-between gap-2"><span class="font-medium">{{ pair.left.nickname || pair.right.nickname || '疑似重复资料' }}</span><span class="rounded bg-amber-500/15 px-2 py-0.5 text-[11px] text-amber-300">待人工核对</span></div>
+          <div class="flex items-center justify-between gap-2"><span class="font-medium">{{ pair.left.nickname || pair.right.nickname || '资料冲突' }}</span><span class="rounded bg-amber-500/15 px-2 py-0.5 text-[11px] text-amber-300">跨账号冲突待核验</span></div>
           <div class="mt-1 text-[11px] text-amber-200">{{ pair.match_reason }}</div>
           <div class="mt-1 truncate text-xs text-slate-400">@{{ pair.left.contact_username || '未记录' }} / @{{ pair.right.contact_username || '未记录' }}</div>
           <div class="mt-1 text-xs text-sky-300">最新采集 {{ new Date(newestCard(pair).collected_at).toLocaleString('zh-CN') }}</div>
         </button>
-        <div v-if="!filteredDuplicatePairs.length" class="py-16 text-center text-sm text-slate-500">暂无符合筛选条件的疑似重复卡片</div>
-      </aside>
-      <aside v-else-if="duplicateView === 'identities'" class="max-h-48 space-y-2 overflow-y-auto lg:max-h-[calc(100dvh-250px)] lg:pr-1">
-        <button v-for="group in identityGroups" :key="group.identity_key" @click="selectedIdentityGroup = group" class="w-full rounded-lg border p-3 text-left" :class="selectedIdentityGroup?.identity_key === group.identity_key ? 'border-sky-500 bg-sky-600/10' : 'border-slate-800 bg-slate-900 hover:border-slate-600'">
-          <div class="flex items-center justify-between gap-2"><span class="font-medium">@{{ group.contact_username || group.contact_peer_id }}</span><span class="text-xs text-amber-300">{{ group.cards.length }} 张待核对</span></div>
-          <div class="mt-1 truncate text-xs text-slate-400">{{ group.cards.map((card) => `#${card.id} ${card.nickname || ''}`).join(' · ') }}</div>
-          <div class="mt-1 text-xs text-sky-300">最新原消息 {{ group.cards[0]?.posted_at ? new Date(group.cards[0].posted_at).toLocaleString('zh-CN') : '时间未知' }}</div>
-        </button>
-        <div v-if="!identityGroups.length" class="py-16 text-center text-sm text-slate-500">暂无相同 TG 号的未归组卡片</div>
+        <div v-if="!filteredDuplicatePairs.length" class="py-16 text-center text-sm text-slate-500">暂无跨账号冲突待核验</div>
       </aside>
       <aside v-else class="max-h-48 space-y-3 overflow-y-auto lg:max-h-[calc(100dvh-250px)] lg:pr-1">
         <article v-for="group in personGroups" :key="group.id" class="rounded-lg border border-slate-800 bg-slate-900 p-3">
@@ -953,19 +913,8 @@ function onReviewVisibilityChange() {
         <div v-if="!personGroups.length" class="py-12 text-center text-sm text-slate-500">暂无已确认人员组</div>
       </aside>
       </div>
-      <section v-if="duplicateView === 'identities' && selectedIdentityGroup" class="space-y-4 overflow-y-auto rounded-xl border border-slate-800 bg-slate-900/50 p-4 lg:col-span-8">
-        <div class="rounded-lg border border-amber-700/40 bg-amber-950/20 p-3 text-sm text-amber-200">相同 TG 号的多张采集卡片已合并成一个核对项，按原消息时间从新到旧列出。请确认这些卡片确属同一人；确认后只建立人员组，所有原卡片仍保留。</div>
-        <div class="space-y-2">
-          <article v-for="card in selectedIdentityGroup.cards" :key="card.id" class="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
-            <div class="flex flex-wrap items-center justify-between gap-2"><h3 class="font-semibold">{{ card.nickname || '未命名' }} · #{{ card.id }}</h3><span class="text-xs text-slate-400">{{ card.status }}</span></div>
-            <p class="mt-1 text-xs text-slate-400">TG：@{{ card.contact_username || '未记录' }}<span v-if="card.contact_peer_id"> · ID {{ card.contact_peer_id }}</span> · {{ card.source_title || '来源未知' }}</p>
-            <p class="mt-1 text-xs text-sky-300">原消息：{{ card.posted_at ? new Date(card.posted_at).toLocaleString('zh-CN') : '时间未知' }} · 采集：{{ new Date(card.collected_at).toLocaleString('zh-CN') }}</p>
-          </article>
-        </div>
-        <button @click="confirmIdentityGroup" :disabled="duplicateSaving" class="sticky bottom-0 w-full rounded-lg bg-emerald-800 px-3 py-3 text-sm font-medium text-emerald-100 hover:bg-emerald-700 disabled:opacity-50">确认 {{ selectedIdentityGroup.cards.length }} 张属于同一人并归组</button>
-      </section>
       <section v-if="duplicateView === 'pairs' && selectedDuplicate" class="space-y-4 overflow-y-auto rounded-xl border border-slate-800 bg-slate-900/50 p-4 lg:col-span-8">
-        <div class="rounded-lg border border-amber-700/40 bg-amber-950/20 p-3 text-sm text-amber-200">候选可能由 TG 号、规范化昵称或资料内容匹配产生。请核对来源、账号、时间和媒体；系统只提供线索，不会自动合并。</div>
+        <div class="rounded-lg border border-amber-700/40 bg-amber-950/20 p-3 text-sm text-amber-200">这两张卡片的原文高度相似，或昵称、城区及资费一致。请核对来源、账号、时间和媒体后裁决。</div>
         <div class="grid gap-4 md:grid-cols-2">
           <article v-for="card in [selectedDuplicate.left, selectedDuplicate.right]" :key="card.id" class="min-w-0 space-y-3 rounded-lg border border-slate-800 bg-slate-950/50 p-3">
             <div class="flex flex-wrap items-start justify-between gap-2"><div><h3 class="font-semibold">{{ card.nickname }} · #{{ card.id }}</h3><p class="mt-1 text-xs text-slate-400">{{ card.source_title || '来源未知' }} · {{ card.status === 'published' ? '已发布' : '待审核' }}</p></div><span v-if="card.id === newestCard(selectedDuplicate).id" class="rounded bg-sky-500/15 px-2 py-1 text-xs text-sky-300">最新采集 · 优先建议</span></div>
@@ -993,8 +942,7 @@ function onReviewVisibilityChange() {
           <button @click="decideDuplicate('keep_both')" :disabled="duplicateSaving" class="rounded-lg border border-slate-600 px-3 py-2.5 text-sm text-slate-200 hover:bg-slate-800 disabled:opacity-50">不同账号，保留两张</button>
         </div>
       </section>
-      <section v-else-if="duplicateView === 'pairs'" class="flex items-center justify-center rounded-xl border border-slate-800 text-slate-600 lg:col-span-8">选择一组疑似重复卡片</section>
-      <section v-else-if="duplicateView === 'identities'" class="flex items-center justify-center rounded-xl border border-slate-800 text-slate-600 lg:col-span-8">选择一个 TG 号账号簇查看采集时间</section>
+      <section v-else-if="duplicateView === 'pairs'" class="flex items-center justify-center rounded-xl border border-slate-800 text-slate-600 lg:col-span-8">选择一组跨账号冲突</section>
       <section v-else class="flex items-center justify-center rounded-xl border border-slate-800 text-slate-600 lg:col-span-8">人员组中的卡片仍保留独立资料，可在左侧查看或移出成员</section>
     </section>
   </div>

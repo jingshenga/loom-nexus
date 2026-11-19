@@ -186,7 +186,7 @@ async def review_detail(listing_id: int) -> dict:
 
 @router.get("/duplicates")
 async def duplicate_candidates() -> dict:
-    """List cards with matching Telegram identities, profile content, or history nicknames."""
+    """List active cards whose profile or source text conflicts across contacts."""
     pool = db.get_pool()
     if pool is None:
         raise HTTPException(status_code=503, detail="database unavailable")
@@ -348,7 +348,11 @@ async def group_duplicate_cards(first_id: int, second_id: int) -> dict:
                 and re.sub(r"[\s\W_]+", "", first["nickname"].casefold())
                     == re.sub(r"[\s\W_]+", "", second["nickname"].casefold())
             )
-            if not (same_identity or same_profile or same_nickname):
+            cross_account_conflict = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM listing_cross_account_conflicts WHERE left_id=$1 AND right_id=$2)",
+                left_id, right_id,
+            )
+            if not (same_identity or same_profile or same_nickname or cross_account_conflict):
                 raise HTTPException(status_code=409, detail="cards are not current duplicate candidates")
 
             group_ids = await conn.fetch(
@@ -513,7 +517,11 @@ async def decide_duplicate(
                 and re.sub(r"[\s\W_]+", "", first["nickname"].casefold())
                     == re.sub(r"[\s\W_]+", "", second["nickname"].casefold())
             )
-            if not (same_identity or same_nickname or same_profile):
+            cross_account_conflict = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM listing_cross_account_conflicts WHERE left_id=$1 AND right_id=$2)",
+                left_id, right_id,
+            )
+            if not (same_identity or same_profile or same_nickname or cross_account_conflict):
                 raise HTTPException(status_code=409, detail="cards are not a current duplicate candidate")
 
             merge_info = {"fields_filled": [], "conflicts": [], "media_added": 0}

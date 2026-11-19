@@ -503,11 +503,11 @@ class MediaOcrProcessor:
             "SELECT r.description AS source_description,r.evidence_json,r.media_json,"
             "j.source_id,l.id AS listing_id,l.nickname,l.price_amount,l.price_currency,"
             "l.description,l.contact_username,l.bot_url,l.custom_fields,l.manual_fields,"
-            "l.evidence_json AS listing_evidence,l.status "
+            "l.evidence_json AS listing_evidence,l.status,l.updated_at,l.media_json AS listing_media "
             "FROM profile_collection_results r "
             "JOIN profile_collection_jobs j ON j.id=r.job_id "
             "JOIN listings l ON l.profile_collection_job_id=j.id "
-            "WHERE r.id=$1",
+            "WHERE r.id=$1 AND l.status IN ('pending','duplicate_pending')",
             profile_result_id,
         )
         if result is None:
@@ -601,29 +601,42 @@ class MediaOcrProcessor:
                 "src": "ocr", "fields": image_fields,
                 "custom_fields": {key: value for key, value in ocr_custom.items() if key in custom_updates},
             }
-        ready = await self._pool.fetchval(
+        media_json = result["media_json"]
+        if not _decode_json(media_json, []):
+            media_json = result["listing_media"]
+        ready = not ocr_filled and await self._pool.fetchval(
             "SELECT listing_meets_publish_requirements($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb)",
             nickname or "", price_amount, description, result["contact_username"],
-            result["bot_url"] or "", result["media_json"],
+            result["bot_url"] or "", media_json,
             json.dumps(custom_fields, ensure_ascii=False),
         )
-        ready = bool(ready) and not ocr_filled
-        next_status = result["status"]
-        if next_status in {"pending", "published"}:
-            if ready:
-                next_status = "published"
-            elif result["status"] == "published":
-                next_status = "pending"
-        await self._pool.execute(
-            "UPDATE listings SET nickname=$2,price_amount=$3,price_currency=$4,description=$5,"
-            "custom_fields=$6::jsonb,evidence_json=$7::jsonb,"
-            "media_json=CASE WHEN manual_fields ? 'media' THEN media_json ELSE $8::jsonb END,"
-            "status=$9,published_at=CASE WHEN $9='published' THEN COALESCE(published_at,NOW()) "
-            "WHEN status='published' THEN NULL ELSE published_at END,updated_at=NOW() WHERE id=$1",
-            result["listing_id"], nickname, price_amount, price_currency, description,
-            json.dumps(custom_fields, ensure_ascii=False),
-            json.dumps(listing_evidence, ensure_ascii=False), result["media_json"], next_status,
-        )
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                # Serialize automatic publication with intake. The optimistic
+                # check protects newer manual edits and supersede decisions.
+                await conn.execute("SELECT listing_lock_intake()")
+                status = await conn.fetchval(
+                    "UPDATE listings SET nickname=$2,price_amount=$3,price_currency=$4,description=$5,"
+                    "custom_fields=$6::jsonb,evidence_json=$7::jsonb,"
+                    "media_json=CASE WHEN manual_fields ? 'media' THEN media_json ELSE $8::jsonb END,"
+                    "updated_at=NOW() WHERE id=$1 AND status=$9 "
+                    "AND updated_at IS NOT DISTINCT FROM $10 RETURNING status",
+                    result["listing_id"], nickname, price_amount, price_currency, description,
+                    json.dumps(custom_fields, ensure_ascii=False),
+                    json.dumps(listing_evidence, ensure_ascii=False), media_json,
+                    result["status"], result["updated_at"],
+                )
+                if status == "pending":
+                    await conn.execute(
+                        "UPDATE listings l SET "
+                        "status=CASE WHEN pair.conflict THEN 'duplicate_pending' ELSE 'published' END,"
+                        "auto_published=NOT pair.conflict,"
+                        "published_at=CASE WHEN pair.conflict THEN NULL ELSE NOW() END "
+                        "FROM (SELECT EXISTS (SELECT 1 FROM listing_cross_account_conflicts "
+                        "WHERE $1 IN (left_id,right_id)) AS conflict) pair "
+                        "WHERE l.id=$1 AND (pair.conflict OR $2::boolean)",
+                        result["listing_id"], bool(ready),
+                    )
 
 
 def _decode_json(value, fallback):

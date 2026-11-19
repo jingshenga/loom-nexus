@@ -30,22 +30,8 @@ WHERE l.status = $1::text
   AND ($13::date IS NULL OR (rm.posted_at AT TIME ZONE 'Asia/Shanghai')::date >= $13::date)
   AND ($14::date IS NULL OR (rm.posted_at AT TIME ZONE 'Asia/Shanghai')::date <= $14::date)
   AND ($1::text <> 'pending' OR NOT EXISTS (
-      SELECT 1 FROM listings other
-      WHERE other.id <> l.id
-        AND other.status IN ('pending', 'duplicate_pending', 'published', 'archived')
-        AND NULLIF(l.nickname, '') IS NOT NULL
-        AND NULLIF(other.nickname, '') IS NOT NULL
-        AND regexp_replace(lower(l.nickname), '[[:space:][:punct:]_]+', '', 'g')
-            = regexp_replace(lower(other.nickname), '[[:space:][:punct:]_]+', '', 'g')
-        AND (l.profile_collection_job_id IS NOT NULL OR other.profile_collection_job_id IS NOT NULL
-             OR EXISTS (SELECT 1 FROM raw_messages history_raw
-                        JOIN checkin_history_scans hs ON hs.source_id=history_raw.source_id
-                        WHERE history_raw.id=l.source_msg_id OR history_raw.id=other.source_msg_id))
-        AND NOT EXISTS (
-            SELECT 1 FROM listing_duplicate_decisions d
-            WHERE d.left_listing_id = LEAST(l.id, other.id)
-              AND d.right_listing_id = GREATEST(l.id, other.id)
-        )
+      SELECT 1 FROM listing_cross_account_conflicts c
+      WHERE l.id IN (c.left_id, c.right_id)
   ))
 ORDER BY CASE WHEN $15::text = 'original' AND $7::text = 'oldest' THEN rm.posted_at END ASC NULLS LAST,
          CASE WHEN $15::text = 'original' AND $7::text <> 'oldest' THEN rm.posted_at END DESC NULLS LAST,

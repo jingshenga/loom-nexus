@@ -36,9 +36,7 @@ SQL_ARCHIVE = sqlres.load("archive_for_contact.sql")
 SQL_POLICY = sqlres.load("settings_get_num.sql")
 SQL_POLICY_ENABLED = sqlres.load("settings_get.sql")
 SQL_MEDIA_FLAGS = sqlres.load("media_ocr_set_flags.sql")
-SQL_LISTING_SYNC_MEDIA = sqlres.load("listing_sync_media.sql")
 SQL_HISTORY_SOURCE = sqlres.load("history_scan_source.sql")
-SQL_CREATE_HISTORY_LISTING = sqlres.load("upsert_history_scan.sql")
 
 # structured card fields the media OCR worker already stored for a
 # message's images, best-confidence first
@@ -344,21 +342,12 @@ class Extractor:
                 marker = "图片识别内容：" + ocr_intro
                 if marker not in description:
                     description = "\n\n".join(part for part in (description, marker) if part)
-            complete_for_publish = await self._pool.fetchval(
-                "SELECT listing_meets_publish_requirements($1,$2,$3,$4,$5,$6::jsonb,$7::jsonb)",
-                fields.get("nickname") or "", fields.get("price_amount"), description,
-                fields.get("username") or "", fields.get("bot_url") or "",
-                json.dumps(media), json.dumps(custom_fields, ensure_ascii=False),
-            )
-            # below-threshold or OCR-sourced data needs human review;
-            # above-threshold regex-clean data publishes directly
-            should_publish = (
-                auto_enabled and complete_for_publish and not ocr_used and confidence >= threshold
-            )
+            # The intake transaction checks publish requirements after inheritance.
+            should_publish = auto_enabled and not ocr_used and confidence >= threshold
             if ocr_used:
                 confidence = min(confidence, 0.79)  # cap OCR confidence
             rows = await self._pool.fetch(
-                SQL_CREATE_HISTORY_LISTING if history_source else SQL_CREATE_LISTING,
+                SQL_CREATE_LISTING,
                 raw_id,
                 None,  # sender is the channel bot, NOT the contact; the
                        # contact identity is the extracted username
@@ -374,17 +363,9 @@ class Extractor:
                 should_publish,
                 row["posted_at"],  # the card's "publish time" is the
                                    # message's own time, not collect time
+                json.dumps(custom_fields, ensure_ascii=False),
             )
             result = rows[0]
-            await self._pool.execute(
-                SQL_LISTING_SYNC_MEDIA, result["listing_id"], raw_id,
-            )
-            if custom_fields:
-                await self._pool.execute(
-                    "UPDATE listings SET custom_fields=COALESCE(custom_fields,'{}'::jsonb)||$2::jsonb, "
-                    "updated_at=NOW() WHERE id=$1 AND NOT (manual_fields ? 'custom_fields')",
-                    result["listing_id"], json.dumps(custom_fields, ensure_ascii=False),
-                )
             await self._mark(raw_id, "done")
             extra = ""
             if result["conflicted"]:
@@ -398,12 +379,6 @@ class Extractor:
                 confidence,
                 result["status"], extra,
             )
-            if should_publish and result["conflicted"]:
-                # data changed for a known contact: park it for review
-                logger.info(
-                    "listing %s conflicts with archived sibling; recheck advised",
-                    result["listing_id"],
-                )
         except Exception:
             logger.exception("raw %s extraction failed; returning to new", raw_id)
             await self._mark(raw_id, "new")
