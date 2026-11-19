@@ -8,16 +8,19 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
-from app import db
+from app import db, sqlres
 from app.api.auth import current_user_id, require_admin
 from app.api.review import (
     SQL_PUBLISH, SQL_REJECT, WORKBENCH_ATTRIBUTE_KEYS, _decode, missing_publish_fields,
 )
+from app.extractor import correction_diffs
 
 router = APIRouter(
     prefix="/api/admin/moderation/workbench", tags=["admin-moderation"],
     dependencies=[Depends(require_admin)],
 )
+
+SQL_DIFF_INSERT = sqlres.load("correction_diff_insert.sql")
 
 # OCR can belong to a listing, its Telegram message, or its profile collection result.
 OCR_LINK = "(o.listing_id=l.id OR o.raw_id=rm.id OR o.profile_result_id=p.id)"
@@ -308,6 +311,22 @@ async def decide(listing_id: int, body: Decision, authorization: str = Header(de
             changed = {key: True for key in BASE_FIELDS if fields[key] != before_fields[key]}
             if custom != before_custom:
                 changed["custom_fields"] = True
+            # feedback loop: record field-level diffs between the
+            # system-extracted values (custom fields merged with the
+            # OCR card view) and the operator's corrections so the
+            # rules workshop can aggregate them into slang entries
+            ocr_assets = [_ocr_item(asset) for asset in await conn.fetch(SQL_OCR, listing_id)]
+            diffs = correction_diffs.compute_diffs(
+                _attribute_values(before_custom, ocr_assets, _object(row["evidence_json"])),
+                _attribute_values(custom, ocr_assets, _object(row["evidence_json"])),
+                base_before={key: row[key] for key in correction_diffs.BASE_DIFF_FIELDS},
+                base_after={key: fields[key] for key in correction_diffs.BASE_DIFF_FIELDS},
+                evidence=_object(row["evidence_json"]),
+            )
+            if diffs:
+                await correction_diffs.record(
+                    conn, listing_id, diffs, current_user_id(authorization),
+                )
             if changed:
                 await conn.execute(
                     """UPDATE listings SET nickname=$2, district=$3, price_amount=$4, price_currency=$5,

@@ -24,7 +24,7 @@ import time
 import asyncpg
 
 from app import llm, sqlres
-from app.extractor import ast_rules, media_ocr, ocr_fields, profile_extract
+from app.extractor import ast_rules, media_ocr, ocr_fields, profile_extract, slang_registry
 from app.extractor.ocr_worker import OcrWorker
 
 logger = logging.getLogger("nexus-core.extractor")
@@ -170,6 +170,10 @@ class Extractor:
             batch_size, idle_s, self._ocr_enabled,
         )
         while not stop.is_set():
+            # dynamic slang snapshot: TTL-gated reload so hot-added
+            # units/aliases reach extraction within a minute, without
+            # blocking the loop when the table is unreachable
+            await slang_registry.ensure_fresh(self._pool)
             rows = await self._pool.fetch(SQL_CLAIM, batch_size)
             if not rows:
                 await _sleep(stop, idle_s)

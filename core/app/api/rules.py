@@ -9,12 +9,12 @@ import re
 from decimal import Decimal, InvalidOperation
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app import db, llm, sqlres
 from app.api.auth import require_admin
-from app.extractor import ast_rules, ocr_fields
+from app.extractor import ast_rules, ocr_fields, slang_registry
 from app.extractor.pipeline import DEFAULT_TRIGGERS, extract_custom_fields, missing_triggers
 
 router = APIRouter(
@@ -72,6 +72,10 @@ class DryRunBody(BaseModel):
     config: dict
     sample_limit: int = Field(50, ge=1, le=200)
     sample_set: Literal["recent", "golden"] = "recent"
+
+
+class SlangToggleBody(BaseModel):
+    enabled: bool
 
 
 class GenerateBody(BaseModel):
@@ -518,3 +522,197 @@ async def generate(body: GenerateBody) -> dict:
                         detail=f"llm produced invalid regex '{pattern}': {exc}",
                     )
     return {"config": config}
+
+
+# ---------------------------------------------------------------------------
+# dynamic slang registry: hot-reloadable units/aliases (张/米 successors,
+# "一次"→1p, 🐻→胸围 …). CRUD writes hot-apply into ast_rules immediately;
+# the extractor loop also refreshes on a TTL via slang_registry.
+# ---------------------------------------------------------------------------
+
+SQL_SLANG_LIST = sqlres.load("slang_terms_list.sql")
+SQL_SLANG_ENABLED = sqlres.load("slang_terms_enabled.sql")
+SQL_SLANG_UPSERT = sqlres.load("slang_terms_insert.sql")
+SQL_SLANG_TOGGLE = sqlres.load("slang_terms_toggle.sql")
+SQL_SLANG_DELETE = sqlres.load("slang_terms_delete.sql")
+SQL_CORRECTION_INSIGHTS = sqlres.load("correction_insights.sql")
+
+SLANG_CATEGORIES = ("money_slang", "tariff_alias", "bust_alias", "age_alias")
+
+
+class SlangBody(BaseModel):
+    category: Literal["money_slang", "tariff_alias", "bust_alias", "age_alias"]
+    source_term: str = Field(min_length=1, max_length=64)
+    target_action: str | None = Field(None, max_length=64)
+    factor: int | None = Field(None, ge=1, le=100000)
+    enabled: bool = True
+
+
+class SlangPreviewBody(SlangBody):
+    config: dict = Field(default_factory=dict)
+    sample_limit: int = Field(30, ge=1, le=200)
+    sample_set: Literal["recent", "golden"] = "golden"
+
+
+def _validate_slang(body: SlangBody) -> None:
+    if body.category == "money_slang" and not body.factor:
+        raise HTTPException(status_code=422, detail="money_slang 需要换算倍数 factor（如 100/1000）")
+    if body.category != "money_slang" and not (body.target_action or "").strip():
+        raise HTTPException(status_code=422, detail="别名类词表需要替换目标 target_action（如 1p / 2p / 胸围 / 年龄）")
+
+
+async def _hot_apply(pool) -> int:
+    """Reload enabled terms from the database into ast_rules and mark
+    the TTL snapshot fresh so the extractor loop stays quiet."""
+    rows = await pool.fetch(SQL_SLANG_ENABLED)
+    count = ast_rules.apply_dynamic_terms([dict(row) for row in rows])
+    slang_registry.mark_fresh(count)
+    return count
+
+
+@router.get("/slang-registry")
+async def list_slang() -> dict:
+    pool = _pool()
+    rows = await pool.fetch(SQL_SLANG_LIST)
+    return {
+        "items": [
+            {
+                "id": r["id"], "category": r["category"],
+                "source_term": r["source_term"],
+                "target_action": r["target_action"], "factor": r["factor"],
+                "enabled": r["enabled"],
+                "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+            }
+            for r in rows
+        ]
+    }
+
+
+@router.put("/slang-registry"
+)
+async def upsert_slang(body: SlangBody) -> dict:
+    pool = _pool()
+    _validate_slang(body)
+    rows = await pool.fetch(
+        SQL_SLANG_UPSERT, body.category, body.source_term.strip(),
+        body.target_action, body.factor, body.enabled,
+    )
+    applied = await _hot_apply(pool)
+    r = rows[0]
+    return {
+        "item": {
+            "id": r["id"], "category": r["category"],
+            "source_term": r["source_term"], "target_action": r["target_action"],
+            "factor": r["factor"], "enabled": r["enabled"],
+        },
+        "applied_terms": applied,
+    }
+
+
+@router.post("/slang-registry/reload")
+async def reload_slang() -> dict:
+    pool = _pool()
+    return {"applied_terms": await slang_registry.reload(pool)}
+
+
+@router.post("/slang-registry/{term_id}/toggle")
+async def toggle_slang(term_id: int, body: SlangToggleBody) -> dict:
+    pool = _pool()
+    rows = await pool.fetch(SQL_SLANG_TOGGLE, term_id, body.enabled)
+    if not rows:
+        raise HTTPException(status_code=404, detail="词条不存在")
+    await _hot_apply(pool)
+    return {"id": term_id, "enabled": rows[0]["enabled"]}
+
+
+@router.delete("/slang-registry/{term_id}")
+async def delete_slang(term_id: int) -> dict:
+    pool = _pool()
+    rows = await pool.fetch(SQL_SLANG_DELETE, term_id)
+    if not rows:
+        raise HTTPException(status_code=404, detail="词条不存在")
+    await _hot_apply(pool)
+    return {"id": term_id, "deleted": True}
+
+
+@router.get("/correction-insights")
+async def correction_insights(
+    days: int = Query(30, ge=1, le=365),
+    min_hits: int = Query(2, ge=1, le=100),
+) -> dict:
+    """High-frequency correction clusters from the last N days with
+    naive slang suggestions (资费字段被反复纠正成 1p/2p → 建议别名词条)."""
+    pool = _pool()
+    rows = await pool.fetch(SQL_CORRECTION_INSIGHTS, days, min_hits)
+    items = []
+    for r in rows:
+        items.append({
+            "field_name": r["field_name"],
+            "old_value": r["old_value"],
+            "new_value": r["new_value"],
+            "hits": r["hits"],
+            "suggestions": suggest_slang_entries(
+                r["field_name"], r["old_value"], r["new_value"],
+            ),
+        })
+    return {"days": days, "items": items}
+
+
+def suggest_slang_entries(field_name: str, old_value, new_value) -> list:
+    """Naive suggestion builder: tiered-fee fields whose corrections
+    collapse to 1p/2p become tariff_alias candidates built from CJK
+    words that only appear on the wrong side of the fix."""
+    if field_name not in ("price_1p_text", "price_2p_text"):
+        return []
+    target = str(new_value or "").strip().lower()
+    if target not in ("1p", "2p"):
+        return []
+    tokens = []
+    for token in re.findall(r"[\u4e00-\u9fff]{2,4}", str(old_value or "")):
+        if token not in tokens:
+            tokens.append(token)
+        if len(tokens) >= 3:
+            break
+    return [
+        {"category": "tariff_alias", "source_term": token, "target_action": target}
+        for token in tokens
+    ]
+
+
+@router.post("/slang-registry/preview")
+async def preview_slang(body: SlangPreviewBody) -> dict:
+    """采纳前回测：临时把候选词条热应用到内存词表 → 跑一轮 Dry-run →
+    恢复数据库快照 → 再跑基线 Dry-run，返回两份指标对比。返回前内存
+    词表已恢复为数据库快照，未入库的候选不会残留生效。"""
+    pool = _pool()
+    _validate_slang(body)
+    candidate = {
+        "category": body.category,
+        "source_term": body.source_term.strip(),
+        "target_action": body.target_action,
+        "factor": body.factor,
+    }
+    db_rows = [dict(row) for row in await pool.fetch(SQL_SLANG_ENABLED)]
+
+    async def snapshot():
+        result = await dry_run(DryRunBody(
+            config=body.config, sample_limit=body.sample_limit,
+            sample_set=body.sample_set,
+        ))
+        return {
+            "total": result.get("total", 0), "hits": result.get("hits", 0),
+            "hit_rate": result.get("hit_rate"), "passed": result.get("passed"),
+        }
+
+    ast_rules.apply_dynamic_terms([*db_rows, candidate])
+    try:
+        with_candidate = await snapshot()
+    finally:
+        ast_rules.apply_dynamic_terms(db_rows)
+    baseline = await snapshot()
+    return {
+        "entry": candidate,
+        "sample_set": body.sample_set,
+        "with_candidate": with_candidate,
+        "baseline": baseline,
+    }

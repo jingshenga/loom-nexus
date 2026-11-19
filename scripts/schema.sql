@@ -3232,7 +3232,65 @@ BEGIN
 END
 $fn$;
 
+-- ============================================================
+-- M19: dynamic slang registry + correction diff feedback loop
+-- dynamic_slang_terms hot-patches ast_rules.normalize_input (money
+-- units, tariff/bust/age aliases) without a code release;
+-- listing_correction_diffs records every field-level manual fix made
+-- on the moderation workbench so recurring fixes become new slang.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS dynamic_slang_terms (
+    id BIGSERIAL PRIMARY KEY,
+    category VARCHAR(24) NOT NULL,   -- money_slang | tariff_alias | bust_alias | age_alias
+    source_term VARCHAR(64) NOT NULL,
+    target_action VARCHAR(64),       -- alias target ("1p"/"2p"/"胸围"/"年龄"); money terms use factor
+    factor INT,                      -- money_slang multiplier (张/米/章 → 100, k → 1000)
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (category, source_term)
+);
+CREATE INDEX IF NOT EXISTS idx_dynamic_slang_enabled
+    ON dynamic_slang_terms(enabled, category);
 
+CREATE TABLE IF NOT EXISTS listing_correction_diffs (
+    id BIGSERIAL PRIMARY KEY,
+    listing_id BIGINT NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+    field_name VARCHAR(64) NOT NULL,
+    old_value TEXT,                  -- system-extracted value ("null" when absent)
+    new_value TEXT,                  -- operator-corrected value
+    raw_snippet TEXT,                -- evidence line that produced the wrong value
+    operator BIGINT REFERENCES site_users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_correction_diffs_recent
+    ON listing_correction_diffs(created_at DESC, field_name);
+
+CREATE OR REPLACE FUNCTION correction_diffs_record(
+    p_listing_id BIGINT,
+    p_diffs JSONB,
+    p_operator BIGINT
+) RETURNS INT
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_count INT;
+BEGIN
+    WITH inserted AS (
+        INSERT INTO listing_correction_diffs
+            (listing_id, field_name, old_value, new_value, raw_snippet, operator)
+        SELECT p_listing_id,
+               left(d->>'field_name', 64),
+               d->>'old_value',
+               d->>'new_value',
+               left(COALESCE(d->>'raw_snippet', ''), 300),
+               p_operator
+        FROM jsonb_array_elements(p_diffs) AS d
+        RETURNING 1
+    )
+    SELECT count(*) INTO v_count FROM inserted;
+    RETURN v_count;
+END
+$fn$;
 
 -- Atomic intake for Telegram messages and profile collection results.
 CREATE TABLE IF NOT EXISTS listing_person_groups (

@@ -108,18 +108,114 @@ money_normalize = _rewrite_money_units
 def normalize_input(text: str) -> str:
     """Pre-extraction cleanup: NFKC full-width folding, keycap digit
     emojis back to digits, pointing marks to spaces, prohibition marks
-    to 禁, zero-width and NBSP removal, digit-group commas and
-    money-slang rewriting. Line structure is preserved — chunked
-    matching relies on it."""
+    to 禁, dynamic slang-registry aliasing and money folding (hot
+    reloadable, beats built-ins), zero-width and NBSP removal,
+    digit-group commas and money-slang rewriting. Line structure is
+    preserved — chunked matching relies on it."""
     text = unicodedata.normalize("NFKC", text or "")
     text = _ZERO_WIDTH.sub("", text)
     text = _KEYCAP_DIGIT.sub(r"\1", text)
     text = _POINTING_MARKS.sub(" ", text)
     text = _PROHIBITION_MARKS.sub("禁", text)
     text = text.replace("\u00a0", " ")
+    text = _apply_dynamic_terms(text)
     text = re.sub(r"(?<=\d),(?=\d)", "", text)
     text = _rewrite_money_units(text)
     return re.sub(r"[ \t\u3000]+", " ", text).strip()
+
+
+# ---------------------------------------------------------------------------
+# dynamic slang registry (hot-reloadable override layer)
+#
+# Built-in slang above stays hardcoded as the fallback; operators add
+# new units/aliases (张/米/章 successors, "一次"→1p, 🐻→胸围, …) into the
+# dynamic_slang_terms table and hot-apply them without a release. The
+# registry is an in-memory snapshot applied inside normalize_input;
+# alias terms fold BEFORE money units so custom entries always win.
+# ---------------------------------------------------------------------------
+
+_DYNAMIC_TERMS: dict = {"money": [], "tariff": [], "bust": [], "age": []}
+_SLANG_CATEGORY_MAP = {
+    "money_slang": "money", "tariff_alias": "tariff",
+    "bust_alias": "bust", "age_alias": "age",
+}
+
+
+def apply_dynamic_terms(rows) -> int:
+    """Replace the in-memory snapshot from DB rows shaped
+    {"category", "source_term", "target_action", "factor"}; returns the
+    number of usable entries. Invalid rows are skipped, never fatal."""
+    bucket: dict = {key: [] for key in _SLANG_CATEGORY_MAP.values()}
+    for row in rows or []:
+        category = _SLANG_CATEGORY_MAP.get(str(row.get("category") or ""))
+        term = str(row.get("source_term") or "").strip()
+        if not category or not term or len(term) > 64:
+            continue
+        bucket[category].append({
+            "term": term,
+            "target": str(row.get("target_action") or "").strip(),
+            "factor": row.get("factor"),
+        })
+    _DYNAMIC_TERMS.update(**bucket)
+    return sum(len(items) for items in bucket.values())
+
+
+def clear_dynamic_terms() -> None:
+    _DYNAMIC_TERMS.update(money=[], tariff=[], bust=[], age=[])
+
+
+def dynamic_terms() -> dict:
+    return {key: list(items) for key, items in _DYNAMIC_TERMS.items()}
+
+
+def _alias_replace(text: str, entries) -> str:
+    """term → target_action. Latin-edged terms get word guards so
+    "cup" never splices inside "600cup"; CJK/emoji-edged terms don't
+    ("一次500" and "🐻C" must fold)."""
+    for entry in entries:
+        target = entry["target"]
+        term = entry["term"]
+        if not target:
+            continue
+        head = "(?<![0-9A-Za-z])" if re.match(r"[0-9A-Za-z]", term[:1]) else ""
+        tail = "(?![0-9A-Za-z])" if re.match(r"[0-9A-Za-z]", term[-1:]) else ""
+        text = re.sub(head + re.escape(term) + tail, target, text)
+    return text
+
+
+def _dynamic_money_re():
+    """(compiled_pattern, {term: factor}) for the money_slang entries,
+    or None when the registry is empty."""
+    entries = _DYNAMIC_TERMS["money"]
+    if not entries:
+        return None
+    factors = {}
+    arms = []
+    for entry in entries:
+        try:
+            factor = int(entry["factor"] or 100)
+        except (TypeError, ValueError):
+            factor = 100
+        factors[entry["term"]] = factor
+        arms.append(re.escape(entry["term"]))
+    pattern = re.compile(r"(\d+(?:\.\d+)?)\s*(" + "|".join(arms) + r")(?![0-9])")
+    return pattern, factors
+
+
+def _apply_dynamic_terms(text: str) -> str:
+    if not any(_DYNAMIC_TERMS.values()):
+        return text
+    for group in ("tariff", "bust", "age"):
+        if _DYNAMIC_TERMS[group]:
+            text = _alias_replace(text, _DYNAMIC_TERMS[group])
+    money = _dynamic_money_re()
+    if money:
+        pattern, factors = money
+        text = pattern.sub(
+            lambda match: _scaled(match.group(1), factors[match.group(2)]),
+            text,
+        )
+    return text
 
 
 # ---------------------------------------------------------------------------
