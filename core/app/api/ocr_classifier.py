@@ -168,7 +168,7 @@ async def train(body: TrainBody, authorization: str = Header(default="")) -> dic
     samples_rows = await pool.fetch(
         "SELECT DISTINCT ON (label.ocr_id) label.ocr_id AS id,label.category_code AS label, "
         "COALESCE(NULLIF(o.normalized_text,''),o.raw_text,'') AS text, "
-        "o.classifier_signals_json AS signals, s.id::text AS source_group, "
+        "o.classifier_signals_json AS signals, s.id::text AS source_group, o.asset_sha256, "
         "COALESCE('raw:'||o.raw_id::text,'listing:'||o.listing_id::text,'ocr:'||o.id::text) AS message_group "
         "FROM ocr_classification_labels label JOIN listing_media_ocr o ON o.id=label.ocr_id "
         "LEFT JOIN raw_messages rm ON rm.id=o.raw_id LEFT JOIN ingest_sources s ON s.id=rm.source_id "
@@ -179,8 +179,16 @@ async def train(body: TrainBody, authorization: str = Header(default="")) -> dic
     samples = [{
         "id": row["id"], "label": row["label"], "text": row["text"],
         "signals": _json(row["signals"], {}), "source_group": row["source_group"],
-        "message_group": row["message_group"],
+        "message_group": row["message_group"], "asset_sha256": row["asset_sha256"],
     } for row in samples_rows]
+    originals = {}
+    conflicting = set()
+    for sample in samples:
+        key = sample["asset_sha256"] or f"ocr:{sample['id']}"
+        previous = originals.setdefault(key, sample)
+        if previous["label"] != sample["label"]:
+            conflicting.add(key)
+    samples = [sample for key, sample in originals.items() if key not in conflicting]
     if body.classification_mode == "card_binary":
         samples = as_card_binary_samples(samples)
     try:

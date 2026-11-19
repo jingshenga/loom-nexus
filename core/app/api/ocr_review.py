@@ -1,10 +1,14 @@
 """Admin-only review queue for locally classified OCR card images."""
+import asyncio
 import json
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app import db
+from app.config import get_settings
+from app.extractor import review_automation
 from app.api.auth import bearer_identity, require_admin
 
 router = APIRouter(
@@ -140,13 +144,14 @@ async def queue(
         "SELECT o.id, o.raw_id, o.listing_id, o.media_path, o.status, "
         "o.classification, o.human_classification, o.predicted_classification, "
         "o.predicted_confidence, o.classifier_version_id, o.classifier_signals_json, "
-        "o.review_status, o.raw_text, o.normalized_text, "
+        "o.review_status, o.raw_text, o.normalized_text, o.predicted_model_version, auto.reason AS auto_reason, "
         "o.fields_json, o.evidence_json, o.confidence, o.engine_version, "
         "o.error_text, COALESCE(rm.raw_text, l.description) AS message_text, "
         "COALESCE(rm.posted_at, l.created_at) AS posted_at, "
         "COALESCE(s.title, CASE WHEN l.duty_collection_job_id IS NOT NULL "
         "THEN '签到资料自动采集' END) AS source_title, l.nickname "
         "FROM listing_media_ocr o "
+        "LEFT JOIN nexus_auto_ocr_decisions auto ON auto.ocr_id=o.id AND auto.undone_at IS NULL "
         "LEFT JOIN raw_messages rm ON rm.id=o.raw_id "
         "LEFT JOIN ingest_sources s ON s.id=rm.source_id "
         "LEFT JOIN LATERAL (SELECT id, nickname, description, created_at, duty_collection_job_id "
@@ -189,10 +194,11 @@ async def queue(
             "human_classification": row["human_classification"],
             "predicted_classification": row["predicted_classification"] or row["classification"],
             "confidence": float(confidence) if confidence is not None else None,
-            "confidence_source": "model" if row["classifier_version_id"] is not None else "legacy_rule",
+            "confidence_source": "model" if row["classifier_version_id"] is not None or row["predicted_model_version"] else "legacy_rule",
             "classifier_version_id": row["classifier_version_id"],
             "classifier_signals": _decode(row["classifier_signals_json"], {}),
             "review_status": row["review_status"],
+            "auto_reason": row["auto_reason"] if not row["human_classification"] else None,
             "raw_text": row["raw_text"],
             "normalized_text": row["normalized_text"],
             "fields": _decode(row["fields_json"], {}),
@@ -205,6 +211,20 @@ async def queue(
             "nickname": row["nickname"],
         })
     return {"items": items, "total": total}
+
+
+@router.get("/automatic-summary")
+async def automatic_summary() -> dict:
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    row = await pool.fetchrow("""
+        SELECT count(*) FILTER (WHERE a.undone_at IS NULL AND o.human_classification IS NULL) AS current_count,
+               count(*) FILTER (WHERE a.undone_at IS NOT NULL) AS undone_count,
+               count(*) FILTER (WHERE o.human_classification IS NOT NULL AND o.human_classification<>a.category) AS corrected_count
+        FROM nexus_auto_ocr_decisions a JOIN listing_media_ocr o ON o.id=a.ocr_id
+        """)
+    return dict(row)
 
 
 @router.patch("/{asset_id}")
@@ -271,11 +291,21 @@ async def decide(
         else (class_code, "not_card", "public")
     )
     identity = bearer_identity(authorization)
-    fields = body.fields if body.fields is not None else _decode(row["fields_json"], {})
-    normalized_text = body.normalized_text if body.normalized_text is not None else row["normalized_text"]
+    sha = await asyncio.to_thread(
+        review_automation.fingerprint, Path(get_settings().media_dir).resolve(), row["media_path"],
+    )
     async with pool.acquire() as conn:
         async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT raw_id,listing_id,media_path,normalized_text,fields_json FROM listing_media_ocr "
+                "WHERE id=$1 FOR UPDATE", asset_id,
+            )
+            if row is None:
+                raise HTTPException(status_code=404, detail="OCR item not found")
+            fields = body.fields if body.fields is not None else _decode(row["fields_json"], {})
+            normalized_text = body.normalized_text if body.normalized_text is not None else row["normalized_text"]
             await _set_human_label(conn, asset_id, class_code, identity[0] if identity else None)
+            await review_automation.record_learning(conn, asset_id, sha)
             await _sync_listing_ocr_text(
                 conn, row["listing_id"], row["normalized_text"], normalized_text,
                 is_card,
@@ -293,6 +323,29 @@ async def decide(
                     "SELECT media_ocr_set_flags($1,$2,$3,'done',$4)",
                     row["raw_id"], row["media_path"], visibility, classification,
                 )
+    return {"ok": True}
+
+
+@router.post("/{asset_id}/undo-automatic")
+async def undo_automatic_ocr(asset_id: int, authorization: str = Header(default="")) -> dict:
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    identity = bearer_identity(authorization)
+    async with pool.acquire() as conn, conn.transaction():
+        row = await conn.fetchrow("SELECT human_classification FROM listing_media_ocr WHERE id=$1 FOR UPDATE", asset_id)
+        if row is None or row["human_classification"]:
+            raise HTTPException(status_code=409, detail="图片已有人工判断或记录不存在")
+        decision = await conn.fetchrow("""
+            UPDATE nexus_auto_ocr_decisions SET undone_at=now(),undone_by=$2
+            WHERE ocr_id=$1 AND undone_at IS NULL RETURNING previous_category
+            """, asset_id, identity[0] if identity else None)
+        if decision is None:
+            raise HTTPException(status_code=409, detail="没有可撤销的自动判断")
+        await conn.execute("""
+            UPDATE listing_media_ocr SET classification=COALESCE($2,'uncertain'),review_status='pending',updated_at=now()
+            WHERE id=$1
+            """, asset_id, decision["previous_category"])
     return {"ok": True}
 
 

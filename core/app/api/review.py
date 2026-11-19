@@ -1,5 +1,6 @@
 """Admin review workbench APIs (token-protected)."""
 import base64
+import asyncio
 import binascii
 import io
 import json
@@ -17,6 +18,7 @@ from app import db, sqlres
 from app.config import get_settings
 from app.api.auth import current_user_id, require_admin
 from app.extractor.ocr_fields import equivalent_field, structured_ocr_candidate
+from app.extractor import review_automation
 
 router = APIRouter(
     prefix="/api/admin/review", tags=["admin-review"],
@@ -90,7 +92,8 @@ def _review_ocr_fields(card, images):
             value = parsed["fields"][key]
             options = fields.setdefault(key, [])
             evidence = {"value": value, "ocr_id": image["id"], "engine_version": image["engine_version"],
-                        "evidence": parsed["evidence"].get(key), "confirmed": image["review_status"] == "confirmed",
+                        "evidence": parsed["evidence"].get(key),
+                        "confirmed": image["human_classification"] == "info_card",
                         "confidence": confidence}
             match = next((i for i, option in enumerate(options) if equivalent_field(key, value, option["value"])), None)
             if match is None:
@@ -316,9 +319,51 @@ async def duplicate_candidates() -> dict:
                 if row[f"{prefix}_posted_at"] else None,
         }
 
-    return {"items": [{"left": card(row, "left"), "right": card(row, "right"),
-                        "match_reason": row["match_reason"]}
-                       for row in rows]}
+    items = []
+    for row in rows:
+        left, right = card(row, "left"), card(row, "right")
+        similarity = review_automation.text_similarity(left["source_text"], right["source_text"])
+        items.append({"left": left, "right": right, "match_reason": row["match_reason"],
+                      "text_similarity": similarity})
+    items.sort(key=lambda item: item["text_similarity"] or 0, reverse=True)
+    return {"items": items}
+
+
+@router.get("/duplicates/{first_id}/{second_id}/evidence")
+async def duplicate_evidence(first_id: int, second_id: int) -> dict:
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    rows = await pool.fetch("SELECT media_json FROM listings WHERE id=ANY($1::bigint[]) ORDER BY id", [first_id, second_id])
+    if len(rows) != 2:
+        raise HTTPException(status_code=404, detail="card not found")
+    return await asyncio.to_thread(
+        review_automation.compare_photos, Path(get_settings().media_dir).resolve(),
+        *[_decode(row["media_json"], []) for row in rows],
+    )
+
+
+@router.get("/person-groups/automatic-decisions")
+async def automatic_group_history() -> dict:
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    rows = await pool.fetch("""
+        SELECT id,group_id,primary_listing_id,member_ids,rule_version,evidence,created_at,undone_at,undone_by
+        FROM nexus_auto_person_decisions ORDER BY id DESC LIMIT 100
+        """)
+    return {"items": [{**dict(row), "evidence": _decode(row["evidence"], {})} for row in rows]}
+
+
+@router.post("/person-groups/{group_id}/undo-automatic")
+async def undo_automatic_group(group_id: int, authorization: str = Header(default="")) -> dict:
+    pool = db.get_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    async with pool.acquire() as conn, conn.transaction():
+        if not await review_automation.undo_group(conn, group_id, current_user_id(authorization)):
+            raise HTTPException(status_code=409, detail="自动归组记录已撤销或成员发生变化")
+    return {"ok": True}
 
 
 @router.get("/duplicates/identity-groups")
@@ -351,7 +396,7 @@ async def person_groups() -> dict:
     if pool is None:
         raise HTTPException(status_code=503, detail="database unavailable")
     rows = await pool.fetch(
-        "SELECT g.id AS group_id, g.display_name, l.id, l.nickname, l.status, "
+        "SELECT g.id AS group_id, g.display_name, g.primary_listing_id, l.id, l.nickname, l.status, "
         "l.contact_username, l.created_at, rm.posted_at, s.title AS source_title "
         "FROM listing_person_groups g "
         "JOIN listing_person_group_members m ON m.group_id=g.id "
@@ -363,7 +408,8 @@ async def person_groups() -> dict:
     groups = {}
     for row in rows:
         group = groups.setdefault(row["group_id"], {
-            "id": row["group_id"], "display_name": row["display_name"], "members": [],
+            "id": row["group_id"], "display_name": row["display_name"],
+            "primary_listing_id": row["primary_listing_id"], "members": [],
         })
         group["members"].append({
             "id": row["id"], "nickname": row["nickname"], "status": row["status"],
@@ -382,6 +428,9 @@ async def remove_person_group_member(group_id: int, listing_id: int) -> dict:
         raise HTTPException(status_code=503, detail="database unavailable")
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", review_automation.PERSON_LOCK)
+            if await conn.fetchval("SELECT primary_listing_id FROM listing_person_groups WHERE id=$1", group_id):
+                raise HTTPException(status_code=409, detail="请先撤销自动归组，再调整成员")
             deleted = await conn.fetchval(
                 "DELETE FROM listing_person_group_members "
                 "WHERE group_id=$1 AND listing_id=$2 RETURNING listing_id",
@@ -408,6 +457,7 @@ async def group_duplicate_cards(first_id: int, second_id: int) -> dict:
         raise HTTPException(status_code=503, detail="database unavailable")
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", review_automation.PERSON_LOCK)
             rows = await conn.fetch(
                 "SELECT l.id,l.nickname,l.district,l.price_amount,l.price_currency,"
                 "l.contact_peer_id,l.contact_username,l.profile_collection_job_id,l.source_msg_id,"
@@ -460,6 +510,9 @@ async def group_duplicate_cards(first_id: int, second_id: int) -> dict:
                 "WHERE listing_id=ANY($1::bigint[]) ORDER BY group_id",
                 [left_id, right_id],
             )
+            if await conn.fetchval("SELECT EXISTS (SELECT 1 FROM listing_person_groups WHERE id=ANY($1::bigint[]) AND primary_listing_id IS NOT NULL)",
+                                   [row["group_id"] for row in group_ids]):
+                raise HTTPException(status_code=409, detail="请先撤销自动归组，再调整成员")
             if not group_ids:
                 group_id = await conn.fetchval(
                     "INSERT INTO listing_person_groups (display_name) VALUES($1) RETURNING id",
@@ -504,6 +557,7 @@ async def confirm_identity_group(body: PersonGroupConfirmBody) -> dict:
         raise HTTPException(status_code=503, detail="database unavailable")
     async with pool.acquire() as conn:
         async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", review_automation.PERSON_LOCK)
             rows = await conn.fetch(
                 "SELECT id,nickname,contact_username,contact_peer_id "
                 "FROM listings WHERE id=ANY($1::bigint[]) ORDER BY id FOR UPDATE",
@@ -524,6 +578,9 @@ async def confirm_identity_group(body: PersonGroupConfirmBody) -> dict:
                 "WHERE listing_id=ANY($1::bigint[]) ORDER BY group_id",
                 listing_ids,
             )
+            if await conn.fetchval("SELECT EXISTS (SELECT 1 FROM listing_person_groups WHERE id=ANY($1::bigint[]) AND primary_listing_id IS NOT NULL)",
+                                   [row["group_id"] for row in group_ids]):
+                raise HTTPException(status_code=409, detail="请先撤销自动归组，再调整成员")
             if group_ids:
                 group_id = group_ids[0]["group_id"]
                 for other in group_ids[1:]:

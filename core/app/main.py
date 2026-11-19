@@ -37,6 +37,7 @@ async def lifespan(app: FastAPI):
         from app.extractor.media_ocr import MediaOcrProcessor
         from app.extractor.ocr_worker import OcrWorker
         from app.extractor.pipeline import Extractor
+        from app.extractor import review_automation
 
         vision4_model_dir = settings.vision4_model_dir
         try:
@@ -70,6 +71,10 @@ async def lifespan(app: FastAPI):
         background_tasks.append(asyncio.create_task(
             media_ocr_processor.run(stop),
             name="media-card-ocr",
+        ))
+        background_tasks.append(asyncio.create_task(
+            review_automation.run(db.get_pool(), settings.media_dir, stop),
+            name="review-automation",
         ))
     yield
     stop.set()

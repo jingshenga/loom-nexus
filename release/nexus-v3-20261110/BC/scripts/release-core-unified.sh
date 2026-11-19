@@ -145,6 +145,7 @@ apply_migration 2026-11-18-collection-reuse-plan.sql
 apply_migration 2026-11-18-collection-reuse-stage.sql
 apply_migration 2026-11-18-collection-ocr-safe-flags.sql
 apply_migration 2026-11-18-bot-collection-precheck.sql
+apply_migration 2026-11-19-review-automation.sql
 
 GUARD_SOURCE="$REPO_DIR/scripts/nexus_active_guard.py"
 [[ -f "$GUARD_SOURCE" ]] || die "continuous Active supervisor source is missing"

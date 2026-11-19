@@ -17,6 +17,7 @@ const total = ref(0);
 const pageSize = 60;
 const categories = ref([]);
 const versions = ref([]);
+const automaticSummary = ref(null);
 const categoryFilter = ref("");
 const confidenceRange = ref("");
 const confidenceSort = ref("confidence_asc");
@@ -40,6 +41,7 @@ const pageFullySelected = computed(() =>
 
 function statusLabel(item) {
   if (item.status === "failed") return "识别失败";
+  if (item.auto_reason) return `自动 · ${categoryName(item.classification)}`;
   if (item.review_status === "confirmed") return "已确认";
   if (item.review_status === "not_card") return "非资料卡";
   return "待核对";
@@ -144,7 +146,11 @@ async function load() {
     params.set("confidence_min", low);
     params.set("confidence_max", high);
   }
-  const data = await api(`/api/admin/ocr/queue?${params}`);
+  const [data, summary] = await Promise.all([
+    api(`/api/admin/ocr/queue?${params}`),
+    api("/api/admin/ocr/automatic-summary"),
+  ]);
+  automaticSummary.value = summary;
   total.value = data.total;
   if (!data.items.length && offset.value > 0 && total.value > 0) {
     offset.value = Math.floor((total.value - 1) / pageSize) * pageSize;
@@ -260,6 +266,23 @@ async function decide(decision) {
 
 async function decideByClass() {
   return decide(categoryDecision(labelClass.value));
+}
+
+async function undoAutomaticOcr() {
+  const item = current.value;
+  if (!item || busy.value) return;
+  busy.value = true;
+  try {
+    await api(`/api/admin/ocr/${item.id}/undo-automatic`, { method: "POST" });
+    modalOpen.value = false;
+    current.value = null;
+    await load();
+    notify("已撤销自动判断，图片已回到待核对");
+  } catch (error) {
+    notify(error.message || "撤销失败");
+  } finally {
+    busy.value = false;
+  }
 }
 
 async function retry() {
@@ -382,6 +405,7 @@ async function reclassifySelected() {
       </div>
       <span v-if="flash" class="w-full rounded bg-emerald-600/20 px-3 py-1 text-xs text-emerald-300">{{ flash }}</span>
     </div>
+    <p v-if="automaticSummary" class="text-xs text-slate-400">自动处理 {{ automaticSummary.current_count }} 张 · 人工改判 {{ automaticSummary.corrected_count }} 张 · 已撤销 {{ automaticSummary.undone_count }} 张</p>
     <div v-if="listingId" class="flex flex-wrap items-center gap-2 rounded-lg border border-sky-800/70 bg-sky-950/30 px-3 py-2 text-sm text-sky-200">
       <span>当前只显示卡片 #{{ listingId }} 的 {{ mediaPaths.length || "全部" }} 张指定 OCR 图片</span>
       <button @click="clearListingFilter" class="ml-auto rounded border border-sky-700 px-2 py-1 text-xs hover:bg-sky-900">清除卡片筛选</button>
@@ -439,12 +463,16 @@ async function reclassifySelected() {
             <img :src="mediaUrl(current.media_path)" class="max-h-[55dvh] max-w-full object-contain lg:max-h-full" alt="OCR 图片详情" />
           </section>
           <section class="space-y-3 overflow-y-auto p-4">
+            <div v-if="current.auto_reason" class="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-sky-900 p-3 text-xs text-sky-200">
+              <span>{{ ({ human_exact_image: '复用同一原图的人工标签', vision4_with_structured_card_fields: 'Vision4 高分且 OCR 提取到明确字段', vision4_photo_without_business_text: 'Vision4 高分且未找到业务文字', vision4_with_report_text: 'Vision4 高分且 OCR 读到检验用语' })[current.auto_reason] }}</span>
+              <button @click="undoAutomaticOcr" :disabled="busy" class="rounded border border-sky-800 px-2 py-1">撤销自动判断</button>
+            </div>
             <div v-if="current.error" class="rounded-lg border border-rose-900/70 bg-rose-950/40 p-3 text-xs text-rose-200">识别失败：{{ current.error }}</div>
             <label class="block text-xs text-slate-400">人工确认图片类别
               <select v-model="labelClass" class="mt-1 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100">
                 <option v-for="item in categories" :key="item.code" :value="item.code">{{ item.name }}</option>
               </select>
-              <span class="mt-1 block text-[10px] text-slate-500">保存后作为训练标签；会保留模型原预测和版本记录。</span>
+              <span class="mt-1 block text-[10px] text-slate-500">分类标签用于学习。相同原图可复用你的分类，新模型仍从分类器训练页验证和发布。</span>
             </label>
             <p class="whitespace-pre-wrap rounded-lg bg-slate-900 p-3 text-xs leading-relaxed text-slate-400">来源消息：{{ current.message_text || "（无正文）" }}</p>
             <label class="block text-xs text-slate-400">OCR 原文（只读）
@@ -464,7 +492,7 @@ async function reclassifySelected() {
             </div>
             <div class="sticky bottom-0 flex flex-wrap gap-2 border-t border-slate-800 bg-slate-950 py-3">
               <button :disabled="busy" @click="saveOnly" class="rounded-lg border border-slate-700 px-3 py-2 text-xs text-slate-200 disabled:opacity-50">保存修改</button>
-              <button :disabled="busy || !labelClass" @click="decideByClass" class="flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-medium text-white disabled:opacity-50"><Check class="size-4" />保存并标记为{{ categoryName(labelClass) }}</button>
+              <button :disabled="busy || !labelClass" @click="decideByClass" class="flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-medium text-white disabled:opacity-50"><Check class="size-4" />确认并用于学习</button>
               <button v-if="current.status === 'failed'" :disabled="busy" @click="retry" class="flex items-center gap-1 rounded-lg border border-amber-700/60 px-3 py-2 text-xs text-amber-300 disabled:opacity-50"><RotateCw class="size-4" />重试识别</button>
             </div>
           </section>

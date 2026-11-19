@@ -25,6 +25,8 @@ for _ in 1 2; do
     docker exec -i "$PG_ID" psql -Xq -v ON_ERROR_STOP=1 -U postgres -d nexus_collection \
       < "$ROOT/scripts/migrations/2026-11-18-$migration.sql"
   done
+  docker exec -i "$PG_ID" psql -Xq -v ON_ERROR_STOP=1 -U postgres -d nexus_collection \
+    < "$ROOT/scripts/migrations/2026-11-19-review-automation.sql"
 done
 for fixture in collection_plan checkin_stage bot_precheck; do
   docker exec -i "$PG_ID" psql -Xq -v ON_ERROR_STOP=1 -U postgres -d nexus_collection \
@@ -39,6 +41,8 @@ CORE_RUN=(docker run --rm --platform "$PLATFORM" --network "container:$PG_ID" --
     -e NEXUS_ACTIVE_ROUTER_ENABLED=true -e NEXUS_ACTIVE_ROUTER_SOURCE_IDS=2 -e NEXUS_ACTIVE_ROUTER_KILL_SWITCH=false)
 "${CORE_RUN[@]}" -v "$ROOT/scripts/test_nexus_collection_ocr_postgres.py:/nexus-tests/ocr.py:ro" \
     "$CANDIDATE" /nexus-tests/ocr.py
+"${CORE_RUN[@]}" -v "$ROOT/scripts/test_nexus_review_automation_postgres.py:/nexus-tests/automation.py:ro" \
+    "$CANDIDATE" /nexus-tests/automation.py
 "${CORE_RUN[@]}" \
     -v "$ROOT/release/nexus-v3-20261110/BC/core/tests/e2e_active_pipeline_postgres.py:/nexus-tests/active.py:ro" \
     "$CANDIDATE" /nexus-tests/active.py

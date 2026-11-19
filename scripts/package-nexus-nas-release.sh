@@ -28,6 +28,8 @@ git -C "$ROOT" archive --format=tar "$COMMIT" \
   scripts/test_nexus_checkin_stage.sql \
   scripts/test_nexus_bot_precheck.sql \
   scripts/test_nexus_collection_ocr_postgres.py \
+  scripts/test_nexus_review_automation_postgres.py \
+  scripts/release-nexus-review-automation.sh \
   bridge/Dockerfile.release-overlay \
   bridge/runner \
   bridge/tests \

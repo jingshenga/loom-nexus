@@ -8,6 +8,7 @@
     LEFT JOIN profile_collection_jobs j ON j.id=l.profile_collection_job_id
     LEFT JOIN listing_person_group_members person ON person.listing_id=l.id
     WHERE l.status IN ('pending','duplicate_pending')
+      AND NOT nexus_auto_duplicate_folded(l.id)
 ), entries AS (
     SELECT subject,'listing' AS kind,id,source_id,contact_username,nickname AS label,status,created_at
     FROM listing_entries

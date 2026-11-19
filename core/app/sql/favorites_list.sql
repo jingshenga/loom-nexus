@@ -9,6 +9,7 @@ WITH favorite_people AS (
            ROW_NUMBER() OVER (
                PARTITION BY COALESCE('g:' || pgm.group_id::text, 'l:' || l.id::text)
                ORDER BY
+                   (l.id=g.primary_listing_id) DESC NULLS LAST,
                    (SELECT count(*) FROM jsonb_array_elements(COALESCE(l.media_json, '[]'::jsonb)) m
                     WHERE m->>'kind' IN ('photo','video')
                       AND COALESCE(m->>'path',m->>'poster','') <> '') DESC,
@@ -22,6 +23,7 @@ WITH favorite_people AS (
     LEFT JOIN raw_messages rm ON rm.id = l.source_msg_id
     LEFT JOIN contact_presence cp ON cp.contact_peer_id = l.contact_peer_id
     LEFT JOIN listing_person_group_members pgm ON pgm.listing_id = l.id
+    LEFT JOIN listing_person_groups g ON g.id=pgm.group_id
     WHERE l.status = 'published'
       AND COALESCE('g:' || pgm.group_id::text, 'l:' || l.id::text)
           IN (SELECT person_key FROM favorite_people)

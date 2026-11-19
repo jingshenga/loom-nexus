@@ -34,6 +34,7 @@ SQL_PROFILE_LISTING_SYNC = (
     "status=$9::varchar(32),published_at=CASE WHEN $9::varchar(32)='published' "
     "THEN COALESCE(published_at,NOW()) ELSE published_at END,"
     "updated_at=NOW() WHERE id=$1 AND status=$10 AND status IN ('pending','duplicate_pending') "
+    "AND ($9::varchar(32)<>'published' OR NOT nexus_auto_duplicate_grouped(id)) "
     "AND updated_at=$11 AND manual_fields=$12::jsonb"
 )
 

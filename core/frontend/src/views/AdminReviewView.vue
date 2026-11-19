@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { CheckCircle2, XCircle, Save, Inbox, ArchiveRestore, Trash2 } from "lucide-vue-next";
 import { api, mediaUrl } from "../api/client";
 import AdminMediaGrid from "../components/AdminMediaGrid.vue";
@@ -17,6 +17,8 @@ const personGroups = ref([]);
 const identityGroups = ref([]);
 const duplicateView = ref("pairs");
 const selectedDuplicate = ref(null);
+const imageComparison = ref(null);
+const groupHistory = ref([]);
 const selectedIdentityGroup = ref(null);
 const duplicateSaving = ref(false);
 const duplicateMediaSaving = ref(false);
@@ -296,10 +298,37 @@ async function loadDuplicatePairs() {
 }
 
 async function loadPersonGroups() {
-  const data = await api("/api/admin/review/person-groups");
+  const [data, history] = await Promise.all([
+    api("/api/admin/review/person-groups"),
+    api("/api/admin/review/person-groups/automatic-decisions"),
+  ]);
   personGroups.value = data.items;
+  groupHistory.value = history.items;
 }
 
+async function undoAutomaticGroup(group) {
+  if (!window.confirm("撤销自动归组，将这组卡片恢复为单独记录？")) return;
+  try {
+    await api(`/api/admin/review/person-groups/${group.id}/undo-automatic`, { method: "POST" });
+    await Promise.all([loadPersonGroups(), loadIdentityGroups(), loadDuplicatePairs()]);
+    notify("自动归组已撤销");
+  } catch (error) {
+    notify(error.message || "撤销失败");
+  }
+}
+
+watch(selectedDuplicate, () => { imageComparison.value = null; });
+
+async function compareDuplicateImages() {
+  const pair = selectedDuplicate.value;
+  imageComparison.value = { loading: true };
+  try {
+    const result = await api(`/api/admin/review/duplicates/${pair.left.id}/${pair.right.id}/evidence`);
+    if (selectedDuplicate.value === pair) imageComparison.value = result;
+  } catch (error) {
+    if (selectedDuplicate.value === pair) imageComparison.value = { error: error.message };
+  }
+}
 async function loadIdentityGroups() {
   const data = await api("/api/admin/review/duplicates/identity-groups");
   identityGroups.value = data.items;
@@ -1046,7 +1075,7 @@ function onReviewVisibilityChange() {
       <div class="flex gap-2">
         <button @click="duplicateView = 'identities'; loadIdentityGroups()" class="rounded-lg px-3 py-1.5 text-xs" :class="duplicateView === 'identities' ? 'bg-sky-700 text-white' : 'bg-slate-800 text-slate-300'">同 TG 号归组</button>
         <button @click="duplicateView = 'pairs'; loadDuplicatePairs()" class="rounded-lg px-3 py-1.5 text-xs" :class="duplicateView === 'pairs' ? 'bg-sky-700 text-white' : 'bg-slate-800 text-slate-300'">资料相似</button>
-        <button @click="duplicateView = 'groups'; loadPersonGroups()" class="rounded-lg px-3 py-1.5 text-xs" :class="duplicateView === 'groups' ? 'bg-sky-700 text-white' : 'bg-slate-800 text-slate-300'">已确认人员组</button>
+        <button @click="duplicateView = 'groups'; loadPersonGroups()" class="rounded-lg px-3 py-1.5 text-xs" :class="duplicateView === 'groups' ? 'bg-sky-700 text-white' : 'bg-slate-800 text-slate-300'">人员组与自动记录</button>
       </div>
       <aside v-if="duplicateView === 'pairs'" class="max-h-48 space-y-2 overflow-y-auto lg:max-h-[calc(100dvh-250px)] lg:pr-1">
         <button v-for="pair in filteredDuplicatePairs" :key="`${pair.left.id}-${pair.right.id}`" @click="selectedDuplicate = pair"
@@ -1069,12 +1098,24 @@ function onReviewVisibilityChange() {
       <aside v-else class="max-h-48 space-y-3 overflow-y-auto lg:max-h-[calc(100dvh-250px)] lg:pr-1">
         <article v-for="group in personGroups" :key="group.id" class="rounded-lg border border-slate-800 bg-slate-900 p-3">
           <h3 class="mb-2 text-sm font-medium">{{ group.display_name || '已确认同一人' }} · {{ group.members.length }} 张</h3>
+          <div v-if="group.primary_listing_id" class="mb-2 flex flex-wrap items-center gap-2 text-xs text-sky-300">
+            <span>自动归组 · 主卡 #{{ group.primary_listing_id }}</span>
+            <button @click="undoAutomaticGroup(group)" class="rounded border border-slate-700 px-2 py-1">撤销自动归组</button>
+          </div>
           <div v-for="member in group.members" :key="member.id" class="flex items-center justify-between gap-2 border-t border-slate-800 py-2 text-xs">
             <div class="min-w-0"><p class="truncate text-slate-200">{{ member.nickname || group.display_name || '未命名' }} · #{{ member.id }} <span class="text-slate-500">{{ member.status }}</span></p><p class="truncate text-slate-500">@{{ member.contact_username || '未记录' }} · {{ member.source_title || '来源未知' }}</p></div>
-            <button @click="removePersonGroupMember(group, member)" class="shrink-0 rounded border border-rose-900 px-2 py-1 text-rose-300">移出</button>
+            <button v-if="!group.primary_listing_id" @click="removePersonGroupMember(group, member)" class="shrink-0 rounded border border-rose-900 px-2 py-1 text-rose-300">移出</button>
           </div>
         </article>
         <div v-if="!personGroups.length" class="py-12 text-center text-sm text-slate-500">暂无已确认人员组</div>
+        <details class="rounded-lg border border-slate-800 bg-slate-900 p-3 text-xs">
+          <summary class="cursor-pointer">最近自动归组记录（{{ groupHistory.length }}）</summary>
+          <div v-for="event in groupHistory" :key="event.id" class="space-y-1 border-b border-slate-800 py-2 break-words">
+            <p>主卡 #{{ event.primary_listing_id }} · {{ event.evidence.primary_reason === 'stable_published' ? '沿用已发布卡' : '资料最完整' }} · {{ event.undone_at ? '已撤销' : '已执行' }}</p>
+            <p class="text-slate-400">{{ event.evidence.reason === 'verified_peer' ? 'TG 数字 ID 一致' : '原帖可验证的 TG 用户名一致' }} · 规则 V{{ event.rule_version }} · {{ new Date(event.created_at).toLocaleString('zh-CN') }}</p>
+            <p class="text-slate-400">组内卡片 {{ event.member_ids.map(id => `#${id}`).join('、') }}</p>
+          </div>
+        </details>
       </aside>
       </div>
       <section v-if="duplicateView === 'identities' && selectedIdentityGroup" class="space-y-4 overflow-y-auto rounded-xl border border-slate-800 bg-slate-900/50 p-4 lg:col-span-8">
@@ -1089,6 +1130,13 @@ function onReviewVisibilityChange() {
         <button @click="confirmIdentityGroup" :disabled="duplicateSaving" class="sticky bottom-0 w-full rounded-lg bg-emerald-800 px-3 py-3 text-sm font-medium text-emerald-100 hover:bg-emerald-700 disabled:opacity-50">确认 {{ selectedIdentityGroup.cards.length }} 张属于同一人并归组</button>
       </section>
       <section v-if="duplicateView === 'pairs' && selectedDuplicate" class="space-y-4 overflow-y-auto rounded-xl border border-slate-800 bg-slate-900/50 p-4 lg:col-span-8">
+        <div class="flex flex-wrap items-center gap-2 rounded-lg border border-slate-800 p-3 text-xs">
+          <span>正文相似度 {{ selectedDuplicate.text_similarity == null ? '文字不足' : Math.round(selectedDuplicate.text_similarity * 100) + '%' }}</span>
+          <button @click="compareDuplicateImages" :disabled="imageComparison?.loading" class="rounded border border-slate-700 px-2 py-1">比较原图</button>
+          <span v-if="imageComparison?.loading">比较中…</span>
+          <span v-else-if="imageComparison?.error" class="text-amber-200">{{ imageComparison.error }}</span>
+          <span v-else-if="imageComparison">完全相同 {{ imageComparison.exact_images }} 张 · 近似 {{ imageComparison.near_images }} 张</span>
+        </div>
         <div class="rounded-lg border border-amber-700/40 bg-amber-950/20 p-3 text-sm text-amber-200">候选可能由 TG 号、规范化昵称或资料内容匹配产生。请核对来源、账号、时间和媒体；系统只提供线索，不会自动合并。</div>
         <div class="grid gap-4 md:grid-cols-2">
           <article v-for="card in [selectedDuplicate.left, selectedDuplicate.right]" :key="card.id" class="min-w-0 space-y-3 rounded-lg border border-slate-800 bg-slate-950/50 p-3">

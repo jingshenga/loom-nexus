@@ -6,7 +6,7 @@ WITH clock AS (
     SELECT l.id, rm.source_id, l.nickname, l.district, l.price_amount, l.price_currency, l.bot_url,
            l.description, l.media_json, l.confidence, l.published_at, l.created_at,
            rm.posted_at,
-           pgm.group_id AS person_group_id,
+           pgm.group_id AS person_group_id, l.id=g.primary_listing_id AS group_primary,
            COALESCE(cp.is_online, FALSE) AS is_online,
            COALESCE(cp.status_tier, 'unknown') AS presence_tier,
            CASE WHEN $9::text = 'yesterday' THEN 'yesterday'
@@ -34,6 +34,7 @@ WITH clock AS (
     LEFT JOIN raw_messages rm ON rm.id = l.source_msg_id
     LEFT JOIN contact_presence cp ON cp.contact_peer_id = l.contact_peer_id
     LEFT JOIN listing_person_group_members pgm ON pgm.listing_id = l.id
+    LEFT JOIN listing_person_groups g ON g.id=pgm.group_id
     CROSS JOIN clock c
     WHERE l.status = 'published'
       AND ($1::text IS NULL OR l.nickname ILIKE '%' || $1 || '%'
@@ -52,6 +53,7 @@ WITH clock AS (
     SELECT *, ROW_NUMBER() OVER (
         PARTITION BY COALESCE('g:' || person_group_id::text, 'l:' || id::text)
         ORDER BY
+            group_primary DESC NULLS LAST,
             on_duty_today DESC,
             (SELECT count(*) FROM jsonb_array_elements(COALESCE(media_json, '[]'::jsonb)) m
              WHERE m->>'kind' IN ('photo','video')
