@@ -38,7 +38,8 @@ WHERE l.status = 'published'
       (SELECT CASE WHEN o.fields_json->>'age_years' ~ '^[0-9]{1,3}$'
                    THEN (o.fields_json->>'age_years')::int END
        FROM listing_media_ocr o
-       WHERE o.status = 'done'
+       WHERE NOT (COALESCE(l.custom_fields, '{}'::jsonb) ? 'age_years')
+         AND o.status = 'done'
          AND COALESCE(o.human_classification, o.classification) = 'info_card'
          AND (o.listing_id = l.id OR o.raw_id = l.source_msg_id OR o.profile_result_id = (
              SELECT max(r.id) FROM profile_collection_results r
@@ -47,9 +48,11 @@ WHERE l.status = 'published'
        ORDER BY o.id LIMIT 1)
   ) BETWEEN COALESCE($7::int, 0) AND COALESCE($8::int, 120))
   AND ($9::text IS NULL OR l.custom_fields->'fixed_intro_terms' @> jsonb_build_array($9::text)
+       OR l.custom_fields->>'fixed_intro_terms' = $9::text
        OR EXISTS (
            SELECT 1 FROM listing_media_ocr o
-           WHERE o.status = 'done'
+           WHERE NOT (COALESCE(l.custom_fields, '{}'::jsonb) ? 'fixed_intro_terms')
+             AND o.status = 'done'
              AND COALESCE(o.human_classification, o.classification) = 'info_card'
              AND (o.listing_id = l.id OR o.raw_id = l.source_msg_id OR o.profile_result_id = (
                  SELECT max(r.id) FROM profile_collection_results r

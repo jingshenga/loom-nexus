@@ -12,6 +12,15 @@ const routes = [
     component: () => import("../views/MessagesView.vue"),
   },
   {
+    path: "/admin",
+    redirect: "/admin/workbench",
+  },
+  {
+    path: "/admin/workbench",
+    component: () => import("../views/AdminWorkbenchView.vue"),
+    meta: { admin: true },
+  },
+  {
     path: "/admin/review",
     component: () => import("../views/AdminReviewView.vue"),
     meta: { admin: true },

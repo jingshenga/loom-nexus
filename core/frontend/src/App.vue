@@ -33,7 +33,7 @@ const nav = [
   { to: "/messages", label: "消息", icon: MessageSquare },
 ];
 const adminNav = [
-  { to: "/admin/review", label: "审核", icon: ShieldCheck },
+  { to: "/admin/workbench", label: "审核工作台", icon: ShieldCheck },
   { to: "/admin/ocr", label: "OCR核对", icon: ImageIcon },
   { to: "/admin/ocr-classifier", label: "分类训练", icon: Wrench },
   { to: "/admin/rules", label: "规则", icon: Wrench },

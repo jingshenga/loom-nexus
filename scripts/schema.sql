@@ -1541,6 +1541,7 @@ $fn$;
 
 -- one-time migration: strip a captured leading "@" from stored contact
 -- usernames (idempotent; a second replay touches 0 rows)
+ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS contact_username VARCHAR(128);
 UPDATE listings SET contact_username = ltrim(contact_username, '@')
 WHERE contact_username LIKE '@%';
 UPDATE chat_sessions SET contact_username = ltrim(contact_username, '@')

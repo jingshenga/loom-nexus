@@ -1,10 +1,11 @@
 <script setup>
 import { useRoute } from "vue-router";
-import { ShieldCheck, ImageIcon, Wrench, Activity, ShieldQuestion, Users, UserCog, Database } from "lucide-vue-next";
+import { ShieldCheck, ImageIcon, Wrench, Activity, ShieldQuestion, Users, UserCog, Database, ListChecks } from "lucide-vue-next";
 
 const route = useRoute();
 const tabs = [
-  { to: "/admin/review", label: "审核", icon: ShieldCheck },
+  { to: "/admin/workbench", label: "审核工作台", icon: ShieldCheck },
+  { to: "/admin/review", label: "批量审核", icon: ListChecks },
   { to: "/admin/history", label: "资料库", icon: Database },
   { to: "/admin/ocr", label: "OCR核对", icon: ImageIcon },
   { to: "/admin/ocr-classifier", label: "分类训练", icon: Wrench },

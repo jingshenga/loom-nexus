@@ -155,12 +155,11 @@ def _attributes(custom_fields, ocr_entries):
                 fields[key] = value
     custom = _decode(custom_fields, {})
     if isinstance(custom, dict):
-        fields.update({key: value for key, value in custom.items() if value not in (None, "", [])})
+        fields.update(custom)
     profile = {
         "age": _number(fields.get("age_years"), 0, 120, integer=True),
         "height": _number(fields.get("height_cm"), 50, 250, integer=True),
-        "weight": _number(fields.get("weight_kg") if fields.get("weight_kg") is not None
-                          else fields.get("weight_value"), 0, 500),
+        "weight": _number(fields.get("weight_kg", fields.get("weight_value")), 0, 500),
         "bust": (_texts(fields.get("bust_size")) or [None])[0],
     }
     def merged(*keys):

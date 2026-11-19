@@ -42,6 +42,11 @@ SQL_HISTORY_SOURCES = sqlres.load("history_library_sources.sql")
 SQL_HISTORY_MESSAGES = sqlres.load("history_library_messages.sql")
 SQL_HISTORY_TOTAL = sqlres.load("history_library_total.sql")
 
+WORKBENCH_ATTRIBUTE_KEYS = {
+    "age_years", "height_cm", "weight_kg", "bust_size", "price_1p_text",
+    "price_2p_text", "service_text", "features_text", "restriction_text", "fixed_intro_terms",
+}
+
 
 def _decode(value, fallback):
     if value is None:
@@ -1016,7 +1021,7 @@ async def edit_content(
             allowed_fields = await conn.fetch(
                 "SELECT field_key FROM listing_field_definitions WHERE is_active"
             )
-            allowed_keys = {item["field_key"] for item in allowed_fields}
+            allowed_keys = {item["field_key"] for item in allowed_fields} | WORKBENCH_ATTRIBUTE_KEYS
             if set(custom_fields) - allowed_keys:
                 raise HTTPException(status_code=422, detail="卡片包含未定义的自定义字段")
             old_by_path = {entry.get("path"): entry for entry in old_media}
@@ -1168,6 +1173,20 @@ async def rotate_photo(listing_id: int, body: RotatePhotoBody) -> dict:
     return {"media": media}
 
 
+def missing_publish_fields(listing, custom_fields, required_fields) -> list[str]:
+    missing = [
+        label for label, value in (
+            ("昵称", listing["nickname"]), ("价格", listing["price_amount"]),
+            ("介绍", listing["description"]), ("TG号", listing["contact_username"]),
+        ) if value is None or (isinstance(value, str) and not value.strip())
+    ]
+    missing.extend(
+        row["label"] for row in required_fields
+        if not str(custom_fields.get(row["field_key"]) or "").strip()
+    )
+    return missing
+
+
 @router.post("/{listing_id}/publish")
 async def publish(listing_id: int) -> dict:
     pool = db.get_pool()
@@ -1180,21 +1199,11 @@ async def publish(listing_id: int) -> dict:
     )
     if listing is None:
         raise HTTPException(status_code=404, detail="listing not found")
-    missing = [
-        label for label, value in (
-            ("昵称", listing["nickname"]), ("价格", listing["price_amount"]),
-            ("介绍", listing["description"]), ("TG号", listing["contact_username"]),
-        ) if value is None or (isinstance(value, str) and not value.strip())
-    ]
-    custom_fields = _decode(listing["custom_fields"], {})
     required_fields = await pool.fetch(
         "SELECT field_key,label FROM listing_field_definitions "
         "WHERE is_active AND required_for_publish ORDER BY field_key"
     )
-    missing.extend(
-        row["label"] for row in required_fields
-        if not str(custom_fields.get(row["field_key"]) or "").strip()
-    )
+    missing = missing_publish_fields(listing, _decode(listing["custom_fields"], {}), required_fields)
     if missing:
         raise HTTPException(status_code=409, detail="上架条件未满足：" + "、".join(missing))
     rows = await pool.fetch(SQL_PUBLISH, listing_id)
