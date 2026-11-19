@@ -1,6 +1,6 @@
 <script setup>
 import { RouterLink } from "vue-router";
-import { MapPin, Star, Images, MessageCircle, Play } from "lucide-vue-next";
+import { MapPin, Star, Images, MessageCircle, Play, ShieldAlert } from "lucide-vue-next";
 import { api, mediaUrl } from "../api/client";
 
 const props = defineProps({
@@ -33,6 +33,24 @@ const tierClass = () =>
 const dutyText = () =>
   props.item.duty_label === "today" ? "今日签到"
     : props.item.duty_label === "yesterday" ? "昨日签到" : "";
+const profileText = () => {
+  const profile = props.item.attributes?.profile || {};
+  return [
+    profile.age != null ? `${profile.age}岁` : null,
+    profile.height != null ? `${profile.height}cm` : null,
+    profile.weight != null ? `${profile.weight}kg` : null,
+    profile.bust,
+  ].filter(Boolean).join(" · ");
+};
+const tariffHint = () => {
+  const lines = props.item.attributes?.tariffs?.p1 || [];
+  for (const line of lines) {
+    const match = String(line).match(/1\s*p\s*[:：]?\s*[¥￥]?\s*(\d{2,6})|[¥￥]?\s*(\d{2,6})\s*元?\s*\/\s*1\s*p/i);
+    if (match) return `${match[1] || match[2]}起/1P`;
+  }
+  return "";
+};
+const hasRestriction = () => (props.item.attributes?.restrictions || []).some((line) => line.startsWith("禁"));
 
 async function toggleFavorite() {
   // optimistic: the caller owns the state and updates instantly; on
@@ -71,9 +89,10 @@ async function toggleFavorite() {
         </span>
       </span>
       <!-- 悬浮价格徽章 -->
-      <span v-if="item.price_amount != null"
-        class="nx-price-chip absolute left-2.5 top-2.5 rounded-xl px-2.5 py-0.5 text-[15px]">
-        {{ item.price_amount }}<small class="ml-0.5 text-[10px] font-normal opacity-85">{{ item.price_currency }}</small>
+      <span v-if="tariffHint() || item.price_amount != null"
+        class="nx-price-chip absolute left-2.5 top-2.5 max-w-[calc(100%-5rem)] truncate rounded-xl px-2.5 py-0.5 text-xs sm:text-[15px]">
+        <template v-if="tariffHint()">{{ tariffHint() }}</template>
+        <template v-else>{{ item.price_amount }}<small class="ml-0.5 text-[10px] font-normal opacity-85">{{ item.price_currency }}</small></template>
       </span>
       <span v-if="mediaCount() > 1"
         class="absolute right-2.5 top-2.5 flex items-center gap-1 rounded-lg bg-slate-950/70 px-2 py-0.5 text-[10px] text-slate-200 backdrop-blur">
@@ -101,6 +120,12 @@ async function toggleFavorite() {
         <MapPin class="size-3 shrink-0" />
         <span class="truncate">{{ item.district || "位置未标注" }}</span>
       </div>
+      <p v-if="profileText()" :title="profileText()" class="truncate rounded-full bg-slate-800 px-2 py-1 text-[11px] text-slate-300">
+        {{ profileText() }}
+      </p>
+      <p v-if="hasRestriction()" class="flex items-center gap-1 text-[10px] text-amber-300">
+        <ShieldAlert class="size-3 shrink-0" /> <span class="truncate">有服务禁忌，请查看详情</span>
+      </p>
     </div>
   </RouterLink>
 </template>

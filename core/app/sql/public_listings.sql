@@ -4,7 +4,7 @@ WITH clock AS (
            ((NOW() AT TIME ZONE 'Asia/Shanghai') - INTERVAL '4 hours')::date AS business_date
 ), filtered AS (
     SELECT l.id, rm.source_id, l.nickname, l.district, l.price_amount, l.price_currency, l.bot_url,
-           l.description, l.media_json, l.confidence, l.published_at, l.created_at,
+           l.description, l.custom_fields, l.evidence_json, l.media_json, l.confidence, l.published_at, l.created_at,
            rm.posted_at,
            pgm.group_id AS person_group_id,
            COALESCE(cp.is_online, FALSE) AS is_online,
@@ -48,6 +48,30 @@ WITH clock AS (
               - CASE WHEN $9::text = 'yesterday' THEN 1 ELSE 0 END
             AND ds.contact_usernames ? lower(l.contact_username)
       ))
+      AND (($10::int IS NULL AND $11::int IS NULL) OR COALESCE(
+          CASE WHEN l.custom_fields->>'age_years' ~ '^[0-9]{1,3}[[:space:]]*岁?$'
+               THEN substring(l.custom_fields->>'age_years' from '^[0-9]{1,3}')::int END,
+          (SELECT CASE WHEN o.fields_json->>'age_years' ~ '^[0-9]{1,3}$'
+                       THEN (o.fields_json->>'age_years')::int END
+           FROM listing_media_ocr o
+           WHERE o.status = 'done'
+             AND COALESCE(o.human_classification, o.classification) = 'info_card'
+             AND (o.listing_id = l.id OR o.raw_id = l.source_msg_id OR o.profile_result_id = (
+                 SELECT max(r.id) FROM profile_collection_results r
+                 WHERE r.job_id = l.profile_collection_job_id))
+             AND o.fields_json ? 'age_years'
+           ORDER BY o.id LIMIT 1)
+      ) BETWEEN COALESCE($10::int, 0) AND COALESCE($11::int, 120))
+      AND ($12::text IS NULL OR l.custom_fields->'fixed_intro_terms' @> jsonb_build_array($12::text)
+           OR EXISTS (
+               SELECT 1 FROM listing_media_ocr o
+               WHERE o.status = 'done'
+                 AND COALESCE(o.human_classification, o.classification) = 'info_card'
+                 AND (o.listing_id = l.id OR o.raw_id = l.source_msg_id OR o.profile_result_id = (
+                     SELECT max(r.id) FROM profile_collection_results r
+                     WHERE r.job_id = l.profile_collection_job_id))
+                 AND o.fields_json->'fixed_intro_terms' @> jsonb_build_array($12::text)
+           ))
 ), ranked AS (
     SELECT *, ROW_NUMBER() OVER (
         PARTITION BY COALESCE('g:' || person_group_id::text, 'l:' || id::text)
@@ -65,7 +89,7 @@ WITH clock AS (
     FROM filtered
 )
 SELECT id, source_id, nickname, district, price_amount, price_currency,
-       description, media_json, confidence, published_at, is_online, bot_url,
+       description, custom_fields, evidence_json, media_json, confidence, published_at, is_online, bot_url,
        presence_tier, duty_label, favorited
 FROM ranked
 WHERE person_rank = 1

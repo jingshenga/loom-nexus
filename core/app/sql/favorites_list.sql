@@ -27,7 +27,7 @@ WITH favorite_people AS (
           IN (SELECT person_key FROM favorite_people)
 )
 SELECT r.id, r.source_id, r.nickname, r.district, r.price_amount, r.price_currency, r.bot_url,
-       r.description, r.media_json, r.published_at,
+       r.description, r.custom_fields, r.evidence_json, r.media_json, r.published_at,
        COALESCE(r.is_online, FALSE) AS is_online,
        COALESCE(r.status_tier, 'unknown') AS presence_tier,
        CASE

@@ -21,6 +21,9 @@ const district = ref("");
 const districts = ref([]);
 const minPrice = ref(null);
 const maxPrice = ref(null);
+const minAge = ref(null);
+const maxAge = ref(null);
+const restriction = ref("");
 const duty = ref("all");
 const offset = ref(0);
 const loading = ref(false);
@@ -76,6 +79,9 @@ function listingParams(limit, pageOffset) {
   if (district.value) params.set("district", district.value);
   if (minPrice.value != null && minPrice.value !== "") params.set("min_price", minPrice.value);
   if (maxPrice.value != null && maxPrice.value !== "") params.set("max_price", maxPrice.value);
+  if (minAge.value != null && minAge.value !== "") params.set("min_age", minAge.value);
+  if (maxAge.value != null && maxAge.value !== "") params.set("max_age", maxAge.value);
+  if (restriction.value) params.set("restriction", restriction.value);
   params.set("duty", duty.value);
   params.set("limit", limit);
   params.set("offset", pageOffset);
@@ -88,6 +94,9 @@ async function refreshSaved(snapshot) {
   district.value = snapshot.district;
   minPrice.value = snapshot.minPrice;
   maxPrice.value = snapshot.maxPrice;
+  minAge.value = snapshot.minAge ?? null;
+  maxAge.value = snapshot.maxAge ?? null;
+  restriction.value = snapshot.restriction || "";
   duty.value = snapshot.duty || "all";
   const pageOffsets = Array.from(
     { length: Math.ceil(snapshot.items.length / PAGE_SIZE) },
@@ -154,6 +163,9 @@ function persistScroll(event) {
     district: district.value,
     minPrice: minPrice.value,
     maxPrice: maxPrice.value,
+    minAge: minAge.value,
+    maxAge: maxAge.value,
+    restriction: restriction.value,
     duty: duty.value,
   };
 }
@@ -244,6 +256,20 @@ onUnmounted(() => {
           class="w-20 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1.5" />
         <span class="w-16 text-right">共 {{ total }} 条</span>
       </div>
+    </div>
+
+    <div class="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+      <span>年龄</span>
+      <input v-model.number="minAge" @change="load(true)" aria-label="最低年龄" placeholder="最低" type="number" min="0" max="120"
+        class="w-16 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1.5" />
+      <span>—</span>
+      <input v-model.number="maxAge" @change="load(true)" aria-label="最高年龄" placeholder="最高" type="number" min="0" max="120"
+        class="w-16 rounded-lg border border-slate-700 bg-slate-900 px-2 py-1.5" />
+      <select v-model="restriction" @change="load(true)" aria-label="服务规范"
+        class="min-w-0 max-w-full rounded-lg border border-slate-700 bg-slate-900 px-2 py-1.5 text-slate-300">
+        <option value="">全部规范</option>
+        <option v-for="term in ['禁嗑药', '禁无套', '禁醉酒', '禁桩基', '禁拔套', '禁鸽子', '禁变态']" :key="term" :value="term">{{ term }}</option>
+      </select>
     </div>
 
     <!-- 筛选 chips：横滚不换行 -->

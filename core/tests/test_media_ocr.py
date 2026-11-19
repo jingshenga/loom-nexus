@@ -91,7 +91,10 @@ class MediaOcrTests(unittest.TestCase):
         ]
         public = _visible_media(media, False)
         self.assertEqual([item["path"] for item in public], ["portrait.jpg", "clip.mp4"])
-        self.assertEqual(_visible_media(media, True), media)
+        self.assertEqual(
+            [item["path"] for item in _visible_media(media, True)],
+            ["portrait.jpg", "pending.jpg", "card.jpg", "clip.mp4"],
+        )
 
 
 if __name__ == "__main__":

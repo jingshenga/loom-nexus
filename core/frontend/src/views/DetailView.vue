@@ -1,7 +1,7 @@
 <script setup>
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { Star, ArrowLeft, MessageCircle, TriangleAlert, ExternalLink, Pencil, Save, X, RotateCcw, ArchiveRestore } from "lucide-vue-next";
+import { Star, ArrowLeft, MessageCircle, TriangleAlert, ExternalLink, Pencil, Save, X, RotateCcw, ArchiveRestore, ShieldAlert, ChevronDown } from "lucide-vue-next";
 import { api } from "../api/client";
 import { useSession } from "../stores/session";
 import MediaGallery from "../components/MediaGallery.vue";
@@ -22,6 +22,28 @@ const withdrawing = ref(false);
 const editError = ref("");
 const editForm = ref(null);
 const manualOrder = ref(false);
+const showEvidence = ref(false);
+const attributes = computed(() => item.value?.attributes || {});
+const profileFacts = computed(() => {
+  const profile = attributes.value.profile || {};
+  return [
+    ["年龄", profile.age != null ? `${profile.age}岁` : null],
+    ["身高", profile.height != null ? `${profile.height}cm` : null],
+    ["体重", profile.weight != null ? `${profile.weight}kg` : null],
+    ["胸围", profile.bust],
+    ["城区", item.value?.district],
+  ].filter(([, value]) => value != null && value !== "");
+});
+const tariffs = computed(() => attributes.value.tariffs || {});
+const hasTariffs = computed(() => ["p1", "p2", "cash_note", "raw_fees"]
+  .some((key) => tariffs.value[key]?.length));
+const extraFees = computed(() => (tariffs.value.raw_fees || []).filter((line) =>
+  !(tariffs.value.p1 || []).includes(line) && !(tariffs.value.p2 || []).includes(line)));
+const evidenceRows = (entry) => Object.entries(entry.fields || {}).map(([key, value]) => ({
+  key, value: Array.isArray(value) ? value.join("、") : String(value),
+  line: entry.evidence?.[key]?.line,
+  score: entry.evidence?.[key]?.score,
+}));
 
 function startEdit() {
   editForm.value = {
@@ -148,16 +170,6 @@ onMounted(async () => {
   }
 });
 
-const fieldRowsTop = (it) => [
-  ["昵称", it.nickname],
-  ["城区", it.district],
-  ["价格", it.price_amount != null ? `${it.price_amount} ${it.price_currency}` : null],
-];
-const fieldRowsBottom = (it) => [
-  ["状态", it.online_tier === "online" ? "在线" : it.online_tier === "recent" ? "近期活跃" : "未知"],
-  ["签到", it.duty_label === "today" ? "今日签到" : it.duty_label === "yesterday" ? "昨日签到" : null],
-  ["发布时间", it.published_at ? new Date(it.published_at).toLocaleString("zh-CN") : null],
-];
 </script>
 
 <template>
@@ -165,9 +177,9 @@ const fieldRowsBottom = (it) => [
   <div v-else-if="item" class="grid gap-6 pb-[calc(150px+env(safe-area-inset-bottom,0px))] lg:grid-cols-2 lg:pb-0">
     <AdminMediaGrid v-if="editing && editForm" v-model:media="editForm.media" editable @order-change="manualOrder = true" />
     <MediaGallery v-else :media="item.media" fixed-mobile-frame />
-    <div class="space-y-4">
+    <div class="min-w-0 space-y-4">
       <div class="flex flex-wrap items-center gap-2">
-        <h2 class="flex items-center gap-2 text-2xl font-bold">
+        <h2 class="flex min-w-0 items-center gap-2 break-words text-2xl font-bold">
           {{ item.nickname || "未命名" }}
           <span v-if="item.online_tier === 'online' || item.online_tier === 'recent'"
             class="inline-block size-2.5 rounded-full"
@@ -209,46 +221,83 @@ const fieldRowsBottom = (it) => [
           <ExternalLink class="size-3.5" />官方客户端直连
         </a>
       </div>
-      <p v-if="!editing" class="text-3xl font-bold text-sky-400">
-        {{ item.price_amount != null ? item.price_amount : "?" }}
-        <span class="text-base text-slate-400">{{ item.price_currency }}</span>
-      </p>
-      <table v-if="!editing" class="w-full overflow-hidden rounded-xl border border-slate-800 text-sm">
-        <tbody>
-          <tr v-for="([label, value], i) in fieldRowsTop(item)" :key="label"
-            class="border-b border-slate-800" :class="i % 2 ? 'bg-slate-900/60' : ''">
-            <td class="w-24 px-4 py-2.5 text-slate-500">{{ label }}</td>
-            <td class="px-4 py-2.5">{{ value ?? "—" }}</td>
-          </tr>
-          <!-- 联系方式行：管理员看真实号码；普通用户只见聊天入口 -->
-          <tr class="border-b border-slate-800 bg-slate-900/60">
-            <td class="w-24 px-4 py-2.5 text-slate-500">联系方式</td>
-            <td class="flex flex-wrap items-center gap-3 px-4 py-2.5">
-              <template v-if="session.isAdmin && item.contact_username">
-                <span>@{{ item.contact_username }}</span>
-              </template>
-              <template v-else>
-                <span class="text-slate-500">通过立即聊天联系</span>
-              </template>
-              <a v-if="item.bot_url" :href="item.bot_url" target="_blank" rel="noreferrer"
-                class="rounded border border-violet-700/60 px-2 py-1 text-xs text-violet-300">联系 Bot</a>
-              <button @click="startChat"
-                class="nx-grad hidden items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-semibold text-white hover:opacity-90 lg:flex">
-                <MessageCircle class="size-4" />立即聊天
-              </button>
-            </td>
-          </tr>
-          <tr v-for="([label, value], i) in fieldRowsBottom(item)" :key="label"
-            class="border-b border-slate-800 last:border-0" :class="i % 2 ? '' : 'bg-slate-900/60'">
-            <td class="w-24 px-4 py-2.5 text-slate-500">{{ label }}</td>
-            <td class="px-4 py-2.5">{{ value ?? "—" }}</td>
-          </tr>
-        </tbody>
-      </table>
-      <p v-if="!editing && item.description"
-        class="whitespace-pre-wrap rounded-xl border border-slate-800 bg-slate-900 p-4 text-sm leading-relaxed text-slate-300">
-        {{ item.description }}
-      </p>
+      <template v-if="!editing">
+        <section v-if="profileFacts.length" class="rounded-2xl border border-slate-800 bg-slate-900 p-4">
+          <h3 class="mb-3 text-sm font-semibold text-slate-200">基础档案</h3>
+          <div class="grid grid-cols-2 gap-2 sm:grid-cols-3">
+            <div v-for="([label, value]) in profileFacts" :key="label" class="min-w-0 rounded-xl bg-slate-800/70 px-3 py-2.5">
+              <p class="text-xs text-slate-500">{{ label }}</p>
+              <p class="mt-1 break-words font-semibold text-slate-100">{{ value }}</p>
+            </div>
+          </div>
+        </section>
+        <section v-if="item.price_amount != null || hasTariffs" class="min-w-0 rounded-2xl border border-sky-500/20 bg-slate-900 p-4">
+          <h3 class="mb-3 text-sm font-semibold text-slate-200">资费与课表</h3>
+          <p v-if="item.price_amount != null" class="mb-3 text-2xl font-bold text-sky-400">
+            {{ item.price_amount }} <span class="text-sm font-normal text-slate-400">{{ item.price_currency }}</span>
+          </p>
+          <div v-if="tariffs.p1?.length || tariffs.p2?.length" class="grid gap-2 sm:grid-cols-2">
+            <div v-for="([label, lines]) in [['1P 套餐', tariffs.p1], ['2P 套餐', tariffs.p2]]" :key="label" v-show="lines?.length"
+              class="min-w-0 rounded-xl border border-slate-700 bg-slate-950/50 p-3">
+              <p class="mb-2 text-xs font-semibold text-sky-300">{{ label }}</p>
+              <p v-for="line in lines || []" :key="line" class="break-words text-sm leading-relaxed text-slate-200">{{ line }}</p>
+            </div>
+          </div>
+          <div v-if="extraFees.length" class="mt-3 space-y-1 text-sm text-slate-400">
+            <p v-for="line in extraFees" :key="line" class="break-words">{{ line }}</p>
+          </div>
+          <div v-if="tariffs.cash_note?.length" class="mt-3 rounded-lg border border-amber-600/40 bg-amber-600/10 p-3 text-sm text-amber-200">
+            <p v-for="line in tariffs.cash_note" :key="line" class="break-words">{{ line }}</p>
+          </div>
+        </section>
+        <section v-if="attributes.services?.length" class="rounded-2xl border border-slate-800 bg-slate-900 p-4">
+          <h3 class="mb-3 text-sm font-semibold text-slate-200">服务与特色</h3>
+          <div class="flex flex-wrap gap-2">
+            <span v-for="line in attributes.services" :key="line" class="max-w-full break-words rounded-lg border border-violet-500/30 bg-violet-500/10 px-2.5 py-1.5 text-sm text-violet-200">{{ line }}</span>
+          </div>
+        </section>
+        <section v-if="attributes.restrictions?.length" class="rounded-2xl border border-amber-600/40 bg-amber-600/10 p-4">
+          <h3 class="mb-3 flex items-center gap-2 text-sm font-semibold text-amber-200"><ShieldAlert class="size-4" />服务禁忌与规范</h3>
+          <div class="flex flex-wrap gap-2">
+            <span v-for="line in attributes.restrictions" :key="line" class="max-w-full break-words rounded-lg border px-2.5 py-1.5 text-sm"
+              :class="line.startsWith('禁') ? 'border-rose-600/50 bg-rose-600/15 text-rose-200' : 'border-amber-600/40 bg-amber-600/10 text-amber-200'">{{ line }}</span>
+          </div>
+        </section>
+        <section class="rounded-2xl border border-slate-800 bg-slate-900 p-4 text-sm">
+          <h3 class="mb-3 font-semibold text-slate-200">联系与状态</h3>
+          <div class="space-y-2 text-slate-400">
+            <p>状态：{{ item.online_tier === 'online' ? '在线' : item.online_tier === 'recent' ? '近期活跃' : '未知' }}</p>
+            <p v-if="item.duty_label">签到：{{ item.duty_label === 'today' ? '今日签到' : '昨日签到' }}</p>
+            <p v-if="item.published_at">发布时间：{{ new Date(item.published_at).toLocaleString('zh-CN') }}</p>
+            <p class="break-words">联系方式：{{ session.isAdmin && item.contact_username ? `@${item.contact_username}` : '通过立即聊天联系' }}</p>
+          </div>
+          <div class="mt-3 flex flex-wrap gap-2">
+            <a v-if="item.bot_url" :href="item.bot_url" target="_blank" rel="noreferrer"
+              class="rounded-lg border border-violet-700/60 px-3 py-1.5 text-xs text-violet-300">联系 Bot</a>
+            <button @click="startChat" class="nx-grad hidden items-center gap-1.5 rounded-lg px-3 py-1.5 font-semibold text-white lg:flex">
+              <MessageCircle class="size-4" />立即聊天
+            </button>
+          </div>
+        </section>
+        <section v-if="session.isAdmin && (item.ocr_evidence?.length || Object.keys(item.evidence_json || {}).length)"
+          class="min-w-0 rounded-2xl border border-slate-700 bg-slate-900 p-4">
+          <button @click="showEvidence = !showEvidence" :aria-expanded="showEvidence"
+            class="flex w-full items-center justify-between text-sm font-semibold text-slate-200">
+            查看 OCR 证据 <ChevronDown class="size-4 transition" :class="showEvidence ? 'rotate-180' : ''" />
+          </button>
+          <div v-if="showEvidence" class="mt-4 space-y-4">
+            <div v-for="(entry, index) in item.ocr_evidence || []" :key="`${entry.media_path}-${index}`" class="min-w-0 rounded-xl bg-slate-950/60 p-3">
+              <p class="mb-2 break-all text-xs text-slate-400">{{ entry.media_path }} · 图像置信度 {{ entry.confidence == null ? '未知' : `${Math.round(entry.confidence * 100)}%` }}</p>
+              <div v-for="row in evidenceRows(entry)" :key="row.key" class="border-t border-slate-800 py-2 text-xs">
+                <p class="break-words text-slate-200">{{ row.key }}：{{ row.value }}</p>
+                <p v-if="row.line" class="mt-1 break-words text-slate-400">原文：{{ row.line }}<span v-if="row.score != null"> · {{ Math.round(row.score * 100) }}%</span></p>
+              </div>
+            </div>
+            <pre v-if="Object.keys(item.evidence_json || {}).length" class="max-h-60 overflow-auto whitespace-pre-wrap break-all rounded-xl bg-slate-950/60 p-3 text-xs text-slate-400">{{ JSON.stringify(item.evidence_json, null, 2) }}</pre>
+          </div>
+        </section>
+        <p v-if="session.isAdmin && item.description" class="whitespace-pre-wrap break-words rounded-xl border border-slate-800 bg-slate-900 p-4 text-sm leading-relaxed text-slate-300">{{ item.description }}</p>
+      </template>
       <div v-if="editing && editForm" class="space-y-3 rounded-xl border border-slate-800 bg-slate-900 p-4">
         <p class="text-xs leading-relaxed text-slate-500">自动识别与排序优先；这里的修改仅覆盖当前卡片。在线和签到状态仍由自动采集维护。</p>
         <label class="block space-y-1 text-sm"><span class="text-slate-400">昵称</span>
