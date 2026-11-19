@@ -8,6 +8,10 @@ from tempfile import TemporaryDirectory
 import asyncpg
 from PIL import Image, ImageDraw
 
+from app import db
+from app.api import ocr_review
+from app.api.auth import issue_token
+from app.config import get_settings
 from app.extractor import review_automation as automation
 
 
@@ -85,6 +89,12 @@ async def main():
 
         with TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
+            db._pool = pool
+            get_settings().media_dir = str(root)
+            reviewer_id = await pool.fetchval(
+                "INSERT INTO site_users(username,password_hash,is_admin) VALUES('fixture_review_admin','fixture',true) RETURNING id"
+            )
+            authorization = "Bearer " + issue_token(reviewer_id, True)[0]
             for i, name in enumerate(("photo.png", "other.png", "protected.png", "learned.png", "card.png")):
                 image = Image.new("RGB", (96, 96), (225, 80, 20))
                 canvas = ImageDraw.Draw(image)
@@ -100,9 +110,9 @@ async def main():
             learning = await asset("learned.png", "other", 0.4)
             replica = await asset("replica.png", "other", 0.4)
             document = await asset("card.png", "info_card", 0.999, '{"stage_name":"Fixture"}', "昵称: Fixture")
-            async with pool.acquire() as conn, conn.transaction():
-                await conn.execute("INSERT INTO ocr_classification_labels(ocr_id,category_code,label_source) VALUES($1,'profile_photo','manual')", learning)
-                await automation.record_learning(conn, learning, automation.fingerprint(root, "learned.png"))
+            assert (await ocr_review.decide(
+                learning, ocr_review.DecisionBody(decision="not_card", class_code="profile_photo"), authorization,
+            ))["ok"]
             assert await automation.apply_ocr(pool, root, photo, "photo.png")
             assert not await automation.apply_ocr(pool, root, other, "other.png")
             assert not await automation.apply_ocr(pool, root, protected, "protected.png")
@@ -111,6 +121,12 @@ async def main():
             assert not await automation.apply_ocr(pool, root, photo, "photo.png")
             assert await pool.fetchval("SELECT count(*) FROM ocr_classification_labels WHERE ocr_id=$1", replica) == 0
             assert await pool.fetchval("SELECT reason FROM nexus_auto_ocr_decisions WHERE ocr_id=$1", replica) == "human_exact_image"
+            automatic = await ocr_review.queue(status="automatic", media_path=[])
+            assert automatic["total"] == 3 and all(item["auto_reason"] for item in automatic["items"])
+            assert (await ocr_review.undo_automatic_ocr(photo, authorization))["ok"]
+            assert await pool.fetchval("SELECT review_status FROM listing_media_ocr WHERE id=$1", photo) == "pending"
+            assert not await automation.apply_ocr(pool, root, photo, "photo.png")
+            assert (await ocr_review.automatic_summary())["undone_count"] == 1
             assert await pool.fetchval("SELECT status FROM listings WHERE id=$1", first) == "published"
         print("REVIEW_AUTOMATION_GATE_OK")
 

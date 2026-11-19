@@ -317,16 +317,21 @@ async function undoAutomaticGroup(group) {
   }
 }
 
-watch(selectedDuplicate, () => { imageComparison.value = null; });
+const selectedPairKey = computed(() => {
+  const pair = selectedDuplicate.value;
+  return pair ? `${pair.left.id}:${pair.right.id}` : null;
+});
+watch(selectedPairKey, () => { imageComparison.value = null; });
 
 async function compareDuplicateImages() {
   const pair = selectedDuplicate.value;
+  const key = selectedPairKey.value;
   imageComparison.value = { loading: true };
   try {
     const result = await api(`/api/admin/review/duplicates/${pair.left.id}/${pair.right.id}/evidence`);
-    if (selectedDuplicate.value === pair) imageComparison.value = result;
+    if (selectedPairKey.value === key) imageComparison.value = result;
   } catch (error) {
-    if (selectedDuplicate.value === pair) imageComparison.value = { error: error.message };
+    if (selectedPairKey.value === key) imageComparison.value = { error: error.message };
   }
 }
 async function loadIdentityGroups() {
