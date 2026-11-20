@@ -3019,6 +3019,7 @@ CREATE TABLE IF NOT EXISTS listing_media_ocr (
     confidence NUMERIC(4, 3) NOT NULL DEFAULT 0,
     engine_version VARCHAR(64),
     error_text VARCHAR(500),
+    file_sha256 VARCHAR(64),
     attempts INT NOT NULL DEFAULT 0,
     reviewed_by BIGINT,
     reviewed_at TIMESTAMPTZ,
@@ -3030,6 +3031,9 @@ CREATE INDEX IF NOT EXISTS idx_listing_media_ocr_queue
     ON listing_media_ocr(review_status, status, id);
 CREATE INDEX IF NOT EXISTS idx_listing_media_ocr_listing
     ON listing_media_ocr(listing_id, review_status);
+-- dedup cache: jump straight to a successful recognition of the same bytes
+CREATE INDEX IF NOT EXISTS idx_listing_media_ocr_sha256
+    ON listing_media_ocr(file_sha256) WHERE status = 'done';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_listing_media_ocr_profile_media
     ON listing_media_ocr(listing_id, media_path)
     WHERE raw_id IS NULL AND listing_id IS NOT NULL;

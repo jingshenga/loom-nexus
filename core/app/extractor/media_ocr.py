@@ -1,4 +1,5 @@
 """Local OCR triage for image-based listing cards."""
+import hashlib
 import logging
 import json
 import re
@@ -21,8 +22,31 @@ SQL_RESET = sqlres.load("media_ocr_reset_processing.sql")
 SQL_PROFILE_DISCOVER = sqlres.load("profile_collection_ocr_discover.sql")
 SQL_PROFILE_FLAGS = sqlres.load("profile_collection_ocr_flags.sql")
 SQL_ENQUEUE_RAW = sqlres.load("media_ocr_enqueue_raw.sql")
+SQL_CACHE_LOOKUP = sqlres.load("media_ocr_cache_lookup.sql")
 
 ENGINE_VERSION = "rapidocr-local-v1"
+
+
+def calc_file_sha256(path: Path) -> str:
+    """SHA-256 of a media file, streamed in 64 KiB chunks (files can be
+    large videos; nothing is ever loaded fully into memory)."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while chunk := handle.read(65536):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _loads_object(value) -> dict:
+    """jsonb columns arrive as raw text through asyncpg unless a codec
+    is registered; anything non-dict degrades to {}."""
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 _DECORATIVE = re.compile(
     "[\\U0001F000-\\U0001FAFF\\U00002600-\\U000027BF]"
     "|[\\u200b-\\u200f\\ufeff]"
@@ -366,6 +390,44 @@ class MediaOcrProcessor:
         uniformity, dimensions = image_signals(str(media_path))
         model_row = await self._load_active_classifier()
         signals = self._signals([], face_score, uniformity, dimensions)
+        # SHA-256 dedup cache: the same bytes forwarded again must never
+        # pay for a second RapidOCR pass. Lookup failures degrade to a
+        # normal engine run — the cache is a pure optimisation.
+        file_sha256 = None
+        try:
+            file_sha256 = calc_file_sha256(media_path)
+        except OSError as exc:
+            logger.warning("sha256 unavailable for image %s: %s", row["id"], exc)
+        if file_sha256:
+            try:
+                cached = await self._pool.fetchrow(SQL_CACHE_LOOKUP, file_sha256)
+            except Exception:
+                logger.exception(
+                    "OCR cache lookup failed for image %s; falling back to engine", row["id"],
+                )
+                cached = None
+            if cached:
+                fields = _loads_object(cached["fields_json"])
+                evidence = _loads_object(cached["evidence_json"])
+                evidence["ocr_cache_hit"] = True
+                evidence["cached_sha256"] = file_sha256
+                classification = cached["classification"]
+                confidence = float(cached["confidence"] or 0.0)
+                if classification in ("info_card", "uncertain"):
+                    review_status, visibility = "pending", "admin"
+                else:
+                    review_status, visibility = "not_required", "public"
+                await self._finish(
+                    row, "done", classification, review_status, visibility,
+                    cached["raw_text"], cached["normalized_text"], fields, evidence,
+                    confidence, None, cached["classifier_version_id"], signals,
+                    file_sha256=file_sha256,
+                )
+                logger.info(
+                    "OCR cache hit for image %s (sha256=%s), skipped engine pass",
+                    row["id"], file_sha256,
+                )
+                return
         try:
             document = await self._ocr.read_document(str(media_path))
             if not document.get("ok"):
@@ -402,7 +464,7 @@ class MediaOcrProcessor:
                     row, "done", classification, review_status, visibility,
                     profile_text, normalize_ocr_text(profile_text), profile_fields,
                     profile_evidence, confidence, None,
-                    version_id, signals,
+                    version_id, signals, file_sha256=file_sha256,
                 )
                 return
             if model_row:
@@ -422,7 +484,7 @@ class MediaOcrProcessor:
             await self._finish(
                 row, "done", classification, review_status, visibility,
                 raw_text, normalized, fields, evidence, confidence, None,
-                version_id, signals,
+                version_id, signals, file_sha256=file_sha256,
             )
             logger.info(
                 "OCR image %s -> %s (chars=%d labels=%d confidence=%.2f)",
@@ -492,7 +554,7 @@ class MediaOcrProcessor:
     async def _finish(
         self, row, status, classification, review_status, visibility,
         raw_text, normalized, fields, evidence, confidence, error,
-        version_id=None, signals=None,
+        version_id=None, signals=None, file_sha256: str | None = None,
     ):
         import json
 
@@ -502,6 +564,7 @@ class MediaOcrProcessor:
             json.dumps(evidence, ensure_ascii=False), confidence, ENGINE_VERSION, error,
             classification, confidence, version_id,
             json.dumps(signals or {}, ensure_ascii=False),
+            file_sha256,
         )
         if row["profile_result_id"] is not None:
             await self._pool.fetch(

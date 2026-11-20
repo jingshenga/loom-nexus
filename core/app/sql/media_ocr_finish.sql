@@ -13,5 +13,6 @@ SET status = $2,
     predicted_confidence = $13,
     classifier_version_id = $14,
     classifier_signals_json = $15::jsonb,
+    file_sha256 = COALESCE($16, file_sha256),
     updated_at = NOW()
 WHERE id = $1;
