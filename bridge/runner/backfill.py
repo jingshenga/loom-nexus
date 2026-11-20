@@ -23,7 +23,7 @@ import os
 
 import asyncpg
 
-from runner import hub, sqlres
+from runner import floodgate, hub, sqlres
 
 logger = logging.getLogger("nexus-bridge.backfill")
 
@@ -35,6 +35,35 @@ SQL_SET_MEDIA = sqlres.load("set_media.sql")
 SQL_RESET_PRICE = sqlres.load("reset_missing_price.sql")
 SQL_RAW_IDS = sqlres.load("raw_ids_for_source.sql")
 SQL_WATERMARK = sqlres.load("source_watermark.sql")
+SQL_LIMIT_SET = sqlres.load("gateway_limit_set.sql")
+
+# unified proactive floodgate: history/resolve/media buckets + the
+# shared account cooldown breaker (a FloodWait tripped by the sender
+# also pauses backfill for that account, and vice versa)
+GATE = floodgate.GATE
+
+
+class BackfillCooling(Exception):
+    """Raised when an official FloodWait tripped the account breaker;
+    carries the effective cooldown seconds."""
+
+    def __init__(self, wait_s: float):
+        super().__init__(f"cooling {wait_s}s")
+        self.wait_s = wait_s
+
+
+async def _pace(account_id, category: str) -> None:
+    """Await the floodgate for this account/category, then record the
+    call timestamp so the next delay is computed against it."""
+    delay = GATE.delay_for(category, account_id)
+    if delay > 0:
+        logger.debug(
+            "floodgate %s: waiting %.2fs before next call (account=%s)",
+            category, delay, account_id,
+        )
+        await asyncio.sleep(delay)
+    GATE.record(category, account_id)
+
 
 POLL_S = float(os.getenv("NEXUS_BRIDGE_BACKFILL_INTERVAL", "3"))
 MEDIA_DIR = os.getenv("NEXUS_MEDIA_DIR", "/app/data/media")
@@ -43,9 +72,13 @@ MAX_MEDIA_BYTES = int(os.getenv("NEXUS_BRIDGE_MEDIA_MAX_MB", "50")) * 1024 * 102
 
 async def save_media(
     msg, source_id: int, stable_prefix: str | None = None,
-    force_kind: str | None = None,
+    force_kind: str | None = None, account_id=None,
 ) -> list:
-    """Download photo/video for one message; returns media_json items."""
+    """Download photo/video for one message; returns media_json items.
+    Downloads pass the `media` floodgate bucket so a big album cannot
+    saturate NAS disk/bandwidth in one burst."""
+    if account_id is not None:
+        await _pace(account_id, "media")
     try:
         is_photo = bool(msg.photo)
         is_video = bool(msg.video or msg.video_note)
@@ -117,13 +150,17 @@ def order_media(media: list) -> list:
 
 
 async def _fetch_history(client, peer_id: int, limit: int, source_id: int,
-                         offset_id: int = 0):
+                         offset_id: int = 0, account_id=None):
     """[(msg_id, sender, grouped, text, date, media_json)] oldest first,
     walking BACKWARD from offset_id (Telethon semantics: offset_id is
     the exclusive upper bound — messages older than it are returned).
-    Album parts sharing a grouped_id are MERGED into one row anchored
-    on the caption-bearing part, carrying all photos + videos."""
+    Both the entity resolve and every page fetch pass the floodgate
+    (`resolve` / `history` buckets) so deep walks stay smooth. Album
+    parts sharing a grouped_id are MERGED into one row anchored on the
+    caption-bearing part, carrying all photos + videos."""
+    await _pace(account_id, "resolve")
     entity = await client.get_entity(peer_id)
+    await _pace(account_id, "history")
     messages = list(reversed(
         (await client.get_messages(entity, limit=limit, offset_id=offset_id)) or []
     ))
@@ -133,7 +170,7 @@ async def _fetch_history(client, peer_id: int, limit: int, source_id: int,
         msg = messages[i]
         gid = getattr(msg, "grouped_id", None)
         if not gid:
-            media = await save_media(msg, source_id)
+            media = await save_media(msg, source_id, account_id=account_id)
             text = (msg.raw_text or "").strip()
             if text or media:
                 rows.append((msg.id, msg.sender_id, None, text, msg.date, order_media(media)))
@@ -146,7 +183,7 @@ async def _fetch_history(client, peer_id: int, limit: int, source_id: int,
         anchor = next((m for m in group if (m.raw_text or "").strip()), group[0])
         media = []
         for part in group:
-            media.extend(await save_media(part, source_id))
+            media.extend(await save_media(part, source_id, account_id=account_id))
         text = (anchor.raw_text or "").strip()
         if text or media:
             rows.append(
@@ -170,9 +207,16 @@ async def _resolve_offset(pool, job) -> int:
 
 async def _backfill_history(pool, job, client) -> int:
     offset = await _resolve_offset(pool, job)
-    history = await _fetch_history(
-        client, job["peer_id"], job["msg_limit"], job["source_id"], offset,
-    )
+    try:
+        history = await _fetch_history(
+            client, job["peer_id"], job["msg_limit"], job["source_id"], offset,
+            account_id=job.get("account_id"),
+        )
+    except Exception as exc:
+        if floodgate.is_flood_wait(exc):
+            wait_s = await _cool_on_flood_wait(pool, job, exc)
+            raise BackfillCooling(wait_s) from exc
+        raise
     inserted = 0
     for msg_id, sender, grouped, text, date, media in history:
         rows = await pool.fetch(
@@ -189,19 +233,46 @@ async def _backfill_history(pool, job, client) -> int:
     return inserted
 
 
+async def _cool_on_flood_wait(pool, job, exc) -> float:
+    """Official FloodWait during a backfill call: trip the shared
+    account breaker (sender pauses too), persist the cooling flag via
+    gateway_limit_set, and report back — the job itself ends as
+    `failed` with a cooling note, so nothing retries blindly while the
+    ban window is live."""
+    account_id = job.get("account_id")
+    wait_s = GATE.cooldown.cool(account_id, floodgate.flood_wait_seconds(exc))
+    try:
+        await pool.fetch(SQL_LIMIT_SET, account_id, "cooldown")
+    except Exception:
+        logger.exception("failed to persist cooldown flag (account=%s)", account_id)
+    logger.warning(
+        "backfill job %s -> cooling (account=%s waits %ss after FloodWait)",
+        job["job_id"], account_id, wait_s,
+    )
+    return wait_s
+
+
 async def _backfill_media(pool, job, client) -> int:
     """Attach media to already-stored messages of the source."""
     stored = await pool.fetch(SQL_RAW_IDS, job["source_id"], job["msg_limit"])
     if not stored:
         return 0
-    entity = await client.get_entity(job["peer_id"])
-    ids = [r["platform_msg_id"] for r in stored]
-    messages = await client.get_messages(entity, ids=ids)
+    try:
+        await _pace(job.get("account_id"), "resolve")
+        entity = await client.get_entity(job["peer_id"])
+        await _pace(job.get("account_id"), "history")
+        ids = [r["platform_msg_id"] for r in stored]
+        messages = await client.get_messages(entity, ids=ids)
+    except Exception as exc:
+        if floodgate.is_flood_wait(exc):
+            wait_s = await _cool_on_flood_wait(pool, job, exc)
+            raise BackfillCooling(wait_s) from exc
+        raise
     updated = 0
     for row, msg in zip(stored, messages):
         if msg is None:
             continue
-        media = await save_media(msg, job["source_id"])
+        media = await save_media(msg, job["source_id"], account_id=job.get("account_id"))
         if not media:
             continue
         result = await pool.fetch(SQL_SET_MEDIA, row["id"], json.dumps(media))
@@ -239,6 +310,16 @@ async def run_backfill(pool: asyncpg.Pool, stop: asyncio.Event) -> None:
                         "backfill job %s (%s) done: %d item(s) source=%s",
                         job["job_id"], job["job_mode"], count, job["source_id"],
                     )
+                except BackfillCooling as exc:
+                    # official FloodWait: the account breaker is already
+                    # tripped and gateway_limits carries the cooling flag;
+                    # the job parks as failed instead of retrying into a
+                    # heavier ban — re-run it manually after the cooldown
+                    await pool.fetch(
+                        SQL_FINISH, job["job_id"], False, 0,
+                        f"{exc} (official FloodWait; account tripped)",
+                    )
+                    logger.warning("backfill job %s parked: %s", job["job_id"], exc)
                 except Exception as exc:
                     await pool.fetch(SQL_FINISH, job["job_id"], False, count, str(exc))
                     logger.warning("backfill job %s failed: %s", job["job_id"], exc)

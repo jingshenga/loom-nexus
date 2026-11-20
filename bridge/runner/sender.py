@@ -30,12 +30,11 @@ import logging
 import os
 import random
 import re
-import time
 
 import asyncpg
 from PIL import Image
 
-from runner import sqlres
+from runner import floodgate, sqlres
 
 logger = logging.getLogger("nexus-bridge.sender")
 
@@ -68,90 +67,23 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-class SendRateLimiter:
-    """Per-account outbound pacing.
+# ---------------------------------------------------------------------------
+# outbound pacing: rate limiter + FloodWait cooldown
+#
+# The implementations moved to floodgate.py — the unified multi-category
+# gate now also paces history backfill, entity resolves and media
+# downloads, with one shared account cooldown breaker per process. The
+# legacy names are re-exported here so old imports and tests keep
+# working unchanged.
+# ---------------------------------------------------------------------------
 
-    Two gates, both sliding-window on a monotonic clock (injectable for
-    tests): a minimum gap between consecutive sends and a per-minute
-    send cap. A bursty outbox backlog therefore drains at a steady,
-    platform-safe pace instead of triggering 429s."""
+SendRateLimiter = floodgate.SendRateLimiter
+AccountCooldown = floodgate.AccountCooldown
+_is_flood_wait = floodgate.is_flood_wait
+_flood_wait_seconds = floodgate.flood_wait_seconds
 
-    def __init__(self, min_gap_s=None, per_minute=None, clock=None):
-        self._min_gap = (
-            float(min_gap_s) if min_gap_s is not None
-            else _env_float("NEXUS_BRIDGE_SEND_MIN_GAP_S", 3.0)
-        )
-        self._per_minute = (
-            int(per_minute) if per_minute is not None
-            else int(_env_float("NEXUS_BRIDGE_SEND_PER_MINUTE", 20))
-        )
-        self._clock = clock or time.monotonic
-        self._last: dict = {}
-        self._window: dict = {}
-
-    def delay_for(self, account_id) -> float:
-        """Seconds the account must still wait before its next send."""
-        now = self._clock()
-        stamps = [
-            stamp for stamp in self._window.get(account_id, [])
-            if now - stamp < 60.0
-        ]
-        self._window[account_id] = stamps
-        delay = 0.0
-        if self._per_minute > 0 and len(stamps) >= self._per_minute:
-            delay = max(delay, 60.0 - (now - stamps[0]))
-        last = self._last.get(account_id)
-        if last is not None and self._min_gap > 0:
-            delay = max(delay, self._min_gap - (now - last))
-        return max(0.0, delay)
-
-    def record(self, account_id) -> None:
-        """Mark a send as happened right now."""
-        now = self._clock()
-        self._last[account_id] = now
-        self._window.setdefault(account_id, []).append(now)
-
-
-class AccountCooldown:
-    """FloodWait-driven account cooldown registry.
-
-    While an account is cooling, the sender loop refuses to claim any
-    of its jobs — that is what turns an official FloodWait into a
-    clean pause instead of a retry storm."""
-
-    def __init__(self, clock=None):
-        self._clock = clock or time.monotonic
-        self._until: dict = {}
-
-    def cool(self, account_id, seconds) -> float:
-        """Put the account on cooldown; returns the effective seconds."""
-        effective = max(1, int(seconds))
-        deadline = self._clock() + effective
-        self._until[account_id] = max(self._until.get(account_id, 0), deadline)
-        return effective
-
-    def remaining(self, account_id) -> float:
-        return max(0.0, self._until.get(account_id, 0) - self._clock())
-
-    def clear(self, account_id) -> None:
-        self._until.pop(account_id, None)
-
-
-# telethon raises FloodWaitError; pyrogram FloodWait carries .value —
-# same convention as runner.duty_collection
-def _is_flood_wait(exc) -> bool:
-    return type(exc).__name__ in {"FloodWaitError", "FloodPremiumWaitError", "FloodWait"}
-
-
-def _flood_wait_seconds(exc) -> int:
-    for attr in ("seconds", "value"):
-        raw = getattr(exc, attr, None)
-        try:
-            if raw:
-                return max(1, int(raw))
-        except (TypeError, ValueError):
-            continue
-    return 1
+RATE_LIMITER = floodgate.GATE.gate("send")
+COOLDOWN = floodgate.GATE.cooldown
 
 
 # shared state for the sender loop (single asyncio process by design)
