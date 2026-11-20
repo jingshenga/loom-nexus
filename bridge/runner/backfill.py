@@ -55,8 +55,9 @@ class BackfillCooling(Exception):
 async def _pace(account_id, category: str) -> None:
     """Await the floodgate for this account/category, then record the
     call timestamp so the next delay is computed against it."""
-    delay = GATE.delay_for(category, account_id)
-    if delay > 0:
+    if account_id is None:
+        return
+    while (delay := GATE.delay_for(category, account_id)) > 0:
         logger.debug(
             "floodgate %s: waiting %.2fs before next call (account=%s)",
             category, delay, account_id,
@@ -77,8 +78,6 @@ async def save_media(
     """Download photo/video for one message; returns media_json items.
     Downloads pass the `media` floodgate bucket so a big album cannot
     saturate NAS disk/bandwidth in one burst."""
-    if account_id is not None:
-        await _pace(account_id, "media")
     try:
         is_photo = bool(msg.photo)
         is_video = bool(msg.video or msg.video_note)
@@ -108,6 +107,8 @@ async def save_media(
             media_id = getattr(media_obj, "id", None) or msg.id
             ext = getattr(msg.file, "ext", None) or (".mp4" if is_video else ".jpg")
             target = os.path.join(target_dir, f"{stable_prefix}_{media_id}{ext}")
+        if account_id is not None:
+            await _pace(account_id, "media")
         saved = await msg.download_media(file=target)
         if not saved:
             return []
@@ -120,6 +121,8 @@ async def save_media(
             [{"kind": "photo" if is_photo else "video", "path": rel}]
         )
     except Exception as exc:
+        if account_id is not None and floodgate.is_flood_wait(exc):
+            raise
         logger.warning("media download failed (msg %s): %s", msg.id, exc)
         return []
 
@@ -263,21 +266,21 @@ async def _backfill_media(pool, job, client) -> int:
         await _pace(job.get("account_id"), "history")
         ids = [r["platform_msg_id"] for r in stored]
         messages = await client.get_messages(entity, ids=ids)
+        updated = 0
+        for row, msg in zip(stored, messages):
+            if msg is None:
+                continue
+            media = await save_media(msg, job["source_id"], account_id=job.get("account_id"))
+            if not media:
+                continue
+            result = await pool.fetch(SQL_SET_MEDIA, row["id"], json.dumps(media))
+            if result[0]["updated"]:
+                updated += 1
     except Exception as exc:
         if floodgate.is_flood_wait(exc):
             wait_s = await _cool_on_flood_wait(pool, job, exc)
             raise BackfillCooling(wait_s) from exc
         raise
-    updated = 0
-    for row, msg in zip(stored, messages):
-        if msg is None:
-            continue
-        media = await save_media(msg, job["source_id"], account_id=job.get("account_id"))
-        if not media:
-            continue
-        result = await pool.fetch(SQL_SET_MEDIA, row["id"], json.dumps(media))
-        if result[0]["updated"]:
-            updated += 1
     requeued = await pool.fetch(SQL_RESET_PRICE, job["source_id"])
     logger.info(
         "media pass: %d message(s) gained media, %d requeued for OCR (source=%s)",

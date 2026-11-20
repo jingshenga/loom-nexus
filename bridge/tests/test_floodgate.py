@@ -281,5 +281,27 @@ class BackfillPacingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(media_gate._window.get("acc", [])), 1)
 
 
+    async def test_official_flood_wait_during_media_download_trips_account(self):
+        from unittest.mock import AsyncMock, patch
+
+        import tempfile
+
+        error = type("FloodWaitError", (Exception,), {"seconds": 90})()
+        photo = msg(100, "photo")
+        photo.photo = SimpleNamespace(id=77)
+        photo.download_media = AsyncMock(side_effect=error)
+        client = FakeClient([photo])
+        pool = FakePool()
+        with tempfile.TemporaryDirectory() as directory, patch.object(backfill, "MEDIA_DIR", directory):
+            with self.assertRaises(backfill.BackfillCooling):
+                await backfill._backfill_history(pool, {
+                    "job_id": 9, "peer_id": -100, "msg_limit": 1, "source_id": 1,
+                    "account_id": "acc", "offset_id": 0,
+                }, client)
+        photo.download_media.assert_awaited_once()
+        self.assertEqual(self.gate.cooldown_remaining("acc"), 90)
+        self.assertEqual(pool.limit_sets, [("acc", "cooldown")])
+
+
 if __name__ == "__main__":
     unittest.main()
