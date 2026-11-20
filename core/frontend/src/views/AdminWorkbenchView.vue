@@ -325,6 +325,20 @@ onUnmounted(() => window.removeEventListener("keydown", onKey));
               : card.original_text_source === 'profile' ? '资料采集原文' : 'Telegram 原文' }}
           </h3>
           <p class="mb-2 break-words text-xs text-slate-400">{{ [card.source_title, card.original_posted_at ? dateTime(card.original_posted_at) : ""].filter(Boolean).join(" · ") }}</p>
+          <!-- 转发链溯源徽标：来自上游母频的原帖出处 -->
+          <p v-if="card.forward_origin"
+            class="mb-2 flex flex-wrap items-center gap-1.5 rounded-lg border border-violet-600/40 bg-violet-600/10 px-2.5 py-1.5 text-xs text-violet-300">
+            <span>📢 转发自:
+              <span class="font-semibold">
+                {{ card.forward_origin.from_name || card.forward_origin.from_id || "未知来源" }}
+              </span>
+              <span v-if="card.forward_origin.from_type" class="text-violet-400/70">({{ card.forward_origin.from_type }})</span>
+              (原帖 #{{ card.forward_origin.channel_post || '-' }})
+            </span>
+            <span v-if="card.forward_origin.post_author" class="text-violet-400/80">
+              作者: {{ card.forward_origin.post_author }}
+            </span>
+          </p>
           <p v-if="card.original_text" class="whitespace-pre-wrap rounded-lg bg-slate-950 p-3 text-sm leading-6 text-slate-200 [overflow-wrap:anywhere]">
             <template v-for="(part, index) in messageParts" :key="index"><mark v-if="part.highlight" class="rounded bg-amber-300/20 text-amber-200">{{ part.text }}</mark><template v-else>{{ part.text }}</template></template>
           </p>

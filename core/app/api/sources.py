@@ -5,7 +5,7 @@ from; dialogs come from the bridge's dialog_cache refresh.
 """
 import json
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from app import db, llm, sqlres
@@ -33,6 +33,7 @@ SQL_BACKUP_REMOVE_PRIMARY = sqlres.load("source_backup_remove_primary.sql")
 SQL_VISIBLE_DIALOG_ACCOUNTS = sqlres.load("source_dialog_accounts.sql")
 SQL_WATERMARK = sqlres.load("source_watermark.sql")
 SQL_PROFILE_GET = sqlres.load("source_profile_get.sql")
+SQL_FORWARD_ORIGINS = sqlres.load("forward_origins.sql")
 
 
 def _pool():
@@ -105,6 +106,35 @@ async def list_dialogs() -> dict:
                 "title": r["title"],
                 "username": r["username"],
                 "kind": r["kind"],
+            }
+            for r in rows
+        ]
+    }
+
+
+@router.get("/forward-origins")
+async def forward_origins(
+    limit: int = Query(50, ge=1, le=200),
+) -> dict:
+    """上游母频发现：聚合 raw_messages 里的转发链元数据，按被转发频次
+    排行。is_already_source 标记该母频是否已被纳管为采集源（peer_id
+    匹配裸 channel id 或 -100 前缀两种形态），空数据自然降级为空列表。"""
+    pool = _pool()
+    rows = await pool.fetch(SQL_FORWARD_ORIGINS, limit)
+    return {
+        "items": [
+            {
+                "from_id": r["from_id"],
+                "from_name": r["from_name"],
+                "from_type": r["from_type"],
+                "forward_count": int(r["forward_count"]),
+                "source_count": int(r["source_count"]),
+                "latest_forwarded_at": (
+                    r["latest_forwarded_at"].isoformat()
+                    if r["latest_forwarded_at"] else None
+                ),
+                "is_already_source": bool(r["is_already_source"]),
+                "known_title": r["known_title"],
             }
             for r in rows
         ]

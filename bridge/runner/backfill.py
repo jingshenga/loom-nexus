@@ -23,7 +23,7 @@ import os
 
 import asyncpg
 
-from runner import floodgate, hub, sqlres
+from runner import floodgate, forward_info, hub, sqlres
 
 logger = logging.getLogger("nexus-bridge.backfill")
 
@@ -176,7 +176,10 @@ async def _fetch_history(client, peer_id: int, limit: int, source_id: int,
             media = await save_media(msg, source_id, account_id=account_id)
             text = (msg.raw_text or "").strip()
             if text or media:
-                rows.append((msg.id, msg.sender_id, None, text, msg.date, order_media(media)))
+                rows.append((
+                    msg.id, msg.sender_id, None, text, msg.date,
+                    order_media(media), forward_info.extract_forward_info(msg),
+                ))
             i += 1
             continue
         group = []
@@ -184,14 +187,24 @@ async def _fetch_history(client, peer_id: int, limit: int, source_id: int,
             group.append(messages[i])
             i += 1
         anchor = next((m for m in group if (m.raw_text or "").strip()), group[0])
+        fwd_from = next(
+            (
+                info for info in (
+                    forward_info.extract_forward_info(part) for part in group
+                )
+                if info
+            ),
+            None,
+        )
         media = []
         for part in group:
             media.extend(await save_media(part, source_id, account_id=account_id))
         text = (anchor.raw_text or "").strip()
         if text or media:
-            rows.append(
-                (anchor.id, anchor.sender_id, gid, text, anchor.date, order_media(media)),
-            )
+            rows.append((
+                anchor.id, anchor.sender_id, gid, text, anchor.date,
+                order_media(media), fwd_from,
+            ))
     return rows
 
 
@@ -221,10 +234,11 @@ async def _backfill_history(pool, job, client) -> int:
             raise BackfillCooling(wait_s) from exc
         raise
     inserted = 0
-    for msg_id, sender, grouped, text, date, media in history:
+    for msg_id, sender, grouped, text, date, media, fwd_from in history:
         rows = await pool.fetch(
             SQL_APPEND, job["source_id"], msg_id, sender, grouped,
             text, date, json.dumps(media),
+            json.dumps(fwd_from, ensure_ascii=False) if fwd_from else None,
         )
         if rows[0]["raw_id"] is not None:
             inserted += 1

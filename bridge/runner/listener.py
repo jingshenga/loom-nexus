@@ -88,7 +88,7 @@ def order_media(media: list) -> list:
 class _Album:
     """Buffered album group keyed by (source_id, grouped_id)."""
 
-    __slots__ = ("anchor_msg_id", "sender_peer_id", "posted_at", "texts", "media")
+    __slots__ = ("anchor_msg_id", "sender_peer_id", "posted_at", "texts", "media", "fwd_from")
 
     def __init__(self, anchor_msg_id, sender_peer_id, posted_at):
         self.anchor_msg_id = anchor_msg_id
@@ -96,6 +96,7 @@ class _Album:
         self.posted_at = posted_at
         self.texts = []
         self.media = []
+        self.fwd_from = None
 
 
 class IngestPipeline:
@@ -114,11 +115,11 @@ class IngestPipeline:
         return rows[0]["source_id"]
 
     async def accept(self, source_id, platform_msg_id, sender_peer_id,
-                     grouped_id, text, media, posted_at):
+                     grouped_id, text, media, posted_at, fwd_from=None):
         if grouped_id is None:
             raw_id = await self._persist(
                 source_id, platform_msg_id, sender_peer_id, None,
-                [text or ""], media or [], posted_at,
+                [text or ""], media or [], posted_at, fwd_from,
             )
             self.standalone_stored += 1
             logger.info("standalone stored -> raw id=%s", raw_id)
@@ -130,6 +131,9 @@ class IngestPipeline:
         if album is None:
             album = self._albums[key] = _Album(platform_msg_id, sender_peer_id, posted_at)
             self._deadlines[key] = now + HARD_CAP_S
+        if fwd_from and album.fwd_from is None:
+            # first part carrying forward lineage anchors the album
+            album.fwd_from = fwd_from
         if text and text not in album.texts:
             album.texts.append(text)
         if media:
@@ -162,7 +166,7 @@ class IngestPipeline:
             return
         raw_id = await self._persist(
             key[0], album.anchor_msg_id, album.sender_peer_id, key[1],
-            album.texts, order_media(album.media), album.posted_at,
+            album.texts, order_media(album.media), album.posted_at, album.fwd_from,
         )
         self.albums_merged += 1
         logger.info(
@@ -176,11 +180,12 @@ class IngestPipeline:
             await self.flush_album(key)
 
     async def _persist(self, source_id, platform_msg_id, sender_peer_id,
-                       grouped_id, texts, media, posted_at):
+                       grouped_id, texts, media, posted_at, fwd_from=None):
         merged_text = "\n".join(t for t in texts if t)
         rows = await self._pool.fetch(
             SQL_APPEND_RAW, source_id, platform_msg_id, sender_peer_id,
             grouped_id, merged_text, json.dumps(media), posted_at,
+            json.dumps(fwd_from, ensure_ascii=False) if fwd_from else None,
         )
         raw_id = rows[0]["raw_id"]
         await self._pool.fetch(SQL_ADVANCE_SOURCE, source_id, platform_msg_id)

@@ -20,9 +20,65 @@ async function loadAll() {
     sources.value.map((s) => [s.id, (s.backup_accounts || []).map((a) => String(a.id))]),
   );
   dialogs.value = (await api("/api/admin/sources/dialogs")).items;
+  loadOrigins();
 }
 
 const boundPeerIds = () => new Set(sources.value.map((s) => s.peer_id));
+
+// ---- 上游母频发现：转发链聚合排行 + 一键纳管 ----
+
+const forwardOrigins = ref([]);
+const originAccountId = ref(null);
+
+async function loadOrigins() {
+  try {
+    forwardOrigins.value = (await api("/api/admin/sources/forward-origins?limit=50")).items;
+  } catch {
+    forwardOrigins.value = [];  // 表未迁移/旧库：面板静默降级
+  }
+  if (!originAccountId.value) {
+    originAccountId.value = data.value?.accounts?.[0]?.id || null;
+  }
+}
+
+const originPeerId = (origin) => Number(`-100${origin.from_id}`);
+const originTitle = (origin) => origin.from_name || origin.known_title || `频道 ${origin.from_id}`;
+const originBound = (origin) => sources.value.some(
+  (s) => String(s.peer_id) === String(originPeerId(origin)) || String(s.peer_id) === String(origin.from_id),
+);
+
+async function adoptOrigin(origin) {
+  if (!originAccountId.value) {
+    notify("请先选择用于监听该母频的网关账号");
+    return;
+  }
+  try {
+    const r = await api("/api/admin/sources", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        peer_id: originPeerId(origin),
+        title: originTitle(origin),
+        username: null,
+        account_id: originAccountId.value,
+      }),
+    });
+    notify(`已纳管母频「${originTitle(origin)}」为采集来源#${r.source_id}`);
+    await loadAll();
+  } catch (e) {
+    notify(`纳管失败: ${String(e.message).slice(0, 70)}`);
+  }
+}
+
+async function copyOriginId(origin) {
+  const text = String(originPeerId(origin));
+  try {
+    await navigator.clipboard.writeText(text);
+    notify(`已复制母频 ID：${text}`);
+  } catch {
+    notify(`母频 ID：${text}（复制失败，请手动记录）`);
+  }
+}
 const backupCandidates = (s) => {
   const visible = new Set(dialogs.value.filter((d) => d.peer_id === s.peer_id).map((d) => String(d.account_id)));
   const selected = new Set(backupSelections.value[s.id] || []);
@@ -184,6 +240,77 @@ onMounted(loadAll);
           <tr v-if="!data.accounts.length"><td colspan="4" class="px-4 py-8 text-center text-slate-600">暂无网关账号（等待 runner.login）</td></tr>
         </tbody>
       </table>
+    </div>
+
+    <!-- 上游母频发现：转发链聚合排行（高频被转发的源头频道优先） -->
+    <div class="rounded-xl border border-violet-800/50 bg-violet-950/10 p-4">
+      <div class="mb-3 flex flex-wrap items-center gap-3">
+        <h3 class="text-sm font-semibold text-violet-300">上游源头挖掘 (Top Forwarded Origins)</h3>
+        <select v-model="originAccountId"
+          class="rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-300">
+          <option :value="null" disabled>选择纳管账号</option>
+          <option v-for="a in data?.accounts || []" :key="a.id" :value="a.id">
+            {{ a.display_name || `账号#${a.id}` }}
+          </option>
+        </select>
+        <span class="text-[11px] text-slate-500">母频 = 高价值卡片的原始出处；纳管后即可直接监听源头，跳过二道贩子。</span>
+      </div>
+      <div class="overflow-x-auto rounded-lg border border-slate-800">
+        <table class="w-full text-sm">
+          <thead class="bg-slate-900 text-left text-xs text-slate-500">
+            <tr>
+              <th class="px-3 py-2">母频</th>
+              <th class="px-3 py-2">转发频次</th>
+              <th class="px-3 py-2">传播群组</th>
+              <th class="px-3 py-2">最近转发</th>
+              <th class="px-3 py-2 text-right">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="origin in forwardOrigins" :key="origin.from_id"
+              class="border-t border-slate-800">
+              <td class="px-3 py-2">
+                <div class="flex items-center gap-2">
+                  <span class="max-w-52 truncate font-medium"
+                    :title="originTitle(origin)">{{ originTitle(origin) }}</span>
+                  <span v-if="origin.is_already_source"
+                    class="rounded bg-emerald-900/40 px-1.5 py-0.5 text-[10px] text-emerald-300">已纳管</span>
+                  <span v-else class="rounded bg-amber-900/40 px-1.5 py-0.5 text-[10px] text-amber-300">未纳管</span>
+                </div>
+                <div class="text-[11px] text-slate-500">
+                  {{ origin.from_type || "channel" }} · ID {{ origin.from_id }}
+                </div>
+              </td>
+              <td class="px-3 py-2">
+                <span class="rounded bg-violet-900/40 px-2 py-0.5 text-xs font-semibold text-violet-300">
+                  {{ origin.forward_count }} 次
+                </span>
+              </td>
+              <td class="px-3 py-2 text-xs text-slate-300">{{ origin.source_count }} 个</td>
+              <td class="px-3 py-2 text-xs text-slate-500">
+                {{ origin.latest_forwarded_at ? new Date(origin.latest_forwarded_at).toLocaleString("zh-CN") : "—" }}
+              </td>
+              <td class="px-3 py-2 text-right">
+                <div class="flex items-center justify-end gap-1.5">
+                  <button v-if="!originBound(origin)" @click="adoptOrigin(origin)"
+                    class="rounded-lg bg-violet-700 px-2.5 py-1 text-xs font-medium text-white hover:bg-violet-600">
+                    一键纳管
+                  </button>
+                  <button @click="copyOriginId(origin)"
+                    class="rounded-lg border border-slate-600 px-2.5 py-1 text-xs text-slate-400 hover:bg-slate-800">
+                    复制 ID
+                  </button>
+                </div>
+              </td>
+            </tr>
+            <tr v-if="!forwardOrigins.length">
+              <td colspan="5" class="px-4 py-6 text-center text-xs text-slate-600">
+                暂无转发链数据。Bridge 会在实时监听与历史回采时自动记录转发出处（fwd_from），积累后此处即出现母频排行。
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
     </div>
 
     <div>

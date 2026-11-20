@@ -17,7 +17,7 @@ import logging
 import os
 import time
 
-from runner import accounts, duty, hub, source_routing, sqlres
+from runner import accounts, duty, forward_info, hub, source_routing, sqlres
 from runner.backfill import save_media
 from runner.listener import LINK_PATTERN, expand_embedded_links, order_media
 
@@ -58,6 +58,7 @@ def _make_handler(pipeline, source_id, client):
             text=text,
             media=media,
             posted_at=msg.date,
+            fwd_from=forward_info.extract_forward_info(msg),
         )
     return handler
 
@@ -70,6 +71,15 @@ def _make_album_handler(pipeline, source_id, client):
         caption = next(
             (msg for msg in messages if (msg.raw_text or "").strip()),
             messages[0],
+        )
+        fwd_from = next(
+            (
+                info for info in (
+                    forward_info.extract_forward_info(msg) for msg in messages
+                )
+                if info
+            ),
+            None,
         )
         parts = await asyncio.gather(
             *(save_media(msg, source_id) for msg in messages)
@@ -87,6 +97,7 @@ def _make_album_handler(pipeline, source_id, client):
             text=text,
             media=media,
             posted_at=caption.date,
+            fwd_from=fwd_from,
         )
     return handler
 

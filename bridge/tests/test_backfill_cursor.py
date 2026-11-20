@@ -62,9 +62,11 @@ class OffsetPassthroughTests(unittest.IsolatedAsyncioTestCase):
         ])
         rows = await _fetch_history(client, -100, 10, 1, offset_id=20)
         self.assertEqual(len(rows), 1)
-        anchor_id, _, grouped, text, _, _ = rows[0]
+        anchor_id, _, grouped, text, _, media, fwd_from = rows[0]
         self.assertEqual((anchor_id, grouped), (11, 777))
         self.assertIn("1P600", text)
+        # 相册部件均非转发 → 整组溯源为 None
+        self.assertIsNone(fwd_from)
 
 
 class ResolveOffsetTests(unittest.IsolatedAsyncioTestCase):
