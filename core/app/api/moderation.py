@@ -60,7 +60,8 @@ SELECT l.*, rm.sender_peer_id, {SOURCE_TITLE} AS source_title, rm.posted_at AS o
        COALESCE(rm.raw_text, p.description, l.description) AS original_text,
        CASE WHEN rm.raw_text IS NOT NULL THEN 'telegram'
             WHEN p.description IS NOT NULL THEN 'profile' ELSE 'listing' END AS original_text_source,
-       COALESCE(rm.media_json, '[]'::jsonb) || COALESCE(p.media_json, '[]'::jsonb) AS original_media
+       COALESCE(rm.media_json, '[]'::jsonb) || COALESCE(p.media_json, '[]'::jsonb) AS original_media,
+       rm.fwd_from_json AS forward_origin
 FROM listings l
 {SOURCE_JOINS}
 WHERE l.id=$1 AND l.status='pending'
@@ -238,6 +239,7 @@ async def next_card(
                     "original_text": row["original_text"],
                     "original_text_source": row["original_text_source"],
                     "original_posted_at": row["original_posted_at"],
+                    "forward_origin": _object(row["forward_origin"]) or None,
                     "fields": {key: row[key] for key in BASE_FIELDS},
                     "attributes": _attribute_values(custom_fields, ocr, _object(row["evidence_json"])),
                     "required_attribute_keys": [field["field_key"] for field in required
