@@ -120,6 +120,8 @@ function notify(msg) {
 const slangItems = ref([]);
 const insightMinHits = 2;
 const insights = ref([]);
+const learnedCandidates = ref([]);
+const candidateResults = ref({});
 const preview = ref(null);
 const previewBusy = ref(false);
 const pendingAdopt = ref(null);
@@ -132,6 +134,41 @@ async function loadInsights() {
   insights.value = (
     await api(`/api/admin/rules/correction-insights?days=30&min_hits=${insightMinHits}`)
   ).items;
+}
+async function loadCandidates() {
+  learnedCandidates.value = (await api("/api/admin/rules/candidates")).items || [];
+  candidateResults.value = {};
+}
+async function backtestCandidate(candidate) {
+  candidateResults.value = { ...candidateResults.value, [candidate.candidate_key]: { loading: true } };
+  try {
+    const result = await api("/api/admin/rules/candidates/backtest", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ candidate_key: candidate.candidate_key }),
+    });
+    candidateResults.value = { ...candidateResults.value, [candidate.candidate_key]: result };
+  } catch (e) {
+    candidateResults.value = { ...candidateResults.value, [candidate.candidate_key]: { error: String(e.message) } };
+  }
+}
+async function adoptCandidate(candidate) {
+  try {
+    await api("/api/admin/rules/candidates/adopt", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ candidate_key: candidate.candidate_key }),
+    });
+    notify(`「${candidate.raw_pattern}」已采纳并热生效`);
+    await Promise.all([loadCandidates(), loadSlang()]);
+  } catch (e) {
+    notify(`采纳失败: ${String(e.message).slice(0, 100)}`);
+  }
+}
+async function dismissCandidate(candidate) {
+  await api("/api/admin/rules/candidates/dismiss", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ candidate_key: candidate.candidate_key }),
+  });
+  learnedCandidates.value = learnedCandidates.value.filter((item) => item.candidate_key !== candidate.candidate_key);
 }
 async function reloadSlang() {
   const data = await api("/api/admin/rules/slang-registry/reload", { method: "POST" });
@@ -560,6 +597,7 @@ onMounted(async () => {
   dialogs.value = (await api("/api/admin/sources/dialogs")).items;
   loadSlang();
   loadInsights();
+  loadCandidates();
   profileRefreshTimer = setInterval(() => {
     if (["profile_collection", "bot_collection", "checkin_reverse"].includes(activeTab.value) && current.value?.id) {
       loadProfileResults(current.value.id);
@@ -596,6 +634,51 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
         </span>
       </summary>
       <div class="grid gap-4 lg:grid-cols-2">
+        <div class="space-y-2 rounded-xl border border-indigo-800/50 bg-indigo-950/20 p-3">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h3 class="text-sm font-semibold text-indigo-200">自学习推荐候选</h3>
+              <p class="text-[11px] text-slate-500">来自重复人工纠偏；采纳前会在黄金样本上比较改善与误伤。</p>
+            </div>
+            <button @click="loadCandidates"
+              class="rounded-lg border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800">刷新候选</button>
+          </div>
+          <div v-if="learnedCandidates.length" class="max-h-80 space-y-2 overflow-y-auto">
+            <article v-for="candidate in learnedCandidates" :key="candidate.candidate_key"
+              class="rounded-lg border border-slate-800 bg-slate-950/60 p-2.5">
+              <div class="flex flex-wrap items-center gap-2 text-xs">
+                <span class="rounded bg-slate-800 px-1.5 py-0.5 font-mono text-indigo-200">{{ candidate.field_name }}</span>
+                <span class="font-mono text-emerald-300">{{ candidate.raw_pattern }}</span>
+                <span class="text-slate-400">→ {{ candidate.target_action }}</span>
+                <span class="ml-auto rounded bg-amber-900/40 px-1.5 py-0.5 text-amber-300">纠偏 {{ candidate.frequency }} 次</span>
+                <span class="rounded bg-indigo-900/40 px-1.5 py-0.5 text-indigo-300">置信 {{ candidate.confidence }}</span>
+              </div>
+              <div v-for="(example, i) in candidate.examples" :key="i" class="mt-1 truncate text-[11px] text-slate-500">
+                {{ example.nickname || `卡片 #${example.listing_id}` }}：{{ example.raw_snippet }}（{{ example.before }} → {{ example.after }}）
+              </div>
+              <div class="mt-2 flex flex-wrap items-center gap-2">
+                <button @click="backtestCandidate(candidate)"
+                  class="rounded-lg border border-sky-800 px-2 py-1 text-[11px] text-sky-300 hover:bg-sky-950/40">一键回测</button>
+                <button @click="adoptCandidate(candidate)"
+                  :disabled="!candidateResults[candidate.candidate_key] || candidateResults[candidate.candidate_key].loading || candidateResults[candidate.candidate_key].total === 0 || candidateResults[candidate.candidate_key].broken > 0"
+                  class="rounded-lg bg-emerald-800 px-2 py-1 text-[11px] text-emerald-100 hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-40">采纳生效</button>
+                <button @click="dismissCandidate(candidate)"
+                  class="rounded-lg border border-slate-700 px-2 py-1 text-[11px] text-slate-400 hover:bg-slate-800">忽略</button>
+                <span v-if="candidateResults[candidate.candidate_key]?.loading" class="text-[11px] text-slate-400">正在回测…</span>
+                <span v-else-if="candidateResults[candidate.candidate_key]?.total != null" class="text-[11px]">
+                  样本 {{ candidateResults[candidate.candidate_key].total }} ·
+                  <span class="text-emerald-400">改善 {{ candidateResults[candidate.candidate_key].improved }}</span> ·
+                  <span class="text-rose-400">破坏 {{ candidateResults[candidate.candidate_key].broken }}</span> ·
+                  <span class="text-slate-400">不变 {{ candidateResults[candidate.candidate_key].unchanged }}</span>
+                </span>
+                <span v-else-if="candidateResults[candidate.candidate_key]?.error" class="text-[11px] text-rose-400">回测失败</span>
+              </div>
+            </article>
+          </div>
+          <div v-else class="rounded-lg border border-slate-800 bg-slate-900/40 p-3 text-xs text-slate-500">
+            当前纠偏数据均已覆盖，暂无新推荐。
+          </div>
+        </div>
         <div class="space-y-2">
           <div class="flex items-center justify-between">
             <span class="text-xs text-slate-400">黑话词表（金额单位 / 资费别名 / 引导词）</span>
@@ -635,6 +718,7 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
               <option value="tariff_alias">资费别名</option>
               <option value="bust_alias">胸围引导</option>
               <option value="age_alias">年龄引导</option>
+              <option value="weight_alias">体重别名</option>
               <option value="restriction_alias">禁忌词</option>
               <option value="service_alias">服务标签</option>
             </select>
