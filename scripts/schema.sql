@@ -3274,6 +3274,11 @@ CREATE TABLE IF NOT EXISTS listing_correction_diffs (
 CREATE INDEX IF NOT EXISTS idx_correction_diffs_recent
     ON listing_correction_diffs(created_at DESC, field_name);
 
+CREATE TABLE IF NOT EXISTS rule_recommendation_dismissals (
+    candidate_key VARCHAR(64) PRIMARY KEY,
+    dismissed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE OR REPLACE FUNCTION correction_diffs_record(
     p_listing_id BIGINT,
     p_diffs JSONB,

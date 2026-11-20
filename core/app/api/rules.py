@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from app import db, llm, sqlres
 from app.api.auth import require_admin
-from app.extractor import ast_rules, ocr_fields, slang_registry
+from app.extractor import ast_rules, ocr_fields, slang_registry, rule_recommender
 from app.extractor.pipeline import DEFAULT_TRIGGERS, extract_custom_fields, missing_triggers
 
 router = APIRouter(
@@ -537,11 +537,11 @@ SQL_SLANG_TOGGLE = sqlres.load("slang_terms_toggle.sql")
 SQL_SLANG_DELETE = sqlres.load("slang_terms_delete.sql")
 SQL_CORRECTION_INSIGHTS = sqlres.load("correction_insights.sql")
 
-SLANG_CATEGORIES = ("money_slang", "tariff_alias", "bust_alias", "age_alias", "restriction_alias", "service_alias")
+SLANG_CATEGORIES = ("money_slang", "tariff_alias", "bust_alias", "age_alias", "weight_alias", "restriction_alias", "service_alias")
 
 
 class SlangBody(BaseModel):
-    category: Literal["money_slang", "tariff_alias", "bust_alias", "age_alias", "restriction_alias", "service_alias"]
+    category: Literal["money_slang", "tariff_alias", "bust_alias", "age_alias", "weight_alias", "restriction_alias", "service_alias"]
     source_term: str = Field(min_length=1, max_length=64)
     target_action: str | None = Field(None, max_length=64)
     factor: int | None = Field(None, ge=1, le=100000)
@@ -554,11 +554,119 @@ class SlangPreviewBody(SlangBody):
     sample_set: Literal["recent", "golden"] = "golden"
 
 
+class CandidateActionBody(BaseModel):
+    candidate_key: str = Field(min_length=8, max_length=64)
+
+
+SQL_CANDIDATE_DIFFS = """
+SELECT d.listing_id, d.field_name, d.old_value, d.new_value, d.raw_snippet,
+       l.nickname
+FROM listing_correction_diffs d
+LEFT JOIN listings l ON l.id = d.listing_id
+WHERE d.created_at >= now() - interval '180 days'
+ORDER BY d.created_at DESC
+LIMIT 5000
+"""
+SQL_CANDIDATE_DISMISSED = "SELECT candidate_key FROM rule_recommendation_dismissals"
+SQL_CANDIDATE_DISMISS = """
+INSERT INTO rule_recommendation_dismissals(candidate_key, dismissed_at)
+VALUES ($1, now()) ON CONFLICT (candidate_key) DO UPDATE SET dismissed_at = now()
+"""
+
+
 def _validate_slang(body: SlangBody) -> None:
     if body.category == "money_slang" and not body.factor:
         raise HTTPException(status_code=422, detail="money_slang 需要换算倍数 factor（如 100/1000）")
     if body.category != "money_slang" and not (body.target_action or "").strip():
         raise HTTPException(status_code=422, detail="别名类词表需要替换目标 target_action（如 1p / 2p / 胸围 / 年龄）")
+
+
+async def _recommendation_candidates(pool):
+    rows = await pool.fetch(SQL_CANDIDATE_DIFFS)
+    dismissed = await pool.fetch(SQL_CANDIDATE_DISMISSED)
+    enabled = [dict(row) for row in await pool.fetch(SQL_SLANG_ENABLED)]
+    covered = [*ast_rules.known_terms(), *(row.get("source_term") for row in enabled)]
+    return rule_recommender.cluster_corrections(
+        [dict(row) for row in rows], covered=covered,
+        dismissed=[row["candidate_key"] for row in dismissed],
+    )
+
+
+async def _candidate_backtest(pool, candidate):
+    await slang_registry.ensure_fresh(pool, ttl_s=0)
+    db_rows = [dict(row) for row in await pool.fetch(SQL_SLANG_ENABLED)]
+    entry = {
+        "category": candidate["category"],
+        "source_term": candidate["raw_pattern"],
+        "target_action": candidate["target_action"],
+        "factor": None,
+    }
+    config = {}
+    with ast_rules.preview_dynamic_terms(db_rows):
+        baseline = await dry_run(DryRunBody(config=config, sample_limit=200, sample_set="golden"))
+    with ast_rules.preview_dynamic_terms([*db_rows, entry]):
+        proposed = await dry_run(DryRunBody(config=config, sample_limit=200, sample_set="golden"))
+    base_by_id = {item["raw_id"]: item for item in baseline["results"]}
+    improved = broken = unchanged = 0
+    for item in proposed["results"]:
+        before = base_by_id.get(item["raw_id"], {})
+        old_count = len(before.get("differences") or {})
+        new_count = len(item.get("differences") or {})
+        if new_count < old_count:
+            improved += 1
+        elif new_count > old_count:
+            broken += 1
+        else:
+            unchanged += 1
+    return {"total": len(proposed["results"]), "improved": improved,
+            "broken": broken, "unchanged": unchanged}
+
+
+@router.get("/candidates")
+async def rule_candidates() -> dict:
+    return {"items": await _recommendation_candidates(_pool())}
+
+
+@router.post("/candidates/backtest")
+async def backtest_candidate(body: CandidateActionBody) -> dict:
+    pool = _pool()
+    candidate = next((item for item in await _recommendation_candidates(pool)
+                      if item["candidate_key"] == body.candidate_key), None)
+    if not candidate:
+        raise HTTPException(status_code=404, detail="候选规则不存在或已忽略")
+    return {"candidate_key": body.candidate_key,
+            **await _candidate_backtest(pool, candidate)}
+
+
+@router.post("/candidates/adopt")
+async def adopt_candidate(body: CandidateActionBody) -> dict:
+    pool = _pool()
+    candidate = next((item for item in await _recommendation_candidates(pool)
+                      if item["candidate_key"] == body.candidate_key), None)
+    if not candidate:
+        raise HTTPException(status_code=404, detail="候选规则不存在或已忽略")
+    result = await _candidate_backtest(pool, candidate)
+    if not result["total"]:
+        raise HTTPException(status_code=409, detail="黄金样本为空，完成回测前不能采纳候选规则")
+    if result["broken"]:
+        raise HTTPException(status_code=409, detail={"message": "黄金样本回测发现误伤，不能采纳", **result})
+    rows = await pool.fetch(
+        SQL_SLANG_UPSERT, candidate["category"], candidate["raw_pattern"],
+        candidate["target_action"], None, True,
+    )
+    applied = await slang_registry.reload(pool)
+    return {"item": dict(rows[0]), "applied_terms": applied, "backtest": result}
+
+
+@router.post("/candidates/dismiss")
+async def dismiss_candidate(body: CandidateActionBody) -> dict:
+    pool = _pool()
+    candidate = next((item for item in await _recommendation_candidates(pool)
+                      if item["candidate_key"] == body.candidate_key), None)
+    if not candidate:
+        raise HTTPException(status_code=404, detail="候选规则不存在")
+    await pool.execute(SQL_CANDIDATE_DISMISS, body.candidate_key)
+    return {"candidate_key": body.candidate_key, "dismissed": True}
 
 
 @router.get("/slang-registry")

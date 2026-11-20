@@ -216,7 +216,8 @@ def normalize_weight(value) -> float | None:
 
 def find_weight(text: str) -> tuple[str, float, float] | None:
     """Return the observed token, its numeric value, and kilograms."""
-    for match in _WEIGHT_LABEL.finditer(_fold_input(text)):
+    folded = _snapshot().parser_aliases.replace(_fold_input(text))
+    for match in _WEIGHT_LABEL.finditer(folded):
         weight = normalize_weight(match.group(0).removeprefix("体重").lstrip(" :="))
         if weight is not None:
             return match.group(0).strip(), float(match.group(1)), weight
@@ -341,7 +342,8 @@ _STATIC_TAGS = {
 }
 _SLANG_CATEGORY_MAP = {
     "money_slang": "money", "tariff_alias": "tariff", "bust_alias": "bust",
-    "age_alias": "age", "restriction_alias": "restriction", "service_alias": "service",
+    "age_alias": "age", "weight_alias": "weight",
+    "restriction_alias": "restriction", "service_alias": "service",
 }
 
 
@@ -463,6 +465,14 @@ def clear_dynamic_terms() -> None:
 
 def dynamic_terms() -> dict:
     return {key: [dict(item) for item in items] for key, items in _snapshot().entries.items()}
+
+
+def known_terms() -> set[str]:
+    """Return built-in and active dynamic terms for feedback deduplication."""
+    snapshot = _snapshot()
+    terms = set(_STATIC_ALIASES) | set(_STATIC_TAGS) | set(_STATIC_MONEY)
+    terms.update(item["term"] for items in snapshot.entries.values() for item in items)
+    return terms
 
 
 @contextmanager
