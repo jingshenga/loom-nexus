@@ -104,5 +104,46 @@ class ListingNormalizationTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertNotIn("bust_size", extract_fields({}, text)[0])
 
+class FlashTextRegressionTests(unittest.TestCase):
+    def setUp(self):
+        from app.extractor import ast_rules
+
+        self.ast = ast_rules
+        self.ast.clear_dynamic_terms()
+        self.addCleanup(self.ast.clear_dynamic_terms)
+
+    def test_longest_and_adjacent_aliases_with_emoji_and_punctuation(self):
+        self.ast.apply_dynamic_terms([
+            {"category": "bust_alias", "source_term": "熊", "target_action": "胸"},
+            {"category": "bust_alias", "source_term": "大熊", "target_action": "胸围"},
+            {"category": "age_alias", "source_term": "【龄】", "target_action": "年龄"},
+            {"category": "bust_alias", "source_term": "🐻️", "target_action": "罩杯"},
+        ])
+        self.assertEqual(self.ast.normalize_input("大熊🐻️【龄】07年"), "胸围罩杯年龄07年")
+        self.assertEqual(self.ast.find_age(["【龄】07年"]), (0, 19))
+        self.assertEqual(self.ast.find_bust("大熊B36"), "B")
+        self.assertEqual(self.ast.find_bust("天然36C"), "C")
+
+    def test_built_in_money_units_guard_duration_bust_and_photo_contexts(self):
+        self.assertEqual(self.ast.normalize_input("6章 6张 11k 1.1k 1w 10K"), "600 600 1100 1100 10000 10000")
+        self.assertEqual(self.ast.normalize_input("照片3张照片 身高1米68 体重51kg 天然36C"), "照片3张照片 身高1米68 体重51kg 天然36C")
+        quotes = self.ast.tariff_quotes(["BT 4张50分钟 / 一次6章40分钟 / 900PP(90min)"])
+        self.assertEqual({key: (quote["amount"], quote["minutes"]) for key, quote in quotes.items()},
+                         {"bt": (400, 50), "1p": (600, 40), "2p": (900, 90)})
+
+    def test_labels_merge_registry_config_and_unstructured_restrictions(self):
+        self.ast.apply_dynamic_terms([
+            {"category": "restriction_alias", "source_term": "🔕客服免聊", "target_action": "不闲聊无口嗨"},
+            {"category": "service_alias", "source_term": "私约课", "target_action": "预约课程"},
+        ])
+        line = "🔕客服免聊、只接受预约、禁影响邻居休息、私约课通宵"
+        _, evidence = self.ast.extract_fields(
+            {"extract": {"restriction_text": {"只接受预约": "仅接受预约"}}}, line,
+        )
+        self.assertEqual(evidence["restriction_text"]["value"], ["不闲聊无口嗨", "仅接受预约", "禁影响邻居休息"])
+        self.assertEqual(evidence["service_text"]["value"], ["预约课程", "包夜"])
+        self.assertEqual(evidence["restriction_text"]["line"], line)
+
+
 if __name__ == "__main__":
     unittest.main()

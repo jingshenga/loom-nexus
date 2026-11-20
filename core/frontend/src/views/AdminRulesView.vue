@@ -635,6 +635,8 @@ onUnmounted(() => clearInterval(profileRefreshTimer));
               <option value="tariff_alias">资费别名</option>
               <option value="bust_alias">胸围引导</option>
               <option value="age_alias">年龄引导</option>
+              <option value="restriction_alias">禁忌词</option>
+              <option value="service_alias">服务标签</option>
             </select>
             <input v-model="slangForm.source_term" placeholder="词（如 双次）" maxlength="64"
               class="w-24 rounded border border-slate-700 bg-slate-950 px-1.5 py-1 text-xs" />

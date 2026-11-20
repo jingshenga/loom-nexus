@@ -27,6 +27,13 @@ hits — a pattern that already matches the whole text keeps its result.
 """
 import re
 import unicodedata
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from decimal import Decimal
+from threading import Lock
+
+from flashtext import KeywordProcessor
 
 FIELDS = ("nickname", "username", "district")
 
@@ -43,71 +50,62 @@ _KEYCAP_DIGIT = re.compile(r"([0-9])\uFE0F?\u20E3")
 _POINTING_MARKS = re.compile(r"[👉➡▶⏩]\uFE0F?")
 _PROHIBITION_MARKS = re.compile(r"[🈲🚫⛔]")
 
-# 0.8k / 8千 → 8000-scale rewrites; negative lookaheads keep "8cm",
-# "2P" handles and other letter-suffixed tokens intact.
-_MONEY_K = re.compile(r"(\d+(?:\.\d+)?)\s*([kK千])(?![0-9A-Za-z])")
-_MONEY_W = re.compile(r"(\d+(?:\.\d+)?)\s*(?:[wW万])(?![0-9A-Za-z])")
-# "8c" → 800, but bra sizes ("胸围88C") stay untouched
-_MONEY_C = re.compile(r"(\d+(?:\.\d+)?)\s*[cC](?![0-9A-Za-z])")
+# Only numeric context needs a grammar. Units themselves live in the trie.
+_STATIC_MONEY = {
+    "章": 100, "张": 100, "米": 100, "c": 100, "C": 100,
+    "千": 1000, "k": 1000, "K": 1000, "万": 10000, "w": 10000, "W": 10000,
+}
+_MONEY_NUMBER = re.compile(r"(\d+(?:\.\d+)?)\s*")
+_COMPACT_DURATION = re.compile(r"\d{1,3}\s*(?:分钟|分|min\b)", re.I)
 _BUST_LABEL = r"(?:胸围?|罩杯|(?<![A-Za-z])cup|大?熊|🐻\ufe0f?)"
 _BUST_MODIFIERS = r"(?:(?:天然|自然|原装|真)\s*)?"
-_BUST_PREFIX = re.compile(rf"{_BUST_LABEL}\s*[:=]?\s*{_BUST_MODIFIERS}$", re.I)
-# "8张" / "6章" → 800-scale money. The digit guard prevents accidental
-# concatenation. A recognized compact duration is separated first; photo
-# counters ("3张照片") are excluded statically. "8米" folds EXCEPT when
-# a digit follows ("1米68" height) or a height prefix precedes.
-_MONEY_ZH = re.compile(r"(\d+(?:\.\d+)?)\s*([张章])(?![0-9])(?![照片图票券卡桌])")
-_MONEY_MI = re.compile(r"(\d+(?:\.\d+)?)\s*米(?![照片图票券卡桌])")
+_BUST_PREFIX = re.compile(rf"(?:{_BUST_LABEL}\s*[:=]?\s*{_BUST_MODIFIERS}|天然\s*)$", re.I)
 _HEIGHT_PREFIX = re.compile(r"(?:身高|净高|身量|个头)\s*[:：]?\s*$")
 
 
-def _scaled(number: str, factor: int) -> str:
-    value = float(number) * factor
-    return str(int(value)) if value == int(value) else str(value)
+def _rewrite_money_units(text: str, processor: KeywordProcessor) -> str:
+    numbers = iter(_MONEY_NUMBER.finditer(text))
+    number = next(numbers, None)
+    parts = []
+    cursor = 0
+    for (unit, factor, dynamic), start, end in _spans(processor, text):
+        while number and number.end() < start:
+            number = next(numbers, None)
+        if not number:
+            break
+        if number.end() != start:
+            continue
+        following = text[end:end + 1]
+        compact_duration = _COMPACT_DURATION.match(text, end) is not None
+        if following.isdigit() and not compact_duration:
+            continue
+        if unit[-1] in _ASCII_WORD_EDGE and following in _ASCII_WORD_EDGE and not compact_duration:
+            continue
+        if (dynamic or unit in "张章米") and following and following in "照片图票券卡桌":
+            continue
+        prefix = text[max(0, number.start() - 24):number.start()]
+        if unit == "米" and (_HEIGHT_PREFIX.search(prefix) or following == "."):
+            continue
+        if (dynamic or unit.lower() == "c") and (
+            _BUST_PREFIX.search(prefix) or text[end:].lstrip().startswith(("罩杯", "杯"))
+        ):
+            continue
+        digits = number[1]
+        if not dynamic and unit.lower() == "k" and len(digits) == 2 and digits.isdigit() and int(digits) >= 11:
+            factor = 100
+        amount = format(Decimal(digits) * factor, "f")
+        if "." in amount:
+            amount = amount.rstrip("0").rstrip(".")
+        parts.extend((text[cursor:number.start()], amount))
+        if compact_duration:
+            parts.append(" ")
+        cursor = end
+    parts.append(text[cursor:])
+    return "".join(parts)
 
 
-def _rewrite_money_units(text: str) -> str:
-    """Colloquial money units become plain yuan numbers so brittle
-    numeric rule patterns see "800" whether the message said 0.8k,
-    8张, 8米, 6章 or 8c."""
-
-    def k_repl(match):
-        number, unit = match.groups()
-        # Integer shorthand like 11k is quoted in hundreds on these cards.
-        factor = 100 if unit.lower() == "k" and number.isdigit() and 10 <= int(number) <= 99 else 1000
-        return _scaled(number, factor)
-
-    def w_repl(match):
-        return _scaled(match.group(1), 10000)
-
-    def c_repl(match):
-        prefix = match.string[max(0, match.start() - 24):match.start()]
-        if _BUST_PREFIX.search(prefix) or match.string[match.end():].lstrip().startswith(("罩杯", "杯")):
-            return match.group(0)
-        return _scaled(match.group(1), 100)
-
-    def zh_repl(match):
-        return _scaled(match.group(1), 100)
-
-    def mi_repl(match):
-        unit_tail = match.string[match.end():match.end() + 1]
-        if unit_tail and (unit_tail.isdigit() or unit_tail == "."):
-            return match.group(0)  # "1米68" / "1.5米…" — height, not money
-        prefix = match.string[max(0, match.start() - 8):match.start()]
-        if _HEIGHT_PREFIX.search(prefix):
-            return match.group(0)
-        return _scaled(match.group(1), 100)
-
-    text = _MONEY_K.sub(k_repl, text)
-    text = _MONEY_W.sub(w_repl, text)
-    text = _MONEY_C.sub(c_repl, text)
-    text = _MONEY_ZH.sub(zh_repl, text)
-    return _MONEY_MI.sub(mi_repl, text)
-
-
-# public alias: OCR card lines and tariff parsing need the same slang
-# folding before they look for 1P/2P amounts ("P 6米" → "P 600")
-money_normalize = _rewrite_money_units
+def money_normalize(text: str) -> str:
+    return _rewrite_money_units(text, _BASE_MONEY)
 
 
 def _fold_input(text: str) -> str:
@@ -119,14 +117,12 @@ def _fold_input(text: str) -> str:
     return re.sub(r"[ \t]+", " ", text).strip()
 
 
-_SLANG_UNIT = r"[章张米kKcC千wW万]"
-_COMPACT_MONEY_DURATION = re.compile(rf"(?<=\d)({_SLANG_UNIT})(?=\d{{1,3}}\s*(?:分钟|分|min\b))", re.I)
-
-
+_SLANG_UNIT = "[" + "".join(_STATIC_MONEY) + "]"
 def normalize_input(text: str) -> str:
     """Fold width, emoji and money slang without changing line boundaries."""
-    folded = re.sub(r"(?<=\d),(?=\d)", "", _apply_dynamic_terms(_fold_input(text)))
-    return _rewrite_money_units(_COMPACT_MONEY_DURATION.sub(r"\1 ", folded))
+    snapshot = _snapshot()
+    folded = snapshot.aliases.replace(_fold_input(text))
+    return _rewrite_money_units(re.sub(r"(?<=\d),(?=\d)", "", folded), snapshot.money)
 
 
 # Body fields are shared by text rules and OCR, which keeps the original line as evidence.
@@ -150,7 +146,7 @@ _WEIGHT_LABEL = re.compile(
 )
 _WEIGHT_TOKEN = re.compile(_WEIGHT_VALUE, re.I)
 _CUP = r"(?:([A-I]\+?)\s*\d{2}|(?:\d{2}\s*)?([A-I]\+?))"
-_BUST_BEFORE = re.compile(rf"{_BUST_LABEL}\s*[:=]?\s*{_BUST_MODIFIERS}{_CUP}(?![A-Za-z0-9+])", re.I)
+_BUST_BEFORE = re.compile(rf"(?:{_BUST_LABEL}|天然)\s*[:=]?\s*{_BUST_MODIFIERS}{_CUP}(?![A-Za-z0-9+])", re.I)
 _BUST_AFTER = re.compile(rf"(?<![A-Za-z0-9]){_CUP}\s*(?:罩杯|杯)", re.I)
 _BUST_STANDALONE = re.compile(r"(?:([A-I])\s*\d{2}|\d{2}\s*([A-I]))", re.I)
 
@@ -228,7 +224,7 @@ def find_weight(text: str) -> tuple[str, float, float] | None:
 
 
 def find_bust(text: str) -> str | None:
-    folded = _apply_dynamic_aliases(_fold_input(text))
+    folded = _snapshot().parser_aliases.replace(_fold_input(text))
     match = _BUST_BEFORE.search(folded) or _BUST_AFTER.search(folded) or _BUST_STANDALONE.fullmatch(folded)
     return (match[1] or match[2]).upper() if match else None
 
@@ -320,111 +316,207 @@ def additional_fee_labels(line: str) -> list[str]:
 
 
 def restriction_terms(line: str) -> list[str]:
-    return [term for term in _RESTRICTION.findall(_fold_input(line)) if len(term) > 1]
+    return keyword_tags(line).get("restriction_text", [])
 
 
-# ---------------------------------------------------------------------------
-# dynamic slang registry (hot-reloadable override layer)
-#
-# Built-in slang above stays hardcoded as the fallback; operators add
-# new units/aliases (张/米/章 successors, "一次"→1p, 🐻→胸围, …) into the
-# dynamic_slang_terms table and hot-apply them without a release. The
-# registry is an in-memory snapshot applied inside normalize_input;
-# alias terms fold BEFORE money units so custom entries always win.
-# ---------------------------------------------------------------------------
-
-_DYNAMIC_TERMS: dict = {"money": [], "tariff": [], "bust": [], "age": []}
+# FlashText advances past the boundary character after a hit. Spacing the
+# scan input preserves adjacent CJK/emoji keywords and offsets into source text.
+_TRIE_SEPARATOR = "\0"
+_ASCII_WORD_EDGE = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+_STATIC_ALIASES = {
+    "一次": "1p", "单次": "1p", "1次": "1p", "一P": "1p", "一p": "1p",
+    "两次": "2p", "双次": "2p", "2次": "2p", "二P": "2p", "二p": "2p",
+    "大熊": "胸围", "熊": "胸围", "🐻": "胸围", "🐻️": "胸围",
+    "通宵": "包夜",
+}
+_STATIC_TAGS = {
+    "禁止拍照": ("restriction_text", "禁止拍照"),
+    **{term: ("restriction_text", term) for term in (
+        "禁嗑药", "禁无套", "禁醉酒", "禁桩基", "禁拔套", "禁鸽子", "禁变态",
+        "不闲聊无口嗨", "不做无套", "不接受20岁以下", "不催赶", "不做口", "不亲吻",
+    )},
+    "包夜": ("service_text", "包夜"),
+    "通宵": ("service_text", "包夜"),
+    "包时": ("service_text", "包时"),
+}
 _SLANG_CATEGORY_MAP = {
-    "money_slang": "money", "tariff_alias": "tariff",
-    "bust_alias": "bust", "age_alias": "age",
+    "money_slang": "money", "tariff_alias": "tariff", "bust_alias": "bust",
+    "age_alias": "age", "restriction_alias": "restriction", "service_alias": "service",
 }
 
 
-def apply_dynamic_terms(rows) -> int:
-    """Replace the in-memory snapshot from DB rows shaped
-    {"category", "source_term", "target_action", "factor"}; returns the
-    number of usable entries. Invalid rows are skipped, never fatal."""
-    bucket: dict = {key: [] for key in _SLANG_CATEGORY_MAP.values()}
-    for row in rows or []:
+def _processor(entries: dict) -> KeywordProcessor:
+    processor = KeywordProcessor(case_sensitive=True)
+    processor.set_non_word_boundaries(set())
+    for term, value in entries.items():
+        processor.add_keyword(_TRIE_SEPARATOR.join(term), value)
+    return processor
+
+
+def _spans(processor: KeywordProcessor, text: str):
+    if processor:
+        for value, start, end in processor.extract_keywords(_TRIE_SEPARATOR.join(text), span_info=True):
+            yield value, start // 2, (end + 1) // 2
+
+
+def _blocked_edge(text: str, start: int, end: int) -> bool:
+    return (
+        start > 0 and text[start] in _ASCII_WORD_EDGE and text[start - 1] in _ASCII_WORD_EDGE
+    ) or (
+        end < len(text) and text[end - 1] in _ASCII_WORD_EDGE and text[end] in _ASCII_WORD_EDGE
+    )
+
+
+@dataclass(frozen=True)
+class _Aliases:
+    trie: KeywordProcessor
+    guarded: bool
+
+    @classmethod
+    def compile(cls, entries):
+        guarded = any(term[0] in _ASCII_WORD_EDGE or term[-1] in _ASCII_WORD_EDGE
+                      or _TRIE_SEPARATOR in target for term, target in entries.items())
+        return cls(_processor(entries), guarded)
+
+    def replace(self, text: str) -> str:
+        if not self.trie:
+            return text
+        if not self.guarded and _TRIE_SEPARATOR not in text:
+            return self.trie.replace_keywords(_TRIE_SEPARATOR.join(text)).replace(_TRIE_SEPARATOR, "")
+        parts = []
+        cursor = 0
+        for target, start, end in _spans(self.trie, text):
+            if not _blocked_edge(text, start, end):
+                parts.extend((text[cursor:start], target))
+                cursor = end
+        parts.append(text[cursor:])
+        return "".join(parts)
+
+
+@dataclass(frozen=True)
+class _TermSnapshot:
+    entries: dict
+    aliases: _Aliases
+    parser_aliases: _Aliases
+    money: KeywordProcessor
+    dynamic_money: KeywordProcessor
+    tags: KeywordProcessor
+    tag_entries: dict
+
+
+def _compile_terms(rows) -> _TermSnapshot:
+    entries = {key: [] for key in _SLANG_CATEGORY_MAP.values()}
+    aliases, money = {}, {}
+    tags = dict(_STATIC_TAGS)
+    for row in rows or ():
         category = _SLANG_CATEGORY_MAP.get(str(row.get("category") or ""))
-        term = str(row.get("source_term") or "").strip()
-        if not category or not term or len(term) > 64:
+        term = _fold_input(str(row.get("source_term") or ""))
+        target = str(row.get("target_action") or "").strip()
+        if not category or not term or len(term) > 64 or row.get("enabled") is False:
             continue
-        bucket[category].append({
-            "term": term,
-            "target": str(row.get("target_action") or "").strip(),
-            "factor": row.get("factor"),
-        })
-    _DYNAMIC_TERMS.update(**bucket)
-    return sum(len(items) for items in bucket.values())
+        factor = row.get("factor")
+        if category == "money":
+            try:
+                factor = int(factor or 100)
+            except (TypeError, ValueError):
+                continue
+            if not 1 <= factor <= 100000:
+                continue
+            money[term] = (term, factor, True)
+        elif not target:
+            continue
+        elif category in {"restriction", "service"}:
+            tags[term] = (f"{category}_text", target)
+        else:
+            aliases[term] = target
+        entries[category].append({"term": term, "target": target, "factor": factor})
+    return _TermSnapshot(
+        entries, _Aliases.compile(aliases), _Aliases.compile(_STATIC_ALIASES | aliases),
+        _processor({**_BASE_MONEY_ENTRIES, **money}), _processor(money), _processor(tags), tags,
+    )
+
+
+_BASE_MONEY_ENTRIES = {term: (term, factor, False) for term, factor in _STATIC_MONEY.items()}
+_BASE_MONEY = _processor(_BASE_MONEY_ENTRIES)
+_EMPTY_TERMS = _compile_terms(())
+_ACTIVE_TERMS = _EMPTY_TERMS
+_TERMS_LOCK = Lock()
+_PREVIEW_TERMS: ContextVar[_TermSnapshot | None] = ContextVar("slang_preview", default=None)
+
+
+def _snapshot() -> _TermSnapshot:
+    return _PREVIEW_TERMS.get() or _ACTIVE_TERMS
+
+
+def apply_dynamic_terms(rows) -> int:
+    """Build complete replacement tries, then publish them in one swap."""
+    global _ACTIVE_TERMS
+    snapshot = _compile_terms(rows)
+    with _TERMS_LOCK:
+        _ACTIVE_TERMS = snapshot
+    return sum(len(items) for items in snapshot.entries.values())
 
 
 def clear_dynamic_terms() -> None:
-    _DYNAMIC_TERMS.update(money=[], tariff=[], bust=[], age=[])
+    apply_dynamic_terms(())
 
 
 def dynamic_terms() -> dict:
-    return {key: list(items) for key, items in _DYNAMIC_TERMS.items()}
+    return {key: [dict(item) for item in items] for key, items in _snapshot().entries.items()}
 
 
-def _alias_replace(text: str, entries) -> str:
-    """term → target_action. Latin-edged terms get word guards so
-    "cup" never splices inside "600cup"; CJK/emoji-edged terms don't
-    ("一次500" and "🐻C" must fold)."""
-    for entry in entries:
-        target = entry["target"]
-        term = entry["term"]
-        if not target:
-            continue
-        head = "(?<![0-9A-Za-z])" if re.match(r"[0-9A-Za-z]", term[:1]) else ""
-        tail = "(?![0-9A-Za-z])" if re.match(r"[0-9A-Za-z]", term[-1:]) else ""
-        text = re.sub(head + re.escape(term) + tail, lambda _: target, text)
-    return text
-
-
-def _dynamic_money_re():
-    """(compiled_pattern, {term: factor}) for the money_slang entries,
-    or None when the registry is empty."""
-    entries = _DYNAMIC_TERMS["money"]
-    if not entries:
-        return None
-    factors = {}
-    arms = []
-    for entry in entries:
-        try:
-            factor = int(entry["factor"] or 100)
-        except (TypeError, ValueError):
-            factor = 100
-        factors[entry["term"]] = factor
-        arms.append(re.escape(entry["term"]))
-    pattern = re.compile(r"(\d+(?:\.\d+)?)\s*(" + "|".join(arms) + r")(?=\d{1,3}\s*(?:分钟|分|min)|(?![0-9A-Za-z照片图票券卡桌]))")
-    return pattern, factors
-
-
-def _apply_dynamic_terms(text: str) -> str:
-    text = _apply_dynamic_aliases(text)
-    money = _dynamic_money_re()
-    if money:
-        pattern, factors = money
-
-        def replace(match):
-            prefix = match.string[max(0, match.start() - 24):match.start()]
-            tail = match.string[match.end():]
-            if (_BUST_PREFIX.search(prefix) or tail.lstrip().startswith(("罩杯", "杯"))
-                or (match.group(2) == "米" and _HEIGHT_PREFIX.search(prefix))):
-                return match.group(0)
-            amount = _scaled(match.group(1), factors[match.group(2)])
-            return amount + (" " if tail[:1].isdigit() else "")
-
-        text = pattern.sub(replace, text)
-    return text
+@contextmanager
+def preview_dynamic_terms(rows):
+    """Use a candidate dictionary in this task without publishing it."""
+    token = _PREVIEW_TERMS.set(_compile_terms(rows))
+    try:
+        yield
+    finally:
+        _PREVIEW_TERMS.reset(token)
 
 
 def _apply_dynamic_aliases(text: str) -> str:
-    for group in ("tariff", "bust", "age"):
-        if _DYNAMIC_TERMS[group]:
-            text = _alias_replace(text, _DYNAMIC_TERMS[group])
-    return text
+    return _snapshot().aliases.replace(text)
+
+
+def _apply_dynamic_terms(text: str) -> str:
+    snapshot = _snapshot()
+    return _rewrite_money_units(snapshot.parser_aliases.replace(text), snapshot.dynamic_money)
+
+
+def keyword_tags(line: str, processor=None) -> dict[str, list[str]]:
+    """Scan configured labels once, with the old free-form restriction fallback."""
+    text = _fold_input(line)
+    trie = _snapshot().tags if processor is None else processor
+    hits = [
+        (start, end, field, value)
+        for (field, value), start, end in _spans(trie, text)
+        if not _blocked_edge(text, start, end)
+    ]
+    hits.extend((match.start(), match.end(), "restriction_text", match[0])
+                for match in _RESTRICTION.finditer(text) if len(match[0]) > 1)
+    result: dict[str, list[str]] = {}
+    previous_end = 0
+    for start, end, field, value in sorted(hits, key=lambda hit: (hit[0], -hit[1])):
+        if start >= previous_end:
+            result.setdefault(field, []).append(value)
+            previous_end = end
+    return result
+
+
+def _configured_tags(cfg: dict) -> KeywordProcessor:
+    snapshot = _snapshot()
+    tags = {}
+    for field in ("restriction_text", "service_text"):
+        terms = cfg.get(field)
+        if isinstance(terms, list):
+            terms = {term: term for term in terms if isinstance(term, str)}
+        if not isinstance(terms, dict):
+            continue
+        for source, target in terms.items():
+            if isinstance(source, str) and isinstance(target, str) and source.strip() and target.strip():
+                tags[_fold_input(source)] = (field, target.strip())
+    return _processor(snapshot.tag_entries | tags) if tags else snapshot.tags
 
 
 # ---------------------------------------------------------------------------
@@ -588,12 +680,14 @@ def extract_fields(rule: dict, text: str, src: str = "regex") -> tuple:
             put("weight_kg", weight[2], line)
         if "bust_size" not in fields and (bust := find_bust(line)):
             put("bust_size", bust, line)
+    tags = _configured_tags(cfg)
     for line in lines:
-        for key, values in (("additional_fee_text", additional_fee_labels(line)),
-                            ("restriction_text", restriction_terms(line))):
-            if values:
-                entry = evidence.setdefault(key, {"value": [], "src": src, "line": line})
-                entry["value"].extend(value for value in values if value not in entry["value"])
+        for key, values in keyword_tags(line, tags).items():
+            entry = evidence.setdefault(key, {"value": [], "src": src, "line": line})
+            entry["value"].extend(value for value in values if value not in entry["value"])
+        if values := additional_fee_labels(line):
+            entry = evidence.setdefault("additional_fee_text", {"value": [], "src": src, "line": line})
+            entry["value"].extend(value for value in values if value not in entry["value"])
     for tier, quote in quotes.items():
         put(f"price_{tier}", quote["amount"], quote["line"])
         put(f"price_{tier}_display", quote["text"], quote["line"])

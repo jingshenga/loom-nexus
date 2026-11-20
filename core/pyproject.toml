@@ -11,4 +11,5 @@ dependencies = [
     "rapidocr>=3.4,<4",
     "onnxruntime>=1.17,<2",
     "pillow>=10.1,<14",
+    "flashtext>=2.7,<3",
 ]

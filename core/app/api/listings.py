@@ -299,10 +299,9 @@ def build_attributes(evidence, card_fields, corrections=None) -> dict:
             return from_card if from_card is not None else from_evidence
         return from_evidence if from_evidence is not None else from_card
 
-    if "restriction_text" not in corrections:
-        found = unwrapped(evidence, "restriction_text")
-        if isinstance(found, list):
-            card_fields["restriction_text"] = found + (card_fields.get("restriction_text") or [])
+    for key in ("restriction_text", "service_text"):
+        if key not in corrections and isinstance(found := unwrapped(evidence, key), list):
+            card_fields[key] = found + (card_fields.get(key) or [])
     return {
         "profile": {
             "age": pick("age_years", _as_int),

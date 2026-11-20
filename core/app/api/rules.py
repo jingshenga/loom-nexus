@@ -537,11 +537,11 @@ SQL_SLANG_TOGGLE = sqlres.load("slang_terms_toggle.sql")
 SQL_SLANG_DELETE = sqlres.load("slang_terms_delete.sql")
 SQL_CORRECTION_INSIGHTS = sqlres.load("correction_insights.sql")
 
-SLANG_CATEGORIES = ("money_slang", "tariff_alias", "bust_alias", "age_alias")
+SLANG_CATEGORIES = ("money_slang", "tariff_alias", "bust_alias", "age_alias", "restriction_alias", "service_alias")
 
 
 class SlangBody(BaseModel):
-    category: Literal["money_slang", "tariff_alias", "bust_alias", "age_alias"]
+    category: Literal["money_slang", "tariff_alias", "bust_alias", "age_alias", "restriction_alias", "service_alias"]
     source_term: str = Field(min_length=1, max_length=64)
     target_action: str | None = Field(None, max_length=64)
     factor: int | None = Field(None, ge=1, le=100000)
@@ -559,15 +559,6 @@ def _validate_slang(body: SlangBody) -> None:
         raise HTTPException(status_code=422, detail="money_slang 需要换算倍数 factor（如 100/1000）")
     if body.category != "money_slang" and not (body.target_action or "").strip():
         raise HTTPException(status_code=422, detail="别名类词表需要替换目标 target_action（如 1p / 2p / 胸围 / 年龄）")
-
-
-async def _hot_apply(pool) -> int:
-    """Reload enabled terms from the database into ast_rules and mark
-    the TTL snapshot fresh so the extractor loop stays quiet."""
-    rows = await pool.fetch(SQL_SLANG_ENABLED)
-    count = ast_rules.apply_dynamic_terms([dict(row) for row in rows])
-    slang_registry.mark_fresh(count)
-    return count
 
 
 @router.get("/slang-registry")
@@ -597,7 +588,7 @@ async def upsert_slang(body: SlangBody) -> dict:
         SQL_SLANG_UPSERT, body.category, body.source_term.strip(),
         body.target_action, body.factor, body.enabled,
     )
-    applied = await _hot_apply(pool)
+    applied = await slang_registry.reload(pool)
     r = rows[0]
     return {
         "item": {
@@ -621,7 +612,7 @@ async def toggle_slang(term_id: int, body: SlangToggleBody) -> dict:
     rows = await pool.fetch(SQL_SLANG_TOGGLE, term_id, body.enabled)
     if not rows:
         raise HTTPException(status_code=404, detail="词条不存在")
-    await _hot_apply(pool)
+    await slang_registry.reload(pool)
     return {"id": term_id, "enabled": rows[0]["enabled"]}
 
 
@@ -631,7 +622,7 @@ async def delete_slang(term_id: int) -> dict:
     rows = await pool.fetch(SQL_SLANG_DELETE, term_id)
     if not rows:
         raise HTTPException(status_code=404, detail="词条不存在")
-    await _hot_apply(pool)
+    await slang_registry.reload(pool)
     return {"id": term_id, "deleted": True}
 
 
@@ -681,9 +672,7 @@ def suggest_slang_entries(field_name: str, old_value, new_value) -> list:
 
 @router.post("/slang-registry/preview")
 async def preview_slang(body: SlangPreviewBody) -> dict:
-    """采纳前回测：临时把候选词条热应用到内存词表 → 跑一轮 Dry-run →
-    恢复数据库快照 → 再跑基线 Dry-run，返回两份指标对比。返回前内存
-    词表已恢复为数据库快照，未入库的候选不会残留生效。"""
+    """Compare the candidate and baseline in this preview task only."""
     pool = _pool()
     _validate_slang(body)
     candidate = {
@@ -704,12 +693,10 @@ async def preview_slang(body: SlangPreviewBody) -> dict:
             "hit_rate": result.get("hit_rate"), "passed": result.get("passed"),
         }
 
-    ast_rules.apply_dynamic_terms([*db_rows, candidate])
-    try:
+    with ast_rules.preview_dynamic_terms([*db_rows, candidate]):
         with_candidate = await snapshot()
-    finally:
-        ast_rules.apply_dynamic_terms(db_rows)
-    baseline = await snapshot()
+    with ast_rules.preview_dynamic_terms(db_rows):
+        baseline = await snapshot()
     return {
         "entry": candidate,
         "sample_set": body.sample_set,

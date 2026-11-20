@@ -165,5 +165,39 @@ class RegistryLoaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ast_rules.normalize_input("8斗"), "8斗")
 
 
+    async def test_reload_replaces_aliases_without_restarting_and_discards_disabled_entries(self):
+        pool = self.FakePool([{"category": "tariff_alias", "source_term": "体验",
+                               "target_action": "1p"}])
+        await slang_registry.ensure_fresh(pool)
+        self.assertIn("1p", ast_rules.tariff_quotes(["体验600"]))
+        pool.rows = [{"category": "tariff_alias", "source_term": "体验", "target_action": "2p"}]
+        await slang_registry.reload(pool)
+        self.assertEqual(set(ast_rules.tariff_quotes(["体验600"])), {"2p"})
+        pool.rows[0]["enabled"] = False
+        await slang_registry.reload(pool)
+        self.assertFalse(ast_rules.tariff_quotes(["体验600"]))
+
+    async def test_preview_is_isolated_from_a_concurrent_reader(self):
+        running = asyncio.Event()
+        reader_done = asyncio.Event()
+        row = {"category": "money_slang", "source_term": "斗", "factor": 100}
+        await slang_registry.reload(self.FakePool([row]))
+
+        async def candidate():
+            with ast_rules.preview_dynamic_terms([row | {"factor": 200}]):
+                running.set()
+                await reader_done.wait()
+                self.assertEqual(ast_rules.normalize_input("6斗"), "1200")
+
+        task = asyncio.create_task(candidate())
+        await running.wait()
+        try:
+            self.assertEqual(ast_rules.normalize_input("6斗"), "600")
+        finally:
+            reader_done.set()
+            await task
+        self.assertEqual(ast_rules.normalize_input("6斗"), "600")
+
+
 if __name__ == "__main__":
     unittest.main()

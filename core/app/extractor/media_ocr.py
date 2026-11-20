@@ -164,7 +164,7 @@ def extract_card_fields(lines: list) -> tuple[dict, dict]:
         and not ast_rules.find_age([text_lines[index]])
         and not ast_rules.tariff_quotes([text_lines[index]])
         and not ast_rules.additional_fee_labels(text_lines[index])
-        and not ast_rules.restriction_terms(text_lines[index])
+        and not ast_rules.keyword_tags(text_lines[index])
         and not re.search(r"艺名|昵称|身高|体重|胸围|年龄|年纪|出生|罩杯|服务|特点|特征|特性|价格|课费|水费|现金|携带|禁", text_lines[index])
     ]
     if title_candidates and not any(re.search(r"(?:艺名|昵称)\s*[:：]?", line) for line in text_lines):
@@ -209,11 +209,17 @@ def extract_card_fields(lines: list) -> tuple[dict, dict]:
             continue
         if re.search(r"地区|城区|地点|工作地|地址", line):
             locations.append(line)
+        tags = ast_rules.keyword_tags(line)
         if re.search(r"服务|课表|服务详情|服务内容|项目|套餐", line):
-            services.append(line)
+            service_lines = [line]
+        else:
+            service_lines = tags.get("service_text", [])
+        if service_lines:
+            services.extend(service_lines)
+            evidence.setdefault("service_text", {"line": line, "score": lines[index].get("score")})
         if re.search(r"特点|特征", line):
             features.append(line)
-        if ast_rules.restriction_terms(line) or "无套" in line:
+        if tags.get("restriction_text") or "无套" in line:
             restrictions.append(line)
         for term, pattern in _FIXED_INTRO.items():
             if pattern.search(line):
@@ -228,7 +234,7 @@ def extract_card_fields(lines: list) -> tuple[dict, dict]:
         if quotes or ast_rules.additional_fee_labels(line) or re.search(r"课费|水费|价格|收费|费用|\d+\s*分钟", line):
             fees.append(line)
         handles.extend(re.findall(r"@[A-Za-z0-9_]{3,}", line))
-        if not any(line in group for group in (locations, services, features, restrictions, fees, cash_lines)):
+        if not service_lines and not any(line in group for group in (locations, features, restrictions, fees, cash_lines)):
             other.append(line)
     if locations:
         fields["location_text"] = locations
@@ -258,7 +264,7 @@ def extract_card_fields(lines: list) -> tuple[dict, dict]:
         fields["unparsed_year_text"] = year_mentions
     if other:
         fields["other_text"] = other
-    for key, group in (("location_text", locations), ("service_text", services),
+    for key, group in (("location_text", locations),
                        ("restriction_text", restrictions), ("price_text", fees)):
         if group:
             source_line = group[0]
